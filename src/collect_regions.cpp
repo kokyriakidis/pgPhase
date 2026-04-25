@@ -68,10 +68,10 @@ int tid_for_name(const bam_hdr_t* header, const std::string& chrom) {
     return -1;
 }
 
-std::vector<RegionChunk> split_region(int tid, hts_pos_t beg, hts_pos_t end) {
+std::vector<RegionChunk> split_region(int tid, hts_pos_t beg, hts_pos_t end, hts_pos_t chunk_size) {
     std::vector<RegionChunk> chunks;
-    for (hts_pos_t chunk_beg = beg; chunk_beg <= end; chunk_beg += kChunkSize) {
-        const hts_pos_t chunk_end = std::min(end, chunk_beg + kChunkSize - 1);
+    for (hts_pos_t chunk_beg = beg; chunk_beg <= end; chunk_beg += chunk_size) {
+        const hts_pos_t chunk_end = std::min(end, chunk_beg + chunk_size - 1);
         chunks.push_back(RegionChunk{tid, chunk_beg, chunk_end});
     }
     return chunks;
@@ -80,6 +80,7 @@ std::vector<RegionChunk> split_region(int tid, hts_pos_t beg, hts_pos_t end) {
 void add_filter_chunks(const RegionFilter& region,
                        const bam_hdr_t* header,
                        const faidx_t* fai,
+                       hts_pos_t chunk_size,
                        std::vector<RegionChunk>& chunks) {
     if (!region.enabled) return;
     const int tid = tid_for_name(header, region.chrom);
@@ -91,7 +92,7 @@ void add_filter_chunks(const RegionFilter& region,
     const hts_pos_t contig_end = static_cast<hts_pos_t>(header->target_len[tid]);
     const hts_pos_t end = region.end < 0 ? contig_end : std::min(region.end, contig_end);
     if (region.beg > end) return;
-    auto region_chunks = split_region(tid, region.beg, end);
+    auto region_chunks = split_region(tid, region.beg, end, chunk_size);
     chunks.insert(chunks.end(), region_chunks.begin(), region_chunks.end());
 }
 
@@ -129,7 +130,7 @@ std::vector<RegionChunk> build_region_chunks(const Options& opts, const bam_hdr_
 
     if (!filters.empty()) {
         for (const RegionFilter& filter : filters) {
-            add_filter_chunks(filter, header, fai, chunks);
+            add_filter_chunks(filter, header, fai, opts.chunk_size, chunks);
         }
         return chunks;
     }
@@ -138,7 +139,7 @@ std::vector<RegionChunk> build_region_chunks(const Options& opts, const bam_hdr_
         if (!faidx_has_seq(fai, header->target_name[tid])) continue;
         const hts_pos_t contig_end = static_cast<hts_pos_t>(header->target_len[tid]);
         if (contig_end <= 0) continue;
-        auto contig_chunks = split_region(tid, 1, contig_end);
+        auto contig_chunks = split_region(tid, 1, contig_end, opts.chunk_size);
         chunks.insert(chunks.end(), contig_chunks.begin(), contig_chunks.end());
     }
 

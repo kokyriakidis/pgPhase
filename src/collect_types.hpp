@@ -19,7 +19,7 @@ namespace pgphase_collect {
 constexpr int kDefaultMinMapq = 30;
 constexpr int kDefaultMinBaseq = 10;
 constexpr int kMinSvLen = 30;
-constexpr hts_pos_t kChunkSize = 500000;
+constexpr hts_pos_t kDefaultChunkSize = 500000;
 constexpr double kDefaultMaxVarRatioPerRead = 0.05;
 constexpr double kDefaultMaxNoisyFracPerRead = 0.5; // longcallD LONGCALLD_MAX_NOISY_FRAC_PER_READ
 constexpr int kDefaultMinDepth = 5;
@@ -75,6 +75,7 @@ struct Options {
     int min_bq = kDefaultMinBaseq;
     int min_depth = kDefaultMinDepth;
     int min_alt_depth = kDefaultMinAltDepth;
+    hts_pos_t chunk_size = kDefaultChunkSize;
     double min_af = kDefaultMinAf;
     double max_af = kDefaultMaxAf;
     double max_var_ratio_per_read = kDefaultMaxVarRatioPerRead;

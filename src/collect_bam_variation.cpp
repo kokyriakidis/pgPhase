@@ -18,6 +18,7 @@ enum LongOption {
     kReadSupportOption,
     kNoisyRegMergeDisOption,
     kMinSvLenOption,
+    kChunkSizeOption,
     kOntOption,
     kStrandBiasPvalOption,
     kNoisyMaxXgapsOption,
@@ -64,6 +65,7 @@ void print_collect_help() {
               << "  -o, --output FILE             Output TSV file [output.tsv]\n"
               << "  -v, --vcf-output FILE         Optional VCF output for collected candidates\n"
               << "      --read-support FILE       Per-read ref/alt observations at candidates (for phasing)\n"
+              << "      --chunk-size INT          Region chunk size in bp [500000]\n"
               << "      --noisy-merge-dis INT     Max distance (bp) to merge noisy/SV windows [500]\n"
               << "      --min-sv-len INT          min_sv_len for noisy-region cgranges merge [30]\n"
               << "      --noisy-slide-win INT     Slide window (bp) for per-read noisy regions [HiFi 100 / ONT 25]\n"
@@ -100,6 +102,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"output", required_argument, nullptr, 'o'},
         {"vcf-output", required_argument, nullptr, 'v'},
         {"read-support", required_argument, nullptr, kReadSupportOption},
+        {"chunk-size", required_argument, nullptr, kChunkSizeOption},
         {"noisy-merge-dis", required_argument, nullptr, kNoisyRegMergeDisOption},
         {"min-sv-len", required_argument, nullptr, kMinSvLenOption},
         {"noisy-slide-win", required_argument, nullptr, kNoisySlideWinOption},
@@ -165,6 +168,9 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kReadSupportOption:
                 opts.read_support_tsv = optarg;
                 break;
+            case kChunkSizeOption:
+                opts.chunk_size = std::stoll(optarg);
+                break;
             case kNoisyRegMergeDisOption:
                 opts.noisy_reg_merge_dis = std::stoi(optarg);
                 break;
@@ -201,7 +207,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         }
     }
 
-    if (opts.threads < 1 || opts.min_mapq < 0 || opts.min_bq < 0 ||
+    if (opts.threads < 1 || opts.min_mapq < 0 || opts.min_bq < 0 || opts.chunk_size < 1 ||
         opts.min_depth < 0 || opts.min_alt_depth < 0 || opts.noisy_reg_merge_dis < 0 || opts.min_sv_len < 0 ||
         opts.min_af < 0.0 || opts.max_af < opts.min_af || opts.strand_bias_pval < 0.0 ||
         opts.strand_bias_pval > 1.0 || opts.max_var_ratio_per_read < 0.0 || opts.max_noisy_frac_per_read < 0.0 ||
