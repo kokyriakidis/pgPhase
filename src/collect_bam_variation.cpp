@@ -62,8 +62,8 @@ constexpr int kDefaultMinDepth = 5;
 constexpr int kDefaultMinAltDepth = 2;
 constexpr double kDefaultMinAf = 0.20;
 constexpr double kDefaultMaxAf = 0.80;
-constexpr int kDefaultNoisyRegSlideWinHifi = 200; // longcallD LONGCALLD_NOISY_REG_HIFI_SLIDE_WIN
-constexpr int kDefaultNoisyRegSlideWinOnt = 50;   // longcallD LONGCALLD_NOISY_REG_ONT_SLIDE_WIN
+constexpr int kDefaultNoisyRegSlideWinHifi = 100; // longcallD LONGCALLD_NOISY_REG_HIFI_SLIDE_WIN
+constexpr int kDefaultNoisyRegSlideWinOnt = 25;   // longcallD LONGCALLD_NOISY_REG_ONT_SLIDE_WIN
 constexpr int kLongClipLength = 30;
 constexpr int kClipFlank = 100;
 constexpr hts_pos_t kReferenceFlank = 50000;
@@ -990,8 +990,9 @@ void variant_genomic_span(const VariantKey& key, hts_pos_t& var_start, hts_pos_t
         var_end = key.pos + key.ref_len - 1;
         return;
     }
-    var_start = key.pos - 1;
-    var_end = key.pos;
+    // longcallD uses `var->pos .. var->pos + ref_len - 1` here; insertions have ref_len=0.
+    var_start = key.pos;
+    var_end = key.pos - 1;
 }
 
 /** longcallD `log_hypergeometric` / `fisher_exact_test` (math_utils.c), using `lgamma` only. */
@@ -1348,7 +1349,7 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
         VariantCategory c = cats[i];
         if (c == VariantCategory::StrandBias) continue;
 
-        if (chunk_noisy->n_r > 0) {
+        if (!opts.is_ont && chunk_noisy->n_r > 0) {
             int64_t n = 0;
             if (variants[i].key.type == VariantType::Insertion) {
                 n = cr_overlap(chunk_noisy,
@@ -2854,7 +2855,9 @@ static void collect_prephase_candidates(BamChunk& chunk,
 static void classify_and_filter_candidates(BamChunk& chunk, const Options& opts, const bam_hdr_t* header) {
     run_collect_var_pipeline(chunk, opts, header);
     post_process_noisy_regs_pgphase(chunk, chunk.candidates);
-    apply_noisy_containment_filter(chunk);
+    if (!opts.is_ont) {
+        apply_noisy_containment_filter(chunk);
+    }
 }
 
 static void finalize_chunk_outputs(BamChunk& chunk, ChunkStitchBundle& stitch_out) {
@@ -3116,7 +3119,7 @@ void print_collect_help() {
               << "      --read-support FILE       Per-read ref/alt observations at candidates (for phasing)\n"
               << "      --noisy-merge-dis INT     Max distance (bp) to merge noisy/SV windows [500]\n"
               << "      --min-sv-len INT          min_sv_len for noisy-region cgranges merge [30]\n"
-              << "      --noisy-slide-win INT     Slide window (bp) for per-read noisy regions [HiFi 200 / ONT 50]\n"
+              << "      --noisy-slide-win INT     Slide window (bp) for per-read noisy regions [HiFi 100 / ONT 25]\n"
               << "      --ont                     ONT mode: Fisher exact test for alt strand bias\n"
               << "      --strand-bias-pval FLOAT  max p-value for ONT strand filter [0.01]\n"
               << "      --noisy-max-xgaps INT     max indel len (bp) for STR/homopolymer flags [5]\n"

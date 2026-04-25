@@ -11,6 +11,20 @@ from pathlib import Path
 
 
 LONGCALLD_SITE_RE = re.compile(r"^CandVarSite:\s+([^:]+):(\d+)\s+(\d+)-([XID])-([0-9]+)")
+LONGCALLD_CATE_RE = re.compile(
+    r"^CandVarCate-([A-Za-z0-9]):\s+([^:]+):(\d+)\s+(\d+)-([XID])-([0-9]+)\s+\d+\tLow-Depth:\s+\d+\t(.*):\s+\d+"
+)
+
+PGPHASE_TO_LONGCALLD_CATE = {
+    "LOW_COV": "L",
+    "STRAND_BIAS": "B",
+    "CLEAN_HET_SNP": "N",
+    "CLEAN_HET_INDEL": "I",
+    "REP_HET_INDEL": "R",
+    "CLEAN_HOM": "H",
+    "LOW_AF": "l",
+    "NON_VAR": "0",
+}
 
 
 @dataclass(frozen=True, order=True)
@@ -20,6 +34,12 @@ class Candidate:
     kind: str
     ref_len: int
     alt_len: int
+
+
+@dataclass(frozen=True, order=True)
+class CategorizedCandidate:
+    candidate: Candidate
+    alt: str
 
 
 def normalize_kind(kind: str) -> str:
@@ -74,6 +94,35 @@ def load_pgphase(path: Path, chrom: str | None) -> set[Candidate]:
     return candidates
 
 
+def pgphase_category_key(row: dict[str, str]) -> CategorizedCandidate:
+    alt = row.get("ALT", "")
+    if alt == ".":
+        alt = ""
+    if normalize_kind(row.get("TYPE", row.get("type", ""))) == "DEL":
+        alt = ""
+    return CategorizedCandidate(candidate=pgphase_candidate(row), alt=alt)
+
+
+def load_pgphase_categories(path: Path, chrom: str | None) -> dict[CategorizedCandidate, str]:
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        categories: dict[CategorizedCandidate, str] = {}
+        for row in reader:
+            candidate = pgphase_candidate(row)
+            if chrom and candidate.chrom != chrom:
+                continue
+            raw_category = row.get("CATEGORY")
+            if not raw_category:
+                continue
+            mapped = PGPHASE_TO_LONGCALLD_CATE.get(raw_category)
+            if mapped is None:
+                # Categories such as NOISY_CANDIDATE/NOISY_RESOLVED have no direct
+                # one-letter longcallD CandVarCate code in this stage.
+                continue
+            categories[pgphase_category_key(row)] = mapped
+    return categories
+
+
 def load_longcalld(path: Path, chrom: str | None) -> set[Candidate]:
     candidates: set[Candidate] = set()
     with path.open() as handle:
@@ -96,8 +145,44 @@ def load_longcalld(path: Path, chrom: str | None) -> set[Candidate]:
     return candidates
 
 
+def load_longcalld_categories(path: Path, chrom: str | None, stage: str) -> dict[CategorizedCandidate, str]:
+    categories: dict[CategorizedCandidate, str] = {}
+    in_final_block = stage != "final"
+    with path.open() as handle:
+        for line in handle:
+            if stage == "final" and "After classify var:" in line and "candidate vars" in line:
+                in_final_block = True
+                continue
+            if stage == "final" and in_final_block and not line.startswith("CandVarCate-"):
+                in_final_block = False
+            if not in_final_block:
+                continue
+            match = LONGCALLD_CATE_RE.match(line)
+            if match is None:
+                continue
+            cate, site_chrom, pos, ref_len, raw_kind, alt_len, alt = match.groups()
+            if chrom and site_chrom != chrom:
+                continue
+            candidate = Candidate(
+                chrom=site_chrom,
+                pos=int(pos),
+                kind=normalize_kind(raw_kind),
+                ref_len=int(ref_len),
+                alt_len=int(alt_len),
+            )
+            if normalize_kind(raw_kind) == "DEL":
+                alt = ""
+            categories[CategorizedCandidate(candidate=candidate, alt=alt)] = cate
+    return categories
+
+
 def format_candidate(candidate: Candidate) -> str:
     return f"{candidate.chrom}:{candidate.pos}:{candidate.kind}:{candidate.ref_len}:{candidate.alt_len}"
+
+
+def format_categorized(candidate: CategorizedCandidate) -> str:
+    alt = candidate.alt if candidate.alt else "."
+    return f"{format_candidate(candidate.candidate)}:{alt}"
 
 
 def print_examples(title: str, candidates: set[Candidate], limit: int) -> None:
@@ -112,6 +197,17 @@ def main() -> int:
     parser.add_argument("--longcalld", required=True, type=Path, help="longcallD verbose log")
     parser.add_argument("--chrom", help="Restrict comparison to one chromosome/contig")
     parser.add_argument("--show", type=int, default=10, help="Number of mismatch examples to print [10]")
+    parser.add_argument(
+        "--compare-categories",
+        action="store_true",
+        help="Also compare per-site CandVarCate labels (requires longcallD log with -V 2 and pgPhase CATEGORY column)",
+    )
+    parser.add_argument(
+        "--category-stage",
+        choices=("final", "all"),
+        default="final",
+        help="Which longcallD CandVarCate lines to compare [final]",
+    )
     args = parser.parse_args()
 
     pgphase = load_pgphase(args.pgphase, args.chrom)
@@ -126,7 +222,28 @@ def main() -> int:
     print_examples("only in pgPhase", only_pgphase, args.show)
     print_examples("only in longcallD", only_longcalld, args.show)
 
-    return 0 if not only_pgphase and not only_longcalld else 2
+    category_ok = True
+    if args.compare_categories:
+        pg_categories = load_pgphase_categories(args.pgphase, args.chrom)
+        longcalld_categories = load_longcalld_categories(args.longcalld, args.chrom, args.category_stage)
+        shared_keys = sorted(set(pg_categories) & set(longcalld_categories))
+        category_mismatches = [
+            (candidate, pg_categories[candidate], longcalld_categories[candidate])
+            for candidate in shared_keys
+            if pg_categories[candidate] != longcalld_categories[candidate]
+        ]
+
+        print(f"pgPhase categorized candidates: {len(pg_categories)}")
+        print(f"longcallD categorized candidates: {len(longcalld_categories)}")
+        print(f"shared categorized candidates: {len(shared_keys)}")
+        print(f"category mismatches: {len(category_mismatches)}")
+        for candidate, pg_cate, lcd_cate in category_mismatches[: args.show]:
+            print(f"  {format_categorized(candidate)} pgPhase={pg_cate} longcallD={lcd_cate}")
+        if len(longcalld_categories) == 0:
+            print("warning: no CandVarCate lines found in longcallD log (run longcallD with -V 2)")
+        category_ok = len(category_mismatches) == 0
+
+    return 0 if (not only_pgphase and not only_longcalld and category_ok) else 2
 
 
 if __name__ == "__main__":
