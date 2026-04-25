@@ -1,0 +1,6 @@
+[submodule "third_party/WFA2-lib"]
+	path = third_party/WFA2-lib
+	url = /home/kokyriakidis/Downloads/longcallD/WFA2-lib
+[submodule "third_party/abPOA"]
+	path = third_party/abPOA
+	url = /home/kokyriakidis/Downloads/longcallD/abPOA
