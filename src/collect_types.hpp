@@ -28,6 +28,7 @@ constexpr double kDefaultMinAf = 0.20;
 constexpr double kDefaultMaxAf = 0.80;
 constexpr int kDefaultNoisyRegSlideWinHifi = 100; // longcallD LONGCALLD_NOISY_REG_HIFI_SLIDE_WIN
 constexpr int kDefaultNoisyRegSlideWinOnt = 25;   // longcallD LONGCALLD_NOISY_REG_ONT_SLIDE_WIN
+constexpr int kDefaultNoisyRegSlideWinShortReads = 25;
 constexpr int kLongClipLength = 30;
 constexpr int kClipFlank = 100;
 constexpr hts_pos_t kReferenceFlank = 50000;
@@ -69,6 +70,12 @@ enum class DigarType : uint8_t {
     RefSkip
 };
 
+enum class ReadTechnology : uint8_t {
+    Hifi,
+    Ont,
+    ShortReads
+};
+
 struct Options {
     int threads = 1;
     int min_mapq = kDefaultMinMapq;
@@ -80,11 +87,11 @@ struct Options {
     double max_af = kDefaultMaxAf;
     double max_var_ratio_per_read = kDefaultMaxVarRatioPerRead;
     double max_noisy_frac_per_read = kDefaultMaxNoisyFracPerRead;
-    int noisy_reg_slide_win = -1; // if <0, pick longcallD default based on --ont
+    int noisy_reg_slide_win = -1; // if <0, pick default based on read_technology
     /** longcallD: `opt->noisy_reg_merge_dis` / `opt->min_sv_len` in `pre_process_noisy_regs` + `cr_merge`. */
     int noisy_reg_merge_dis = kNoisyRegMergeDis;
     int min_sv_len = kLongcalldMinSvLen;
-    bool is_ont = false;
+    ReadTechnology read_technology = ReadTechnology::Hifi;
     double strand_bias_pval = kDefaultStrandBiasPvalOnt;
     int noisy_reg_max_xgaps = kDefaultNoisyRegMaxXgaps;
     bool include_filtered = false;
@@ -103,6 +110,14 @@ struct Options {
 
     const std::string& primary_bam_file() const {
         return bam_files.empty() ? bam_file : bam_files.front();
+    }
+
+    bool is_ont() const {
+        return read_technology == ReadTechnology::Ont;
+    }
+
+    bool is_short_reads() const {
+        return read_technology == ReadTechnology::ShortReads;
     }
 };
 

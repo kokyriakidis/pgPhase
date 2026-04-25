@@ -98,9 +98,10 @@ static void xid_push_win(XidQueue& q,
 }
 
 static int effective_noisy_slide_win(const Options& opts) {
-    return opts.noisy_reg_slide_win > 0 ? opts.noisy_reg_slide_win
-                                        : (opts.is_ont ? kDefaultNoisyRegSlideWinOnt
-                                                       : kDefaultNoisyRegSlideWinHifi);
+    if (opts.noisy_reg_slide_win > 0) return opts.noisy_reg_slide_win;
+    if (opts.is_ont()) return kDefaultNoisyRegSlideWinOnt;
+    if (opts.is_short_reads()) return kDefaultNoisyRegSlideWinShortReads;
+    return kDefaultNoisyRegSlideWinHifi;
 }
 
 struct NoisyRegionBuilder {

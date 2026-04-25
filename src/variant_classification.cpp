@@ -285,7 +285,7 @@ static VariantCategory classify_variant_initial(const VariantKey& key,
     if (counts.alt_cov < opts.min_alt_depth) {
         return VariantCategory::LowCoverage;
     }
-    if (opts.is_ont) {
+    if (opts.is_ont()) {
         const int fa = counts.forward_alt;
         const int ra = counts.reverse_alt;
         const int expected = (fa + ra) / 2;
@@ -335,7 +335,7 @@ void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
     for (size_t i = 0; i < variants.size(); ++i) {
         const VariantCategory c = cats[i];
         if (c == VariantCategory::LowCoverage) continue;
-        if (opts.is_ont && c == VariantCategory::StrandBias) continue;
+        if (opts.is_ont() && c == VariantCategory::StrandBias) continue;
         const VariantKey& k = variants[i].key;
         if (k.type == VariantType::Insertion) {
             cr_add(var_pos_cr, "cr", static_cast<int32_t>(k.pos - 1), static_cast<int32_t>(k.pos), 1);
@@ -367,7 +367,7 @@ void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
         VariantCategory c = cats[i];
         if (c == VariantCategory::StrandBias) continue;
 
-        if (!opts.is_ont && chunk_noisy->n_r > 0) {
+        if (!opts.is_ont() && chunk_noisy->n_r > 0) {
             int64_t n = 0;
             if (variants[i].key.type == VariantType::Insertion) {
                 n = cr_overlap(chunk_noisy,
