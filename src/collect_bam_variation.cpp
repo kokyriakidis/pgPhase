@@ -19,7 +19,9 @@ enum LongOption {
     kNoisyRegMergeDisOption,
     kMinSvLenOption,
     kChunkSizeOption,
+    kHifiOption,
     kOntOption,
+    kShortReadsOption,
     kStrandBiasPvalOption,
     kNoisyMaxXgapsOption,
     kMaxNoisyFracOption,
@@ -68,8 +70,10 @@ void print_collect_help() {
               << "      --chunk-size INT          Region chunk size in bp [500000]\n"
               << "      --noisy-merge-dis INT     Max distance (bp) to merge noisy/SV windows [500]\n"
               << "      --min-sv-len INT          min_sv_len for noisy-region cgranges merge [30]\n"
-              << "      --noisy-slide-win INT     Slide window (bp) for per-read noisy regions [HiFi 100 / ONT 25]\n"
+              << "      --noisy-slide-win INT     Slide window (bp) for per-read noisy regions [HiFi 100 / ONT/short reads 25]\n"
+              << "      --hifi                    HiFi mode: 100 bp noisy window, simple strand filter [default]\n"
               << "      --ont                     ONT mode: Fisher exact test for alt strand bias\n"
+              << "      --short-reads             Short-read mode: 25 bp noisy window, HiFi strand filter\n"
               << "      --strand-bias-pval FLOAT  max p-value for ONT strand filter [0.01]\n"
               << "      --noisy-max-xgaps INT     max indel len (bp) for STR/homopolymer flags [5]\n"
               << "\n"
@@ -109,7 +113,9 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"debug-site", required_argument, nullptr, kDebugSiteOption},
         {"extra-bam", required_argument, nullptr, 'X'},
         {"input-is-list", no_argument, nullptr, 'L'},
+        {"hifi", no_argument, nullptr, kHifiOption},
         {"ont", no_argument, nullptr, kOntOption},
+        {"short-reads", no_argument, nullptr, kShortReadsOption},
         {"strand-bias-pval", required_argument, nullptr, kStrandBiasPvalOption},
         {"noisy-max-xgaps", required_argument, nullptr, kNoisyMaxXgapsOption},
         {"help", no_argument, nullptr, 'h'},
@@ -118,6 +124,16 @@ int collect_bam_variation(int argc, char* argv[]) {
 
     int opt = 0;
     int long_index = 0;
+    bool read_technology_was_set = false;
+    bool read_technology_conflict = false;
+    const auto set_read_technology = [&](ReadTechnology tech) {
+        if (read_technology_was_set && opts.read_technology != tech) {
+            read_technology_conflict = true;
+            return;
+        }
+        opts.read_technology = tech;
+        read_technology_was_set = true;
+    };
     while ((opt = getopt_long(argc, argv, "t:q:B:D:r:R:aj:o:v:hX:L", long_options, &long_index)) != -1) {
         switch (opt) {
             case 't':
@@ -189,8 +205,14 @@ int collect_bam_variation(int argc, char* argv[]) {
             case 'L':
                 opts.input_is_list = true;
                 break;
+            case kHifiOption:
+                set_read_technology(ReadTechnology::Hifi);
+                break;
             case kOntOption:
-                opts.is_ont = true;
+                set_read_technology(ReadTechnology::Ont);
+                break;
+            case kShortReadsOption:
+                set_read_technology(ReadTechnology::ShortReads);
                 break;
             case kStrandBiasPvalOption:
                 opts.strand_bias_pval = std::stod(optarg);
@@ -213,6 +235,10 @@ int collect_bam_variation(int argc, char* argv[]) {
         opts.strand_bias_pval > 1.0 || opts.max_var_ratio_per_read < 0.0 || opts.max_noisy_frac_per_read < 0.0 ||
         opts.noisy_reg_max_xgaps < 0 || opts.noisy_reg_slide_win < -1) {
         std::cerr << "Error: numeric thresholds are invalid\n";
+        return 1;
+    }
+    if (read_technology_conflict) {
+        std::cerr << "Error: choose only one of --hifi, --ont, or --short-reads\n";
         return 1;
     }
 

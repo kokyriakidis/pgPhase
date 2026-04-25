@@ -54,7 +54,7 @@ static void collect_prephase_candidates(BamChunk& chunk,
 static void classify_and_filter_candidates(BamChunk& chunk, const Options& opts, const bam_hdr_t* header) {
     classify_chunk_candidates(chunk, opts, header);
     post_process_noisy_regs_pgphase(chunk, chunk.candidates);
-    if (!opts.is_ont) {
+    if (!opts.is_ont()) {
         apply_noisy_containment_filter(chunk);
     }
 }
