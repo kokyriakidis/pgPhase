@@ -2,10 +2,12 @@
 
 #include "collect_pipeline.hpp"
 
+#include <fstream>
 #include <getopt.h>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace pgphase_collect {
 
@@ -21,12 +23,31 @@ enum LongOption {
     kNoisyMaxXgapsOption,
     kMaxNoisyFracOption,
     kNoisySlideWinOption,
-    kDebugSiteOption
+    kDebugSiteOption,
+    kInputIsListOption
 };
 
+static std::vector<std::string> load_bam_list(const std::string& path) {
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("failed to open BAM/CRAM list: " + path);
+    std::vector<std::string> files;
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        if (line[first] == '#') continue;
+        const size_t last = line.find_last_not_of(" \t\r\n");
+        files.push_back(line.substr(first, last - first + 1));
+    }
+    if (files.empty()) throw std::runtime_error("BAM/CRAM list is empty: " + path);
+    return files;
+}
+
 void print_collect_help() {
-    std::cout << "Usage: pgphase collect-bam-variation [options] <ref.fa> <input.bam>\n"
+    std::cout << "Usage: pgphase collect-bam-variation [options] <ref.fa> <input.bam|bam.list> [region ...]\n"
               << "Options:\n"
+              << "  -L, --input-is-list          Treat input path as a list of BAM/CRAM files\n"
+              << "  -X, --extra-bam FILE         Extra input BAM/CRAM file; may be repeated\n"
               << "  -t, --threads INT             Region worker threads [1]\n"
               << "  -q, --min-mapq INT            Minimum read mapping quality [30]\n"
               << "  -B, --min-bq INT              Minimum base quality for candidate sites [10]\n"
@@ -50,7 +71,7 @@ void print_collect_help() {
               << "      --strand-bias-pval FLOAT  max p-value for ONT strand filter [0.01]\n"
               << "      --noisy-max-xgaps INT     max indel len (bp) for STR/homopolymer flags [5]\n"
               << "\n"
-              << "Regions can also be supplied after <input.bam>, e.g.\n"
+              << "Regions can also be supplied after <input.bam|bam.list>, e.g.\n"
               << "  pgphase collect-bam-variation ref.fa hifi.bam chr11:1000-2000 chr12:1-500\n";
 }
 
@@ -59,6 +80,7 @@ void print_collect_help() {
 int collect_bam_variation(int argc, char* argv[]) {
     using namespace pgphase_collect;
     Options opts;
+    std::vector<std::string> extra_bam_files;
     optind = 1;
 
     const struct option long_options[] = {
@@ -82,6 +104,8 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"min-sv-len", required_argument, nullptr, kMinSvLenOption},
         {"noisy-slide-win", required_argument, nullptr, kNoisySlideWinOption},
         {"debug-site", required_argument, nullptr, kDebugSiteOption},
+        {"extra-bam", required_argument, nullptr, 'X'},
+        {"input-is-list", no_argument, nullptr, 'L'},
         {"ont", no_argument, nullptr, kOntOption},
         {"strand-bias-pval", required_argument, nullptr, kStrandBiasPvalOption},
         {"noisy-max-xgaps", required_argument, nullptr, kNoisyMaxXgapsOption},
@@ -91,7 +115,7 @@ int collect_bam_variation(int argc, char* argv[]) {
 
     int opt = 0;
     int long_index = 0;
-    while ((opt = getopt_long(argc, argv, "t:q:B:D:r:R:aj:o:v:h", long_options, &long_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:q:B:D:r:R:aj:o:v:hX:L", long_options, &long_index)) != -1) {
         switch (opt) {
             case 't':
                 opts.threads = std::stoi(optarg);
@@ -153,6 +177,12 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kDebugSiteOption:
                 opts.debug_site = optarg;
                 break;
+            case 'X':
+                extra_bam_files.push_back(optarg);
+                break;
+            case 'L':
+                opts.input_is_list = true;
+                break;
             case kOntOption:
                 opts.is_ont = true;
                 break;
@@ -185,7 +215,14 @@ int collect_bam_variation(int argc, char* argv[]) {
         return 1;
     }
     opts.ref_fasta = argv[optind];
-    opts.bam_file = argv[optind + 1];
+    const std::string input_path = argv[optind + 1];
+    if (opts.input_is_list) {
+        opts.bam_files = load_bam_list(input_path);
+    } else {
+        opts.bam_files.push_back(input_path);
+    }
+    opts.bam_files.insert(opts.bam_files.end(), extra_bam_files.begin(), extra_bam_files.end());
+    opts.bam_file = opts.bam_files.front();
     for (int arg_i = optind + 2; arg_i < argc; ++arg_i) {
         opts.regions.push_back(argv[arg_i]);
     }

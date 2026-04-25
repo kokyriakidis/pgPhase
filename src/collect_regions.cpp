@@ -146,13 +146,12 @@ std::vector<RegionChunk> build_region_chunks(const Options& opts, const bam_hdr_
 }
 
 std::vector<RegionChunk> load_region_chunks(const Options& opts) {
-    SamFile bam(opts.bam_file, 1);
+    SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
     std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
     if (!header) throw std::runtime_error("failed to read BAM header");
-    std::unique_ptr<hts_idx_t, IndexDeleter> index(sam_index_load(bam.get(), opts.bam_file.c_str()));
+    std::unique_ptr<hts_idx_t, IndexDeleter> index(sam_index_load(bam.get(), opts.primary_bam_file().c_str()));
     if (!index) throw std::runtime_error("region chunking requires an indexed BAM/CRAM");
-    std::unique_ptr<faidx_t, FaiDeleter> fai(fai_load(opts.ref_fasta.c_str()));
-    if (!fai) throw std::runtime_error("failed to load FASTA index for: " + opts.ref_fasta);
+    std::unique_ptr<faidx_t, FaiDeleter> fai(load_reference_index(opts.ref_fasta));
     return build_region_chunks(opts, header.get(), fai.get());
 }
 

@@ -88,15 +88,21 @@ struct Options {
     int noisy_reg_max_xgaps = kDefaultNoisyRegMaxXgaps;
     bool include_filtered = false;
     bool autosome = false;
+    bool input_is_list = false;
     std::string region_file;
     std::vector<std::string> regions;
     std::string ref_fasta;
     std::string bam_file;
+    std::vector<std::string> bam_files;
     std::string output_tsv = "output.tsv";
     std::string output_vcf;
     /** If non-empty, write per-read allele observations for downstream phasing. */
     std::string read_support_tsv;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
+
+    const std::string& primary_bam_file() const {
+        return bam_files.empty() ? bam_file : bam_files.front();
+    }
 };
 
 struct RegionFilter {
@@ -243,8 +249,16 @@ struct FaiDeleter {
 
 class SamFile {
 public:
-    SamFile(const std::string& path, int threads) : fp_(sam_open(path.c_str(), "r")) {
+    SamFile(const std::string& path, int threads, const std::string& ref_fasta = "") : fp_(sam_open(path.c_str(), "r")) {
         if (fp_ == nullptr) throw std::runtime_error("failed to open BAM/CRAM: " + path);
+        const htsFormat* fmt = hts_get_format(fp_);
+        if (fmt == nullptr) throw std::runtime_error("failed to inspect alignment format: " + path);
+        if (fmt->format != bam && fmt->format != cram) {
+            throw std::runtime_error("input alignment file must be BAM or CRAM: " + path);
+        }
+        if (fmt->format == cram && !ref_fasta.empty() && hts_set_fai_filename(fp_, ref_fasta.c_str()) != 0) {
+            throw std::runtime_error("failed to set reference for CRAM decoding: " + path);
+        }
         if (threads > 1 && hts_set_threads(fp_, threads) != 0) {
             throw std::runtime_error("failed to configure htslib threads");
         }
@@ -318,21 +332,34 @@ private:
     std::string seq_;
 };
 
+inline faidx_t* load_reference_index(const std::string& ref_fasta) {
+    faidx_t* fai = fai_load3(ref_fasta.c_str(), nullptr, nullptr, FAI_CREATE);
+    if (fai == nullptr) throw std::runtime_error("failed to load/build reference FASTA index: " + ref_fasta);
+    return fai;
+}
+
 struct WorkerContext {
     explicit WorkerContext(const Options& opts)
-        : bam(opts.bam_file, 1),
-          header(sam_hdr_read(bam.get())),
-          index(sam_index_load(bam.get(), opts.bam_file.c_str())),
-          fai(fai_load(opts.ref_fasta.c_str())),
+        : fai(load_reference_index(opts.ref_fasta)),
           ref(fai.get()) {
-        if (!header) throw std::runtime_error("failed to read BAM header");
-        if (!index) throw std::runtime_error("region chunking requires an indexed BAM/CRAM");
-        if (!fai) throw std::runtime_error("failed to load FASTA index for: " + opts.ref_fasta);
+        if (opts.bam_files.empty()) throw std::runtime_error("no input BAM/CRAM files provided");
+        bams.reserve(opts.bam_files.size());
+        headers.reserve(opts.bam_files.size());
+        indexes.reserve(opts.bam_files.size());
+        for (const std::string& path : opts.bam_files) {
+            bams.push_back(std::make_unique<SamFile>(path, 1, opts.ref_fasta));
+            headers.emplace_back(sam_hdr_read(bams.back()->get()));
+            if (!headers.back()) throw std::runtime_error("failed to read BAM header: " + path);
+            indexes.emplace_back(sam_index_load(bams.back()->get(), path.c_str()));
+            if (!indexes.back()) throw std::runtime_error("region chunking requires an indexed BAM/CRAM: " + path);
+        }
     }
 
-    SamFile bam;
-    std::unique_ptr<bam_hdr_t, HeaderDeleter> header;
-    std::unique_ptr<hts_idx_t, IndexDeleter> index;
+    bam_hdr_t* primary_header() const { return headers.front().get(); }
+
+    std::vector<std::unique_ptr<SamFile>> bams;
+    std::vector<std::unique_ptr<bam_hdr_t, HeaderDeleter>> headers;
+    std::vector<std::unique_ptr<hts_idx_t, IndexDeleter>> indexes;
     std::unique_ptr<faidx_t, FaiDeleter> fai;
     ReferenceCache ref;
 };
