@@ -12,7 +12,15 @@ C_CFLAGS = -O3 -Wall -Wextra
 WFA2_LIB = $(WFA2_ROOT)/lib/libwfa.a
 ABPOA_LIB = $(ABPOA_ROOT)/lib/libabpoa.a
 
-SOURCES_CXX = src/main.cpp src/collect_bam_variation.cpp
+SOURCES_CXX = src/main.cpp \
+	src/collect_bam_variation.cpp \
+	src/collect_pipeline.cpp \
+	src/collect_regions.cpp \
+	src/bam_digar.cpp \
+	src/candidate_collection.cpp \
+	src/collect_output.cpp \
+	src/noisy_regions.cpp \
+	src/variant_classification.cpp
 SOURCES_C = src/sdust.c src/cgranges.c src/kalloc.c
 
 OBJS = $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o)
