@@ -30,8 +30,6 @@
 
 extern "C" {
 #include "cgranges.h"
-#include "abpoa.h"
-#include "wavefront/wavefront_align.h"
 }
 #include "sdust.h"
 
@@ -342,8 +340,6 @@ struct ReadRecord {
     bool is_skipped = false;
     int total_cand_events = 0; // longcallD n_total_cand_vars (includes long-clip noisy windows)
     const char* digar_source = "ref"; // eqx/cs/md/ref (which builder populated digars)
-    int hap = 0;
-    hts_pos_t read_phase_set = 0;
 };
 
 static inline void record_variant_event(ReadRecord& read, int tid, const DigarOp& digar) {
@@ -431,9 +427,6 @@ struct VariantCounts {
     int reverse_alt = 0;
     VariantCategory category = VariantCategory::LowCoverage;
     double allele_fraction = 0.0;
-    hts_pos_t phase_set = 0;
-    int hap_alt = 0;
-    int hap_ref = 0;
 };
 
 struct CandidateVariant {
@@ -450,8 +443,6 @@ struct BamChunk {
     std::string ref_seq;
     std::vector<Interval> low_complexity_regions;
     std::vector<int> ordered_read_ids;
-    std::vector<int> up_overlap_read_ids;
-    std::vector<int> down_overlap_read_ids;
     std::vector<Interval> noisy_regions;
     std::vector<ReadRecord> reads;
     CandidateTable candidates;
@@ -462,15 +453,6 @@ struct BamChunk {
     int chunk_median_qual = 0;
     int chunk_third_quar_qual = 0;
     int chunk_max_qual = 0;
-};
-
-struct ChunkStitchBundle {
-    std::vector<std::string> up_qnames;
-    std::vector<std::string> down_qnames;
-    std::vector<int> up_haps;
-    std::vector<int> down_haps;
-    std::vector<hts_pos_t> up_phase;
-    std::vector<hts_pos_t> down_phase;
 };
 
 struct HeaderDeleter {
@@ -1689,99 +1671,6 @@ void post_process_noisy_regs_pgphase(BamChunk& chunk, const CandidateTable& cand
     intervals_from_cr(noisy_own.cr, chunk.noisy_regions);
 }
 
-void sort_overlap_read_ids(BamChunk& chunk) {
-    auto cmp = [&](int lhs, int rhs) {
-        const std::string& a = chunk.reads[static_cast<size_t>(lhs)].qname;
-        const std::string& b = chunk.reads[static_cast<size_t>(rhs)].qname;
-        if (a != b) return a < b;
-        if (chunk.reads[static_cast<size_t>(lhs)].beg != chunk.reads[static_cast<size_t>(rhs)].beg) {
-            return chunk.reads[static_cast<size_t>(lhs)].beg < chunk.reads[static_cast<size_t>(rhs)].beg;
-        }
-        return chunk.reads[static_cast<size_t>(lhs)].nm < chunk.reads[static_cast<size_t>(rhs)].nm;
-    };
-    std::sort(chunk.up_overlap_read_ids.begin(), chunk.up_overlap_read_ids.end(), cmp);
-    std::sort(chunk.down_overlap_read_ids.begin(), chunk.down_overlap_read_ids.end(), cmp);
-}
-
-void fill_stitch_bundle(const BamChunk& chunk, ChunkStitchBundle& bundle) {
-    bundle.up_qnames.clear();
-    bundle.down_qnames.clear();
-    bundle.up_haps.clear();
-    bundle.down_haps.clear();
-    bundle.up_phase.clear();
-    bundle.down_phase.clear();
-    for (int id : chunk.up_overlap_read_ids) {
-        const ReadRecord& r = chunk.reads[static_cast<size_t>(id)];
-        bundle.up_qnames.push_back(r.qname);
-        bundle.up_haps.push_back(r.hap);
-        bundle.up_phase.push_back(r.read_phase_set);
-    }
-    for (int id : chunk.down_overlap_read_ids) {
-        const ReadRecord& r = chunk.reads[static_cast<size_t>(id)];
-        bundle.down_qnames.push_back(r.qname);
-        bundle.down_haps.push_back(r.hap);
-        bundle.down_phase.push_back(r.read_phase_set);
-    }
-}
-
-void apply_flip_between_chunks(const ChunkStitchBundle& pre,
-                               const ChunkStitchBundle& cur,
-                               CandidateTable& pre_cand,
-                               CandidateTable& cur_cand) {
-    (void)pre_cand;
-    if (pre.down_qnames.size() != cur.up_qnames.size()) return;
-    int flip_hap_score = 0;
-    hts_pos_t max_pre_read_ps = -1;
-    hts_pos_t min_cur_read_ps = std::numeric_limits<hts_pos_t>::max();
-    for (size_t j = 0; j < cur.up_qnames.size(); ++j) {
-        if (pre.down_qnames[j] != cur.up_qnames[j]) continue;
-        const int pre_hap = pre.down_haps[j];
-        const int cur_hap = cur.up_haps[j];
-        const hts_pos_t pre_ps = j < pre.down_phase.size() ? pre.down_phase[j] : 0;
-        const hts_pos_t cur_ps = j < cur.up_phase.size() ? cur.up_phase[j] : 0;
-        if (pre_hap == 0 || cur_hap == 0 || pre_ps <= 0 || cur_ps <= 0) continue;
-        if (pre_hap == cur_hap) flip_hap_score -= 1;
-        else flip_hap_score += 1;
-        max_pre_read_ps = std::max(max_pre_read_ps, pre_ps);
-        min_cur_read_ps = std::min(min_cur_read_ps, cur_ps);
-    }
-    if (flip_hap_score == 0) return;
-    const bool flip = flip_hap_score > 0;
-    if (!flip) return;
-    if (max_pre_read_ps < 0 || min_cur_read_ps == std::numeric_limits<hts_pos_t>::max()) return;
-    for (auto& cv : cur_cand) {
-        if (cv.counts.phase_set <= 0) continue;
-        if (cv.counts.phase_set == min_cur_read_ps) {
-            std::swap(cv.counts.hap_alt, cv.counts.hap_ref);
-            cv.counts.phase_set = max_pre_read_ps;
-        }
-    }
-}
-
-void apply_noisy_wfa_touch(const BamChunk& chunk) {
-    (void)chunk;
-    abpoa_t* ab = abpoa_init();
-    if (ab != nullptr) abpoa_free(ab);
-    if (chunk.noisy_regions.empty()) return;
-
-    wavefront_aligner_attr_t attr = wavefront_aligner_attr_default;
-    attr.distance_metric = gap_affine;
-    attr.affine_penalties.match = 0;
-    attr.affine_penalties.mismatch = 6;
-    attr.affine_penalties.gap_opening = 6;
-    attr.affine_penalties.gap_extension = 2;
-    attr.alignment_scope = compute_alignment;
-    attr.alignment_form.span = alignment_end2end;
-    attr.heuristic.strategy = wf_heuristic_none;
-
-    wavefront_aligner_t* wf = wavefront_aligner_new(&attr);
-    if (wf == nullptr) return;
-    const char pat[] = {0, 1, 2, 3};
-    const char txt[] = {0, 1, 2, 2};
-    wavefront_align(wf, pat, 4, txt, 4);
-    wavefront_aligner_delete(wf);
-}
-
 void recompute_chunk_qual_stats(BamChunk& chunk) {
     chunk.qual_hist.fill(0);
     for (const ReadRecord& r : chunk.reads) {
@@ -2295,10 +2184,6 @@ bool read_passes_filters(const bam1_t* aln, const Options& opts) {
     return true;
 }
 
-bool same_candidate_site(const VariantKey& lhs, const VariantKey& rhs) {
-    return exact_comp_var_site_ins(&lhs, &rhs, kLongcalldMinSvLen) == 0;
-}
-
 /** longcallD `collect_all_cand_var_sites` merge pass: qsort order + `exact_comp_var_site_ins`. */
 void collapse_fuzzy_large_insertions(CandidateTable& variants) {
     std::sort(variants.begin(), variants.end(), [](const CandidateVariant& a, const CandidateVariant& b) {
@@ -2585,8 +2470,6 @@ void populate_low_complexity_intervals(BamChunk& chunk) {
 
 void populate_chunk_read_indexes(BamChunk& chunk) {
     chunk.ordered_read_ids.clear();
-    chunk.up_overlap_read_ids.clear();
-    chunk.down_overlap_read_ids.clear();
     chunk.noisy_regions.clear();
 
     chunk.ordered_read_ids.reserve(chunk.reads.size());
@@ -2594,12 +2477,9 @@ void populate_chunk_read_indexes(BamChunk& chunk) {
         const ReadRecord& read = chunk.reads[read_i];
         if (read.is_skipped) continue;
         chunk.ordered_read_ids.push_back(static_cast<int>(read_i));
-        if (read.beg < chunk.region.beg) chunk.up_overlap_read_ids.push_back(static_cast<int>(read_i));
-        if (read.end > chunk.region.end) chunk.down_overlap_read_ids.push_back(static_cast<int>(read_i));
         chunk.noisy_regions.insert(chunk.noisy_regions.end(), read.noisy_regions.begin(), read.noisy_regions.end());
     }
     merge_intervals(chunk.noisy_regions);
-    sort_overlap_read_ids(chunk);
 }
 
 void finalize_bam_chunk(BamChunk& chunk, ReferenceCache& ref, const bam_hdr_t* header) {
@@ -2637,46 +2517,6 @@ void add_coverage(VariantCounts& counts, bool reverse, bool alt, bool low_qualit
     } else {
         counts.ref_cov++;
         reverse ? counts.reverse_ref++ : counts.forward_ref++;
-    }
-}
-
-std::vector<ReadEvent>::const_iterator find_matching_event(const std::vector<ReadEvent>& events,
-                                                           const VariantKey& key) {
-    const hts_pos_t target_pos = key.sort_pos();
-    auto event_it = std::lower_bound(
-        events.begin(),
-        events.end(),
-        target_pos,
-        [](const ReadEvent& event, hts_pos_t pos) {
-            return event.key.sort_pos() < pos;
-        });
-
-    for (; event_it != events.end() && event_it->key.sort_pos() == target_pos; ++event_it) {
-        if (same_candidate_site(key, event_it->key)) return event_it;
-    }
-    return events.end();
-}
-
-void infer_read_hap_phase_from_candidates(BamChunk& chunk, const CandidateTable& cand) {
-    for (ReadRecord& read : chunk.reads) {
-        if (read.is_skipped) continue;
-        read.hap = 0;
-        read.read_phase_set = 0;
-        for (const ReadEvent& ev : read.events) {
-            if (ev.low_quality) continue;
-            for (const CandidateVariant& cv : cand) {
-                if (!same_candidate_site(cv.key, ev.key)) continue;
-                if (cv.counts.category != VariantCategory::CleanHetSnp &&
-                    cv.counts.category != VariantCategory::CleanHetIndel) {
-                    continue;
-                }
-                read.read_phase_set = cv.counts.phase_set;
-                const auto ev_it = find_matching_event(read.events, cv.key);
-                read.hap = (ev_it != read.events.end()) ? cv.counts.hap_alt : cv.counts.hap_ref;
-                break;
-            }
-            if (read.hap != 0) break;
-        }
     }
 }
 
@@ -2797,22 +2637,6 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
     }
 }
 
-void assign_clean_phase_sets(CandidateTable& variants) {
-    hts_pos_t current_phase_set = 0;
-    for (CandidateVariant& candidate : variants) {
-        const bool is_clean_het = candidate.counts.category == VariantCategory::CleanHetSnp ||
-                                  candidate.counts.category == VariantCategory::CleanHetIndel;
-        if (!is_clean_het) continue;
-
-        if (current_phase_set == 0) current_phase_set = candidate.key.pos;
-        candidate.counts.phase_set = current_phase_set;
-
-        // This subcommand reports collection-time phase support, not final VCF genotypes.
-        candidate.counts.hap_alt = candidate.counts.alt_cov >= candidate.counts.ref_cov ? 1 : 2;
-        candidate.counts.hap_ref = candidate.counts.hap_alt == 1 ? 2 : 1;
-    }
-}
-
 void resolve_simple_noisy_candidates(CandidateTable& variants) {
     for (CandidateVariant& candidate : variants) {
         if (candidate.counts.category != VariantCategory::NoisyCandidate &&
@@ -2825,16 +2649,10 @@ void resolve_simple_noisy_candidates(CandidateTable& variants) {
     }
 }
 
-void assign_haplotype_refinement_light(CandidateTable& variants) {
-    (void)variants;
-}
-
 void run_collect_var_pipeline(BamChunk& chunk, const Options& opts, const bam_hdr_t* header) {
     (void)header;
     classify_cand_vars_pgphase(chunk, opts);
-    assign_clean_phase_sets(chunk.candidates);
     resolve_simple_noisy_candidates(chunk.candidates);
-    assign_haplotype_refinement_light(chunk.candidates);
 }
 
 static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerContext& context) {
@@ -2860,17 +2678,10 @@ static void classify_and_filter_candidates(BamChunk& chunk, const Options& opts,
     }
 }
 
-static void finalize_chunk_outputs(BamChunk& chunk, ChunkStitchBundle& stitch_out) {
-    infer_read_hap_phase_from_candidates(chunk, chunk.candidates);
-    fill_stitch_bundle(chunk, stitch_out);
-    apply_noisy_wfa_touch(chunk);
-}
-
 CandidateTable collect_chunks_parallel(const Options& opts,
                                        const std::vector<RegionChunk>& chunks,
                                        std::vector<std::vector<ReadSupportRow>>* read_support_batches) {
     std::vector<CandidateTable> chunk_tables(chunks.size());
-    std::vector<ChunkStitchBundle> stitch_info(chunks.size());
     if (chunks.empty()) return CandidateTable{};
 
     if (read_support_batches != nullptr) read_support_batches->assign(chunks.size(), {});
@@ -2899,7 +2710,6 @@ CandidateTable collect_chunks_parallel(const Options& opts,
                     if (read_support_batches != nullptr) rs_ptr = &(*read_support_batches)[chunk_i];
                     collect_prephase_candidates(chunk, opts, rs_ptr);
                     classify_and_filter_candidates(chunk, opts, context.header.get());
-                    finalize_chunk_outputs(chunk, stitch_info[chunk_i]);
                     chunk_tables[chunk_i] = std::move(chunk.candidates);
                 }
             } catch (...) {
@@ -2911,13 +2721,6 @@ CandidateTable collect_chunks_parallel(const Options& opts,
 
     for (std::thread& worker : workers) worker.join();
     if (first_error) std::rethrow_exception(first_error);
-
-    for (size_t ii = 1; ii < chunks.size(); ++ii) {
-        if (chunks[ii - 1].tid != chunks[ii].tid) continue;
-        if (chunks[ii - 1].end + 1 != chunks[ii].beg) continue;
-        apply_flip_between_chunks(
-            stitch_info[ii - 1], stitch_info[ii], chunk_tables[ii - 1], chunk_tables[ii]);
-    }
 
     CandidateTable merged;
     for (CandidateTable& table : chunk_tables) {
@@ -2993,7 +2796,7 @@ void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& var
             << counts.alt_cov << '\t' << counts.low_qual_cov << '\t' << counts.forward_ref << '\t'
             << counts.reverse_ref << '\t' << counts.forward_alt << '\t' << counts.reverse_alt << '\t'
             << counts.allele_fraction << '\t' << category_name(counts.category) << '\t'
-            << counts.phase_set << '\t' << counts.hap_alt << '\t' << counts.hap_ref << '\n';
+            << 0 << '\t' << 0 << '\t' << 0 << '\n';
     }
 }
 

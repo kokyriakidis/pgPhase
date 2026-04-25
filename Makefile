@@ -7,13 +7,13 @@ ABPOA_ROOT ?= $(THIRD_PARTY)/abPOA
 CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra
 WFA_CPPFLAGS = -I$(WFA2_ROOT)
 AB_CPPFLAGS = -I$(ABPOA_ROOT)/include
-C_CFLAGS = -O3 -Wall -Wextra $(WFA_CPPFLAGS) $(AB_CPPFLAGS)
+C_CFLAGS = -O3 -Wall -Wextra
 
 WFA2_LIB = $(WFA2_ROOT)/lib/libwfa.a
 ABPOA_LIB = $(ABPOA_ROOT)/lib/libabpoa.a
 
 SOURCES_CXX = src/main.cpp src/collect_bam_variation.cpp
-SOURCES_C = src/sdust.c src/cgranges.c
+SOURCES_C = src/sdust.c src/cgranges.c src/kalloc.c
 
 OBJS = $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o)
 
@@ -27,7 +27,7 @@ check: pgphase
 	bash scripts/validate_collect_gates.sh
 
 %.o: %.cpp
-	$(CXX) $(CXXFLAGS) $(WFA_CPPFLAGS) $(AB_CPPFLAGS) -c $< -o $@
+	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 %.o: %.c
 	$(CC) $(C_CFLAGS) -c $< -o $@
@@ -41,8 +41,8 @@ $(WFA2_LIB):
 $(ABPOA_LIB):
 	$(MAKE) -C "$(ABPOA_ROOT)" libabpoa
 
-pgphase: third-party-libs $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
+pgphase: $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
 clean:
-	rm -f pgphase $(OBJS)
+	rm -f pgphase src/*.o
