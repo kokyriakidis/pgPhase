@@ -1,0 +1,41 @@
+# Build outputs
+/pgphase
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+
+# CMake / generic build dirs
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+# Test and coverage artifacts
+*.gcda
+*.gcno
+*.gcov
+coverage/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*.bak
+*.orig
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE/editor metadata
+.idea/
+.vscode/
+
+# OS metadata
+.DS_Store
+Thumbs.db
