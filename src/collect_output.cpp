@@ -44,7 +44,7 @@ std::string category_name(VariantCategory category) {
     return "UNKNOWN";
 }
 void write_read_support_tsv(const Options& opts, const std::vector<std::vector<ReadSupportRow>>& by_chunk) {
-    SamFile bam(opts.bam_file, 1);
+    SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
     std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
     if (!header) throw std::runtime_error("failed to read BAM header");
 
@@ -65,7 +65,7 @@ void write_read_support_tsv(const Options& opts, const std::vector<std::vector<R
 }
 
 void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
-    SamFile bam(opts.bam_file, 1);
+    SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
     std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
     if (!header) throw std::runtime_error("failed to read BAM header");
     ReferenceCache ref(fai);
@@ -102,7 +102,7 @@ void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& var
 void write_variants_vcf(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
     if (opts.output_vcf.empty()) return;
 
-    SamFile bam(opts.bam_file, 1);
+    SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
     std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
     if (!header) throw std::runtime_error("failed to read BAM header");
     ReferenceCache ref(fai);

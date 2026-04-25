@@ -19,9 +19,27 @@
 namespace pgphase_collect {
 
 static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerContext& context) {
-    chunk.reads = load_read_records_for_chunk(
-        opts, chunk.region, context.bam, context.header.get(), context.index.get(), context.ref);
-    finalize_bam_chunk(chunk, context.ref, context.header.get());
+    chunk.reads.clear();
+    for (size_t input_i = 0; input_i < context.bams.size(); ++input_i) {
+        std::vector<ReadRecord> reads = load_read_records_for_chunk(
+            opts,
+            chunk.region,
+            *context.bams[input_i],
+            context.headers[input_i].get(),
+            context.indexes[input_i].get(),
+            context.ref);
+        chunk.reads.insert(
+            chunk.reads.end(),
+            std::make_move_iterator(reads.begin()),
+            std::make_move_iterator(reads.end()));
+    }
+    std::sort(chunk.reads.begin(), chunk.reads.end(), [](const ReadRecord& lhs, const ReadRecord& rhs) {
+        if (lhs.beg != rhs.beg) return lhs.beg < rhs.beg;
+        if (lhs.end != rhs.end) return lhs.end < rhs.end;
+        if (lhs.nm != rhs.nm) return lhs.nm < rhs.nm;
+        return lhs.qname < rhs.qname;
+    });
+    finalize_bam_chunk(chunk, context.ref, context.primary_header());
 }
 
 static void collect_prephase_candidates(BamChunk& chunk,
@@ -49,7 +67,7 @@ static CandidateTable process_chunk(const RegionChunk& region,
     chunk.region = region;
     load_and_prepare_chunk(chunk, opts, context);
     collect_prephase_candidates(chunk, opts, read_support_out);
-    classify_and_filter_candidates(chunk, opts, context.header.get());
+    classify_and_filter_candidates(chunk, opts, context.primary_header());
     return std::move(chunk.candidates);
 }
 
@@ -108,8 +126,7 @@ CandidateTable collect_chunks_parallel(const Options& opts,
 }
 
 void run_collect_bam_variation(const Options& opts) {
-    std::unique_ptr<faidx_t, FaiDeleter> fai(fai_load(opts.ref_fasta.c_str()));
-    if (!fai) throw std::runtime_error("failed to load FASTA index for: " + opts.ref_fasta);
+    std::unique_ptr<faidx_t, FaiDeleter> fai(load_reference_index(opts.ref_fasta));
 
     const std::vector<RegionChunk> chunks = load_region_chunks(opts);
     std::vector<std::vector<ReadSupportRow>> read_support_batches;
