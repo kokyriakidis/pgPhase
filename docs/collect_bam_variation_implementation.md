@@ -1,8 +1,37 @@
 # `collect-bam-variation` Implementation Description
 
-This document describes the implementation of the `pgphase collect-bam-variation` command from command-line input to final candidate output. The goal of this command is to collect and classify germline, non-mosaic pre-phasing candidate variation from one or more indexed BAM/CRAM files. The output is not a final phased callset. It is a structured set of candidate SNP, insertion, and deletion sites with read-level support counts and quality categories that can be used by a later phasing stage.
+This document describes the implementation of the `pgphase collect-bam-variation` command from command-line input to final candidate output. The goal of this command is to collect and classify germline, non-mosaic **pre-phasing** candidate variation from one or more indexed BAM/CRAM files. The output is **not** a final phased callset: it is a structured table (TSV and optionally VCF) of candidate SNP, insertion, and deletion sites with read-level support counts, strand tallies, and quality categories aligned with longcallD’s candidate stage. That table is intended for downstream phasing or for parity checks against longcallD’s internal classifications.
 
-The implementation is organized as a staged pipeline. **Command-line parsing** (`collect_bam_variation`), **region chunking**, **streaming orchestration**, and **parallel batch execution** live in `collect_pipeline.cpp`. **Biological logic** ported from longcallD—low-complexity / noisy-region `cgranges` handling, candidate site aggregation, allele counting, and variant classification—is concentrated in **`collect_var.cpp`** (single translation unit for easier navigation). **Read loading and Digar construction** are in `bam_digar.cpp`. **TSV / VCF / read-support writers** are in `collect_output.cpp` / `collect_output.hpp` (the header documents output contracts). Shared types and RAII wrappers are in `collect_types.hpp`.
+The implementation is organized as a **staged pipeline** so that memory stays bounded on whole-genome runs and so each stage has a clear responsibility:
+
+- **`collect_pipeline.cpp`** — End-to-end orchestration: parse regions and BED, build `RegionChunk` tiles with neighbour metadata (`reg_chunk_i`, prev/next overlap hints), stream batches to disk, and expose the `collect_bam_variation` CLI. This is the “control plane” of the tool.
+- **`collect_var.cpp`** — The “biology core” ported from longcallD: merge and filter chunk-level noisy regions (`cgranges`), gather candidate keys from digars, sweep reads for allele depths, run Fisher strand bias in ONT mode, and run the two-pass `classify_cand_vars`-shaped classification (including containment against noisy spans on non-ONT paths).
+- **`bam_digar.cpp`** — The “alignment plane”: stream BAM/CRAM into `ReadRecord` rows, apply read filters, build digars from EQX / MD / `cs` / reference comparison, and detect **per-read** noisy intervals using the same sliding-window rule as longcallD (see §8).
+- **`collect_output.cpp`** — Serializers only: TSV header/body, optional candidate VCF (left-normalized, FILTER/INFO semantics for candidates), and optional read×site read-support TSV. No classification logic lives here.
+- **`collect_types.hpp`** — Shared structs (`Options`, `BamChunk`, `ReadRecord`, `CandidateVariant`, …) and small RAII helpers (`SamFile`, `ReferenceCache`, HTS deleters).
+
+Together, these files implement “longcallD-shaped” candidate collection in C++17 with explicit streaming and multi-BAM pooling.
+
+### Source documentation (Doxygen)
+
+The `collect_*` sources and headers are written for **Doxygen-style** extraction:
+
+- Each major `.cpp` begins with an `@file` / `@brief` (and sometimes `@details`) block describing scope and conventions.
+- Public and internal helpers use `@brief`, `@param`, `@return`, `@throws`, and `@note` where that clarifies contracts (for example, which functions reopen the BAM for SQ names, or when `std::runtime_error` is thrown on I/O failure).
+- Header files (`collect_pipeline.hpp`, `collect_var.hpp`, `collect_output.hpp`, `collect_types.hpp`) duplicate or summarize API intent so a reader browsing headers alone sees the same contracts as the implementation.
+
+Generating HTML from the tree is optional; the comments are also meant to be read in-place in the IDE.
+
+### Vendored `cgranges` (longcallD fork, not vanilla lh3)
+
+The project ships **`src/cgranges.c`** and **`src/cgranges.h`** as **vendored** sources (they live in-repo, not as a git submodule). For the current longcallD `main` branch on GitHub, these files are **byte-identical** to longcallD’s `src/cgranges.*`.
+
+They are **not** the same as the minimal upstream library [lh3/cgranges](https://github.com/lh3/cgranges) alone: longcallD’s copy adds APIs this pipeline relies on, including:
+
+- **`cr_merge` / `cr_merge2`** — merge nearby intervals with fixed and dynamic distance parameters (noisy-region geometry after extension).
+- **`cr_is_contained`** — test whether a query span is fully covered by some stored interval (non-ONT containment filter for candidates inside noisy blocks).
+
+**Why vendored instead of a submodule?** A plain clone plus `make` works everywhere; the exact C snapshot stays pinned to what was validated against longcallD; and release tarballs do not depend on recursive submodule checkout. If longcallD updates `cgranges` upstream, this tree should be refreshed deliberately (diff and test) rather than floating on a submodule pointer.
 
 The main source files are:
 
@@ -160,7 +189,7 @@ Reads can span chunk boundaries. Because each chunk queries reads overlapping th
 
 ## 4. Parallel Chunk Processing and Streaming Output
 
-The central orchestrator is `run_collect_bam_variation` (`collect_pipeline.cpp`). It **streams** results to disk so the full merged candidate table for an entire genome need not sit in memory at once.
+The central orchestrator is `run_collect_bam_variation` (`collect_pipeline.cpp`). It **streams** results to disk so the full merged candidate table for an entire genome need not sit in memory at once. The streaming loop groups chunks by `reg_chunk_i`, runs a thread pool over each group, merges only within the batch, and appends to open output streams—so peak RAM scales with **one contig’s batch** plus worker scratch space, not with every variant on the genome. For readers navigating the code, `collect_pipeline.cpp` / `.hpp` document each step (`load_region_chunks`, `collect_chunk_batch_parallel`, CLI parsing) with Doxygen-style comments.
 
 High-level flow:
 
@@ -455,7 +484,25 @@ The second level requires Digar construction first, because the program cannot k
 
 ## 8. Read-Level Noisy-Region Detection
 
-Noisy-region detection begins while constructing Digars. The code uses a sliding window over non-low-quality SNP, insertion, and deletion events on each read.
+Noisy-region detection begins **while** Digars are being built for each read. The implementation walks the alignment once; whenever a non–low-quality SNP, insertion, or deletion is recorded, it feeds a **sliding-window accumulator** that sums event “weight” inside a fixed genomic width on the reference. If that sum exceeds a threshold, the read is considered locally unreliable and a **read-level noisy interval** is opened, extended, or merged—**before** chunk-level noisy merging runs in §9–§10.
+
+This design mirrors longcallD’s intent: dense mismatch and indel signal in a short window is a proxy for local misalignment or excessive micro-errors, so simple pileup-style calling there is untrustworthy.
+
+### Parity with longcallD (`xid_queue_t` / `push_xid_size_queue_win`)
+
+In longcallD, the same algorithm lives in `bam_utils.c` as `xid_queue_t` and `push_xid_size_queue_win`. In pgPhase, the equivalent logic is **`XidQueue`** and **`xid_push_win`** in `bam_digar.cpp`, wrapped by **`NoisyRegionBuilder`** (constructor picks window width from technology, `observe_variant` pushes events, `flush` emits a trailing open interval).
+
+**The sliding-window math is the same:** push `(pos, len, count)`, subtract evicted events from the front while `pos[front] + len[front] - 1 <= pos - win`, and when `count > 0` and the running sum **`> max_s`** (`noisy_reg_max_xgaps`), compute `noisy_start = pos[front]`, `noisy_end = pos[rear] + lens[rear]`, then merge or flush intervals using the same adjacency rule and the same **`var_size = max(sum of counts, genomic span)`** label.
+
+**Intentional structural differences** (output-equivalent for interval geometry):
+
+| Aspect | longcallD | pgPhase |
+|--------|-----------|---------|
+| **Where intervals go** | Immediately `cr_add` into a per-read `cgranges_t` (0-based half-open storage). | Append **`Interval{start,end,label}`** to `ReadRecord::noisy_regions` (**1-based inclusive**). Chunk code later converts via `intervals_to_cr` / merge when it needs trees. |
+| **`is_dense[]` flag** | Allocated and set to 1 for queue indices when noisy; **never read** elsewhere in that file. | **Omitted** (dead state in longcallD). |
+| **Eviction loop** | `while` without `front <= rear` guard. | **`while (front <= rear && …)`** so the loop never indexes past an empty queue (defensive port). |
+
+So the **detection rule and merge behaviour match longcallD**; pgPhase differs in **C++ data layout** (vectors on `ReadRecord`, defer building `cgranges` until chunk merge) and in **dropping unused bookkeeping**.
 
 The effective window is:
 
@@ -1167,7 +1214,7 @@ Example row:
 chr11  1000  SNP  A  G  30  15  15  0  8  7  9  6  0.5  CLEAN_HET_SNP  CLEAN_HET_SNP  0  0  0
 ```
 
-The phase-related fields are placeholders at this stage. They are emitted so later phasing code can extend the same format. **`collect_output.hpp`** summarizes the output contract: pre-phasing candidates only (not diploid genotypes), and VCF `FILTER` / `INFO.CAT` follow **final** `CATEGORY`.
+The phase-related fields are placeholders at this stage. They are emitted so later phasing code can extend the same format. **`collect_output.hpp`** and **`collect_output.cpp`** document the output contract in detail (Doxygen): outputs describe **pre-phasing candidates only** (not diploid genotypes); VCF `FILTER` and `INFO.CAT` follow **final** `CATEGORY`; writers may **throw** `std::runtime_error` if the primary BAM header cannot be read or an output path cannot be opened—callers should treat I/O failures as fatal.
 
 For deletions, the reference allele is fetched from the FASTA. For insertions, the TSV uses `REF = "."` and stores the inserted sequence in `ALT`.
 
@@ -1347,3 +1394,5 @@ close streams; log chunk count and observation totals
 The central design principle is separation between site discovery and evidence counting. The first pass identifies possible candidate sites from alignment events. The second pass counts how reads support those sites. The classification stage then decides whether each site is clean, low-support, strand-biased, repeat-associated, noisy, resolved, homozygous-like, or non-variant.
 
 This makes the output appropriate for downstream phasing: clean heterozygous SNPs and indels are readily usable as phase-informative markers, while ambiguous loci remain visible through their categories and counts instead of being silently discarded.
+
+**Source documentation:** The `collect_*` translation units (`collect_pipeline`, `collect_var`, `collect_output`, `collect_types`) carry Doxygen-style `@file` / `@brief` / `@param` / `@return` comments so behavior matches this document at the symbol level. The introduction’s **Vendored `cgranges`** subsection explains the longcallD fork and why it is vendored; **§8** documents parity for the per-read noisy sliding window (`bam_digar` vs longcallD `xid_queue_t`). Re-vendor `src/cgranges.{c,h}` only after an intentional diff against longcallD if upstream changes.
