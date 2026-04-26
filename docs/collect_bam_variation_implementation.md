@@ -1096,7 +1096,7 @@ This final filter is not applied in ONT mode in the current implementation, matc
 
 ## 17. Resolving Large Noisy Candidates
 
-After classification, candidates with category `NOISY_CANDIDATE` or `REP_HET_INDEL` can be converted to `NOISY_RESOLVED` if they are large enough:
+After classification, candidates with category `NOISY_CAND_HET`, `NOISY_CAND_HOM`, or `REP_HET_INDEL` can be converted to `NOISY_RESOLVED` if they are large enough:
 
 ```text
 insertion length >= 30
@@ -1115,7 +1115,7 @@ category after resolution: NOISY_RESOLVED
 
 This distinguishes large events that originated from noisy or repeat-associated logic but are large enough to be retained as resolved structural-like candidates.
 
-In the current category flow, `REP_HET_INDEL` is the common category that can be converted here. `NOISY_CANDIDATE` exists as a category for compatibility with the broader longcallD-style category model, but the current initial classifier most commonly produces `LOW_COV`, `STRAND_BIAS`, `LOW_AF`, `CLEAN_HOM`, `REP_HET_INDEL`, `CLEAN_HET_SNP`, `CLEAN_HET_INDEL`, and `NON_VAR`.
+In the current **digar collect** flow, only `REP_HET_INDEL` is typically promoted here: longcallD `classify_cand_vars` does not assign `NOISY_CAND_HET` / `NOISY_CAND_HOM` (`e` / `h`) to BAM-sweep candidates (those labels are for MSA-recalled variants inside noisy regions). The initial classifier most commonly produces `LOW_COV`, `STRAND_BIAS`, `LOW_AF`, `CLEAN_HOM`, `REP_HET_INDEL`, `CLEAN_HET_SNP`, `CLEAN_HET_INDEL`, and `NON_VAR`.
 
 ## 18. Merging Candidate Tables Across Chunks
 
@@ -1152,22 +1152,26 @@ FORWARD_ALT
 REVERSE_ALT
 AF
 CATEGORY
+INIT_CAT
 PHASE_SET
 HAP_ALT
 HAP_REF
 ```
 
+- **`CATEGORY`**: final label after the full longcallD-shaped classify pass (noisy overlap, `LOW_AF`→`LOW_COV` rewrite, post-process, containment filter where applicable). Use this for phasing filters and for VCF `FILTER` / `INFO.CAT`.
+- **`INIT_CAT`**: first-pass `classify_var_cate` only (matches longcallD’s first `CandVarCate-` block before `After classify var:`). Use for parity checks against `longcallD -V 2` stderr (`scripts/compare_candidates.py --category-stage initial`).
+
 Example row:
 
 ```text
-chr11  1000  SNP  A  G  30  15  15  0  8  7  9  6  0.5  CLEAN_HET_SNP  0  0  0
+chr11  1000  SNP  A  G  30  15  15  0  8  7  9  6  0.5  CLEAN_HET_SNP  CLEAN_HET_SNP  0  0  0
 ```
 
-The phase-related fields are placeholders at this stage. They are emitted so later phasing code can extend the same format. **`collect_output.hpp`** summarizes the output contract: pre-phasing candidates only (not diploid genotypes), all categories emitted in TSV, and VCF `FILTER` / `INFO.CAT` aligned with those categories.
+The phase-related fields are placeholders at this stage. They are emitted so later phasing code can extend the same format. **`collect_output.hpp`** summarizes the output contract: pre-phasing candidates only (not diploid genotypes), and VCF `FILTER` / `INFO.CAT` follow **final** `CATEGORY`.
 
 For deletions, the reference allele is fetched from the FASTA. For insertions, the TSV uses `REF = "."` and stores the inserted sequence in `ALT`.
 
-The TSV writer emits every candidate present in the final candidate table, including filtered categories such as `LOW_COV`, `STRAND_BIAS`, and `NON_VAR`. The category column is therefore essential: downstream code should choose which categories are usable for phasing or calling rather than assuming every TSV row is clean.
+The TSV writer emits every candidate present in the final candidate table, including filtered categories such as `LOW_COV`, `STRAND_BIAS`, and `NON_VAR`. The **`CATEGORY`** column is therefore essential for downstream phasing: choose which categories are usable rather than assuming every TSV row is clean.
 
 Typical phase-informative categories are:
 

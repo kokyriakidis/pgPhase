@@ -34,8 +34,10 @@ std::string category_name(VariantCategory category) {
             return "CLEAN_HET_INDEL";
         case VariantCategory::CleanHom:
             return "CLEAN_HOM";
-        case VariantCategory::NoisyCandidate:
-            return "NOISY_CANDIDATE";
+        case VariantCategory::NoisyCandHet:
+            return "NOISY_CAND_HET";
+        case VariantCategory::NoisyCandHom:
+            return "NOISY_CAND_HOM";
         case VariantCategory::NoisyResolved:
             return "NOISY_RESOLVED";
         case VariantCategory::RepeatHetIndel:
@@ -83,10 +85,25 @@ void write_read_support_tsv(const Options& opts, const std::vector<std::vector<R
 void write_variants_tsv_header(std::ostream& out) {
     out << "CHROM\tPOS\tTYPE\tREF\tALT\tDP\tREF_COUNT\tALT_COUNT\tLOW_QUAL_COUNT"
         << "\tFORWARD_REF\tREVERSE_REF\tFORWARD_ALT\tREVERSE_ALT"
-        << "\tAF\tCATEGORY\tPHASE_SET\tHAP_ALT\tHAP_REF\n";
+        << "\tAF\tCATEGORY\tINIT_CAT\tPHASE_SET\tHAP_ALT\tHAP_REF\n";
 }
 
 /** One row per CandidateVariant; REF/ALT from ReferenceCache for SNP/DEL. */
+/**
+ * @brief Serializes the mapped candidate variant evaluations to TSV.
+ *
+ * Implements the dump logic of category classifications and variant counts
+ * that allows cross-verification of internal structs (like `NOISY_HET`, `LOW_COV`, 
+ * etc) corresponding directly to the internal representations and debugging formats
+ * provided in `longcallD`.
+ *
+ * Like longcallD's log dumping mechanisms (when outputting unvcf text modes).
+ * 
+ * @param out Open file stream targeting a `.tsv`.
+ * @param header Raw header (BAM fields).
+ * @param opts Options.
+ * @param variants Validated list of categorized variants.
+ */
 void write_variants_tsv_records(std::ostream& out,
                                 const bam_hdr_t* header,
                                 ReferenceCache& ref,
@@ -109,7 +126,7 @@ void write_variants_tsv_records(std::ostream& out,
             << counts.alt_cov << '\t' << counts.low_qual_cov << '\t' << counts.forward_ref << '\t'
             << counts.reverse_ref << '\t' << counts.forward_alt << '\t' << counts.reverse_alt << '\t'
             << counts.allele_fraction << '\t' << category_name(counts.category) << '\t'
-            << 0 << '\t' << 0 << '\t' << 0 << '\n';
+            << category_name(counts.candvarcate_initial) << '\t' << 0 << '\t' << 0 << '\t' << 0 << '\n';
     }
 }
 
@@ -163,6 +180,18 @@ void write_variants_vcf_header(std::ostream& out, const Options& opts, const bam
 /**
  * Left-normalized VCF records: SNP at POS; INS/DEL with anchor base (POS-1) per VCF convention.
  * FILTER flags clean vs filtered candidates; SVTYPE/SVLEN for large indels when |len| >= min_sv_len.
+ */
+/**
+ * @brief Constructs a valid VCF text representation mapping internal variant keys to VCF.
+ *
+ * Implements the standard `write_vcf` routines from `longcallD`, generating correct
+ * headers and parsing internal types (Deletions, HET_SNPs, BIAS) to `PASS` or 
+ * filtered (`FILTER`) outputs natively mapping `AC`, `AD`, and `GT`.
+ *
+ * @param out Output target `.vcf`
+ * @param opts Options
+ * @param fai Cached fasta index reference.
+ * @param variants Analyzed candidates list output.
  */
 void write_variants_vcf_records(std::ostream& out,
                                 const Options& opts,

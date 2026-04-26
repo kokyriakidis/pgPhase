@@ -318,6 +318,22 @@ static void classify_and_filter_candidates(BamChunk& chunk,
 }
 
 /** One RegionChunk end-to-end: load reads, collect+count, classify; returns BamChunk. */
+/**
+ * @brief Sequentially collects variants from candidate regions.
+ *
+ * Implements the core multi-stage worker thread map-reduce pattern:
+ * It pulls bam portions by region coordinates, identifies individual variants via 
+ * parsed CIGAR operations/CS tags, and assigns them categories (HET, STRAND BIAS, 
+ * LOW COVERAGE, etc) prior to merging the sub-chunks together.
+ *
+ * This implements the overarching control flow found in `longcallD`'s 
+ * top-level `collect_var_main()`.
+ *
+ * @param region Sub-region coordinate struct mapping a piece of genome.
+ * @param opts Options describing behavior and qualities.
+ * @param context Thread-local variables passing caching pointers safely.
+ * @return CandidateTable A self-contained list of evaluated sites.
+ */
 static BamChunk process_chunk(const RegionChunk& region,
                               const Options& opts,
                               WorkerContext& context,
@@ -330,7 +346,20 @@ static BamChunk process_chunk(const RegionChunk& region,
     return chunk;
 }
 
-/** Concatenate per-chunk candidate tables (longcallD: fuzzy collapse only within each chunk). */
+/**
+ * @brief Simple memory-efficient concatenation of threaded variant results.
+ *
+ * Emulates the array `memcpy` structure when chunks synchronize. Rather than 
+ * maintaining overlapping complex locks over a giant data structure, each thread 
+ * independently allocates `BamChunk` variants and then moves (`std::make_move_iterator`) 
+ * them deterministically and sequentially so genomic order is perfectly maintained.
+ *
+ * Does not re-evaluate `fuzzy_collapse` boundary conflicts (which mimics 
+ * exactly `longcallD`'s static logic of collapsing purely inside chunks).
+ *
+ * @param chunks The completed chunk outputs evaluated by thread workers.
+ * @return A unified table mapping the whole runtime block.
+ */
 static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
     CandidateTable merged;
     for (BamChunk& chunk : chunks) {
@@ -399,7 +428,23 @@ static ChunkBatchResult collect_chunk_batch_parallel(const Options& opts,
     return result;
 }
 
-/** Run all chunks in one batch; optionally collect read_support_batches. */
+/**
+ * @brief Dispatcher driving the threadpool executing BAM collection logic.
+ *
+ * Implements a modern C++ thread dispatch architecture managing identical loops
+ * defined by `collect_ref_seq_bam_main()` nested looping over regions.
+ *
+ * Divides linearly scheduled `RegionChunk` boundaries across an active set of `std::thread`,
+ * spawning atomic threads parsing discrete BAM boundaries with unique indices without locking.
+ * Collects returned processed vectors of variants, reassembles them serially 
+ * removing arbitrary split overlaps in `merge_chunk_candidates()`.
+ *
+ * Handles exception safety seamlessly, ensuring memory cleans up on thread death.
+ *
+ * @param opts Run flags config struct.
+ * @param chunks A pre-split list of genomic ranges to distribute.
+ * @param read_support_batches Output buffer to stash parsed variant-to-read links.
+ */
 CandidateTable collect_chunks_parallel(
     const Options& opts,
     const std::vector<RegionChunk>& chunks,

@@ -28,6 +28,17 @@ static int var_site_alt_len(const VariantKey& v) {
  * longcallD `exact_comp_var_site`: total order for qsort of var_site_t from digars.
  * Return <0 if a<b, 0 if equal, >0 if a>b.
  */
+/**
+ * @brief Computes base-pair exact match equality for variant records.
+ *
+ * Compares two VariantKeys (variants) to see if they are identical. For exact
+ * matches, variants must share type, chrom, positions, and exact ALT bases.
+ * Equivalent to longcallD's `exact_comp_var_site()`.
+ *
+ * @param var1 First variant to compare.
+ * @param var2 Second variant to compare.
+ * @return 0 if exactly equal, else non-zero.
+ */
 int exact_comp_var_site(const VariantKey* var1, const VariantKey* var2) {
     if (var1->tid != var2->tid) return var1->tid < var2->tid ? -1 : 1;
     const hts_pos_t p1 = var1->type == VariantType::Snp ? var1->pos : var1->pos - 1;
@@ -53,6 +64,21 @@ int exact_comp_var_site(const VariantKey* var1, const VariantKey* var2) {
 /**
  * longcallD `exact_comp_var_site_ins`: same sort keys, but large insertions (>= min_sv_len)
  * merge when min(alt_len) >= 0.8 * max(alt_len); small insertions still require exact sequence.
+ */
+/**
+ * @brief Computes fuzzy length-based equality for insertion matching.
+ *
+ * For insertions, comparing exact sequence differences can be overly strict
+ * due to alignment noise. If both variants are INS, they overlap/occur at the same
+ * position, and have similar lengths, they are treated as identical. This helps
+ * cluster together heavily jittered SVs.
+ *
+ * Equivalent to longcallD's `exact_comp_var_site_ins()`.
+ *
+ * @param var1 First variant to compare.
+ * @param var2 Second variant to compare.
+ * @param min_sv_len Threshold minimum size above which leniency expands dynamically.
+ * @return 0 if treated as identical fuzzy match, else non-zero.
  */
 int exact_comp_var_site_ins(const VariantKey* var1, const VariantKey* var2, int min_sv_len) {
     if (var1->tid != var2->tid) return var1->tid < var2->tid ? -1 : 1;
@@ -100,6 +126,18 @@ bool VariantKeyLess::operator()(const VariantKey& lhs, const VariantKey& rhs) co
 
 /** Convert one digar op to a VariantKey suitable for the CandidateTable.
  *  SNP: ref_len=1; INS: ref_len=0 (insertion has no consumed reference bases); DEL: ref_len=op.len. */
+/**
+ * @brief Convert a raw `DigarOp` (abstract mapped alteration) to a structured `VariantKey`.
+ *
+ * `VariantKey` normalizes the types/bases and trims context bases where possible
+ * (removing shared prefix bases from insertions and deletions per VCF specification).
+ *
+ * Equivalent to longcallD's `make_var_site_from_digar()`.
+ *
+ * @param tid Target contig index.
+ * @param op Raw operation describing the difference against the reference.
+ * @return Standardized normalized variant key.
+ */
 VariantKey variant_key_from_digar(int tid, const DigarOp& op) {
     if (op.type == DigarType::Snp) {
         return VariantKey{tid, op.pos, VariantType::Snp, 1, op.alt};
@@ -146,6 +184,17 @@ static int get_var_site_start(const CandidateTable& v, hts_pos_t start, int n_to
 }
 
 /** longcallD `collect_all_cand_var_sites` merge pass: qsort order + `exact_comp_var_site_ins`. */
+/**
+ * @brief Identifies long simple repeating chunks and normalizes fuzzy repetitive variants.
+ *
+ * It iterates through potential overlapping insertion SVs and collapses ones that 
+ * differ in sequence but align fundamentally to the exact same repeat loci.
+ * Reduces raw variant explosion in low-complexity STRs.
+ *
+ * Equivalent logic to `collapse_fuzzy_var_sites()` in `longcallD`.
+ *
+ * @param variants CandidateTable structure holding tracked variants.
+ */
 void collapse_fuzzy_large_insertions(CandidateTable& variants) {
     std::sort(variants.begin(), variants.end(), [](const CandidateVariant& a, const CandidateVariant& b) {
         return exact_comp_var_site(&a.key, &b.key) < 0;
@@ -246,6 +295,18 @@ static void add_coverage(VariantCounts& counts, bool reverse, bool alt, bool low
  * `exact_comp_var_site_ins`; alt BQ = max(digar flag, mean qual < min_bq) like
  * is_low_qual || ave_qual < opt->min_bq; trailing sites with pos <= read end get
  * ref unless past pos_end.
+ */
+/**
+ * @brief Scans a parsed ReadRecord's digars to tally allele counts across variants.
+ *
+ * Checks for direct support or rejection for a variant by comparing its position
+ * to exactly overlapping `DigarOp` structures recorded natively.
+ *
+ * Equivalent logic to `longcallD`'s `update_read_vs_all_var_profile_from_digar()`.
+ *
+ * @param reads All parsed reads in the chunk.
+ * @param variants Reference list of candidates to search against.
+ * @param read_indexes Caches precomputed indices accelerating lookups.
  */
 void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         CandidateTable& variants,
@@ -596,9 +657,22 @@ static void collect_noisy_reg_start_end_pgphase(const cgranges_t* chunk_noisy_re
     }
 }
 
-/** longcallD `pre_process_noisy_regs` (collect_var.c): merge raw per-read noisy intervals into
- *  chunk-level regions, extend into low-complexity windows, then filter out regions where fewer than
- *  min_alt_depth reads or a ratio below min_af are actually noisy (likely noise rather than true SVs). */
+/**
+ * @brief Merges per-read noisy intervals into unified chunk-level regions and extends low-comp windows.
+ *
+ * Implements `longcallD`'s `pre_process_noisy_regs()` from `collect_var.c`.
+ * It sweeps across individually flagged noisy segments (dense mismatches),
+ * merges overlapping intervals from multiple reads via `cgranges_t` merges,
+ * extends them to encompass neighboring low-complexity sequence (like homopolymers),
+ * and finally drops regions that lack sufficient read support (min_alt_depth or min_af)
+ * to be deemed true structural variations rather than isolated noise bursts.
+ *
+ * Designed to execute entirely via zero-copy native struct traversal prior to
+ * the variant candidate sweeps.
+ *
+ * @param chunk Collection of read records and current candidates in this block.
+ * @param opts User-defined filtering thresholds.
+ */
 void pre_process_noisy_regs_pgphase(BamChunk& chunk, const Options& opts) {
     if (chunk.noisy_regions.empty()) return;
 
@@ -723,7 +797,19 @@ void post_process_noisy_regs_pgphase(BamChunk& chunk, const CandidateTable& cand
     intervals_from_cr(noisy_own.cr, chunk.noisy_regions);
 }
 
-/** After `post_process_noisy_regs_pgphase`, longcallD `cr_is_contained` sweep. */
+/**
+ * @brief Traverses surviving variants and drops those entirely swallowed by a noisy block.
+ *
+ * Implements `longcallD`'s final masking pass equivalent (`cr_is_contained`).
+ * Once complex overlapping noise profiles are merged and bounds checked via
+ * `post_process_noisy_regs_pgphase()`, this effectively zeroes out cleanly-called
+ * variant candidates that mistakenly fell inside those black-boxed `NOISY` extents.
+ *
+ * This ensures that a single structural variance window gets reported cleanly
+ * instead of hundreds of raw SNVs generated through misalignment.
+ *
+ * @param chunk Chunk tracking the current region's evaluated candidates.
+ */
 void apply_noisy_containment_filter(BamChunk& chunk) {
     if (chunk.noisy_regions.empty()) return;
     CrangesOwner own;
@@ -813,6 +899,15 @@ static double log_hypergeom_pg(int a, int b, int c, int d) {
             std::lgamma(static_cast<double>(N + 1)));
 }
 
+/**
+ * @brief Evaluates statistical probability of read variance within noisy loci.
+ *
+ * Implements Fisher's Exact test and log hypergeometric distribution (analogous logic
+ * in `fisher_exact()` of longcallD) evaluating whether read strands deviate
+ * significantly from uniform distribution.
+ *
+ * Calculates Strand Bias and noise correlations dynamically.
+ */
 static double fisher_exact_two_tail(int a, int b, int c, int d) {
     if (a + b + c + d <= 0) return 1.0;
     const double log_p_observed = log_hypergeom_pg(a, b, c, d);
@@ -934,7 +1029,25 @@ static bool var_is_homopolymer_pg(const VariantKey& var,
     return is_homopolymer != 0;
 }
 
-/** longcallD `var_is_repeat_region` (collect_var.c), short indels only. */
+/**
+ * @brief Checks if an indel resides within a short identical sequence repeat (micro-homology/STR).
+ *
+ * Direct C++ translation of `longcallD`'s `var_is_repeat_region()`.
+ * Identifies if a deleted/inserted string exactly matches the flanking genomic 
+ * sequence up to 3x the motif length. Bypasses aligning long blocks and checks
+ * simple tandem repetitions using byte array matches `std::memcmp` safely
+ * within the cached reference boundary `ref_seq`.
+ * 
+ * Works for `var.type == VariantType::Deletion` or `Insertion` where `ref_len`
+ * or `alt_len` doesn't overshoot maximum local gap settings `xid`.
+ *
+ * @param var Found structural insertion or deletion.
+ * @param ref_seq Current active FASTA chunk data.
+ * @param ref_beg FASTA offset.
+ * @param ref_end FASTA boundary.
+ * @param xid Limit of max variant extent allowed (from config `noisy_reg_max_xgaps`).
+ * @return True if surrounded exactly by 3 repeats of its own sequence sequence motif.
+ */
 static bool var_is_repeat_region_pg(const VariantKey& var,
                                     const std::string& ref_seq,
                                     hts_pos_t ref_beg,
@@ -1104,6 +1217,19 @@ static void cr_add_var_to_noisy_cr(cgranges_t* var_cr,
 // ════════════════════════════════════════════════════════════════════════════
 
 /** longcallD `classify_var_cate` first stage (strand bias only if `is_ont`). */
+/**
+ * @brief Performs the initial categorization (filtering out low cov, biases).
+ *
+ * Runs sequentially after counting alleles to bucket sites into classes mimicking
+ * VCF FILTERS like strand bias, extremely low AF, or basic heterozygosity.
+ *
+ * Equivalent to the internal categorization blocks in longcallD's `classify_cand_vars()`.
+ *
+ * @param key The variant being considered.
+ * @param count Collected allele support (Alt, Ref, Fwd, Rev, Low Qual).
+ * @param opts Options for thresholds.
+ * @return Initial category.
+ */
 static VariantCategory classify_variant_initial(const VariantKey& key,
                                                 VariantCounts& counts,
                                                 const std::string& ref_slice,
@@ -1140,7 +1266,23 @@ static VariantCategory classify_variant_initial(const VariantKey& key,
     return key.type == VariantType::Snp ? VariantCategory::CleanHetSnp : VariantCategory::CleanHetIndel;
 }
 
-/** longcallD `classify_cand_vars` core: noisy overlap, REP/dense loci → noisy_var_cr. */
+/** longcallD-shaped `classify_cand_vars`: two passes by necessity, not two separate classifiers.
+ *
+ * **Pass 1** — Only *local* rules: `classify_variant_initial` fills `cats[]` and
+ * `candvarcate_initial` (coverage, allele fraction, strand bias, repeat het, clean categories).
+ * Every candidate that is not `LOW_COV` (and not skipped for ONT strand bias when building the
+ * index) inserts its reference interval into `var_pos_cr`, which is then indexed. Density checks
+ * need the full set of surviving loci in that structure before any per-site `n_ov` query.
+ *
+ * **Pass 2** — *Context* rules: overlap with existing `chunk_noisy` → `NON_VAR` (HiFi);
+ * `RepeatHetIndel` handling adds to `noisy_var_cr`; `cr_overlap` on `var_pos_cr` with `n_ov > 1`
+ * flags dense clusters for `noisy_var_cr`; then `LOW_AF` is folded to `LOW_COV` (longcallD
+ * `var_i_to_cate` after this loop). Merged ranges are written back to `chunk.noisy_regions`.
+ *
+ * Note: longcallD `NOISY_CAND_HET` / `NOISY_CAND_HOM` (`e` / `h`) are **not** produced here; they
+ * come from MSA-based recall inside noisy regions. This pass matches longcallD `classify_cand_vars`
+ * (candidates remain `CLEAN_*` / `REP_HET_INDEL` until `NON_VAR` from containment, etc.).
+ */
 static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
     CandidateTable& variants = chunk.candidates;
     if (variants.empty()) return;
@@ -1160,11 +1302,14 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
         }
     }
 
+    // Pass 1: local labels + interval index of all non–LOW_COV candidates (see function comment).
     std::vector<VariantCategory> cats;
     cats.reserve(variants.size());
     for (auto& cv : variants) {
-        cats.push_back(classify_variant_initial(
-            cv.key, cv.counts, chunk.ref_seq, chunk.ref_beg, chunk.ref_end, opts));
+        const VariantCategory init = classify_variant_initial(
+            cv.key, cv.counts, chunk.ref_seq, chunk.ref_beg, chunk.ref_end, opts);
+        cv.counts.candvarcate_initial = init;
+        cats.push_back(init);
     }
 
     cgranges_t* var_pos_cr = cr_init();
@@ -1196,6 +1341,7 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
     const hts_pos_t reg_beg = chunk.region.beg;
     const hts_pos_t reg_end = chunk.region.end;
 
+    // Pass 2: noisy mask, dense overlaps via var_pos_cr, noisy_var_cr merge, LOW_AF→LOW_COV.
     for (size_t i = 0; i < variants.size(); ++i) {
         VariantCategory c = cats[i];
         if (c == VariantCategory::StrandBias) continue;
@@ -1246,6 +1392,7 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
             }
         }
 
+        // Match longcallD: LOW_AF is rewritten to LOW_COV in var_i_to_cate after this loop.
         if (c == VariantCategory::LowAlleleFraction) cats[i] = VariantCategory::LowCoverage;
     }
 
@@ -1271,11 +1418,12 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
     }
 }
 
-/** Promote NoisyCandidate / RepeatHetIndel variants whose alt or ref span is >= kMinSvLen to
- *  NoisyResolved, so they are retained in the output TSV as large SV evidence. */
+/** Promote noisy MSA / repeat-het variants whose alt or ref span is >= kMinSvLen to NoisyResolved,
+ *  so they are retained in the output TSV as large SV evidence. */
 static void resolve_simple_noisy_candidates(CandidateTable& variants) {
     for (CandidateVariant& candidate : variants) {
-        if (candidate.counts.category != VariantCategory::NoisyCandidate &&
+        if (candidate.counts.category != VariantCategory::NoisyCandHet &&
+            candidate.counts.category != VariantCategory::NoisyCandHom &&
             candidate.counts.category != VariantCategory::RepeatHetIndel) continue;
         if (candidate.key.alt.size() >= static_cast<size_t>(kMinSvLen) ||
             candidate.key.ref_len >= kMinSvLen) {

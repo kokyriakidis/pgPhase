@@ -12,9 +12,10 @@ namespace pgphase_collect {
 /**
  * TSV/VCF/read-support writers for collect-bam-variation.
  *
- * Contract: outputs describe **pre-phasing candidates**, not final diploid genotypes. TSV includes all
- * categories (filter with CATEGORY). VCF uses FILTER=LowQual/RefCall/NoCall for non-clean rows; INFO.CAT
- * holds the same labels as TSV. PHASE_SET / hap columns in TSV are placeholders (0). Read-support TSV is
+ * Contract: outputs describe **pre-phasing candidates**, not final diploid genotypes. TSV includes
+ * CATEGORY (final, post-containment) and INIT_CAT (longcallD first `classify_var_cate` only, for parity
+ * checks). VCF uses FILTER from final category; INFO.CAT matches final labels. PHASE_SET / hap in TSV
+ * are placeholders (0). Read-support TSV is
  * optional auxiliary evidence for downstream phasing tools.
  */
 

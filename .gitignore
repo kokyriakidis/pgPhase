@@ -40,6 +40,8 @@ coverage/
 *.swo
 *.bak
 *.orig
+*~lock*
+.~lock.*
 
 # Python cache
 __pycache__/

@@ -62,13 +62,27 @@ enum class VariantType : uint8_t {
 };
 
 enum class VariantCategory : uint8_t {
+    /** `LONGCALLD_LOW_COV_VAR` — first-pass letter `L` (low alt depth). */
     LowCoverage,
+    /**
+     * `LONGCALLD_LOW_AF_VAR` — first-pass letter `l` (low allele fraction).
+     * After the second classify loop, longcallD stores this as LOW_COV in `var_i_to_cate`
+     * (collect_var.c ~981–983); we fold the same way before using `cats[]` as final category.
+     */
     LowAlleleFraction,
     StrandBias,
     CleanHetSnp,
     CleanHetIndel,
     CleanHom,
-    NoisyCandidate,
+    /**
+     * longcallD `LONGCALLD_NOISY_CAND_HET_VAR` (`e`). Assigned when noisy-region MSA recalls a
+     * variant seen on one consensus haplotype only (`update_cand_var_profile_from_cons_aln_str2`).
+     * Digar `classify_cand_vars` does **not** set this — same as longcallD (candidates stay
+     * `CLEAN_*` / `REP_HET_INDEL` until containment or later stages).
+     */
+    NoisyCandHet,
+    /** longcallD `LONGCALLD_NOISY_CAND_HOM_VAR` (`h`); same provenance as `NoisyCandHet`. */
+    NoisyCandHom,
     NoisyResolved,
     /** longcallD `LONGCALLD_REP_HET_VAR`: homopolymer / STR indels in clean AF band. */
     RepeatHetIndel,
@@ -145,6 +159,7 @@ struct Options {
 // Region & read data
 // ════════════════════════════════════════════════════════════════════════════
 
+/** Maps back to `region_t` structure. Dictates coordinate bounds representing where variation scanning operates. */
 struct RegionFilter {
     bool enabled = false;
     std::string chrom;
@@ -152,6 +167,7 @@ struct RegionFilter {
     hts_pos_t end = -1; // 1-based inclusive, -1 means contig end
 };
 
+/** Tracks thread-safe slices of a `RegionFilter`, dispatching localized genomic bounds mapped precisely to `longcallD` partitioning. */
 struct RegionChunk {
     int chunk_id = -1;
     int tid = -1;
@@ -172,6 +188,7 @@ struct RegionChunk {
     bool has_next_region() const { return next_chunk_id >= 0; }
 };
 
+/** Equivalent to `longcallD`'s `var_key_t`. Core struct functioning as the hashing identity (TID/Pos/Type/Len/Alt) across variants. */
 struct VariantKey {
     int tid = -1;
     hts_pos_t pos = 0; // 1-based. Insertions are between pos - 1 and pos, matching longcallD.
@@ -184,12 +201,14 @@ struct VariantKey {
     }
 };
 
+/** C-compatible interval bounds structure containing generic label maps logic to `noisy_region_t`. */
 struct Interval {
     hts_pos_t beg = 0; // 1-based inclusive
     hts_pos_t end = 0; // 1-based inclusive
     int label = 0;
 };
 
+/** High-level sequence alteration node parsed from alignment files. Counterpart of `digar_op_t` storing individual SNP/Insertion/Deletion components. */
 struct DigarOp {
     hts_pos_t pos = 0; // 1-based reference coordinate
     DigarType type = DigarType::Equal;
@@ -268,7 +287,10 @@ struct VariantCounts {
     int forward_alt = 0;  // strand_to_alle_covs[0][1]
     int reverse_alt = 0;  // strand_to_alle_covs[1][1]
     int n_uniq_alles = 2; // always 2 for Step 1 (ref + primary alt)
+    /** After full classify_cand_vars (noisy overlap, LOW_AF→LOW_COV rewrite, etc.). */
     VariantCategory category = VariantCategory::LowCoverage;
+    /** longcallD first-loop `classify_var_cate` only (matches CandVarCate before `After classify var:`). */
+    VariantCategory candvarcate_initial = VariantCategory::LowCoverage;
     double allele_fraction = 0.0;
 };
 
