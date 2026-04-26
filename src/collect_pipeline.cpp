@@ -390,8 +390,9 @@ static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerC
 /**
  * @brief Candidate discovery and allele counting for one chunk (pre-classification).
  *
- * Runs noisy-region preprocessing, builds deduplicated candidate keys from digars, then
- * `collect_allele_counts_from_records` (optionally appends read-support rows).
+ * Matches longcallD `collect_var_main` ordering: deduplicated sites from digars, then allele
+ * counts, then `pre_process_noisy_regs`-shaped refinement of chunk noisy regions (before
+ * classification). Optionally appends read-support rows during the allele sweep.
  *
  * @param chunk Prepared chunk with reads and reference slice.
  * @param opts Quality thresholds (`min_bq`, noisy options).
@@ -400,10 +401,10 @@ static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerC
 static void collect_prephase_candidates(BamChunk& chunk,
                                         const Options& opts,
                                         std::vector<ReadSupportRow>* read_support_out) {
-    pre_process_noisy_regs_pgphase(chunk, opts);
     collect_candidate_sites_from_records(chunk.region, chunk.reads, chunk.candidates);
     collect_allele_counts_from_records(
         chunk.reads, chunk.candidates, &chunk.region, read_support_out, opts.min_bq);
+    pre_process_noisy_regs_pgphase(chunk, opts);
 }
 
 /**

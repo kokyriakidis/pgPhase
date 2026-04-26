@@ -132,6 +132,7 @@ void variant_genomic_span(const VariantKey& key, hts_pos_t& var_start, hts_pos_t
  * @param chunk Chunk state with reads and optional low-complexity intervals.
  * @param opts Depth/ratio/merge thresholds.
  */
+/** @brief longcallD `pre_process_noisy_regs`: after sites + allele counts, before classification. */
 void pre_process_noisy_regs_pgphase(BamChunk& chunk, const Options& opts);
 
 /**

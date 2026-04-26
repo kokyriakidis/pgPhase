@@ -5,7 +5,7 @@ This document describes the implementation of the `pgphase collect-bam-variation
 The implementation is organized as a **staged pipeline** so that memory stays bounded on whole-genome runs and so each stage has a clear responsibility:
 
 - **`collect_pipeline.cpp`** — End-to-end orchestration: parse regions and BED, build `RegionChunk` tiles with neighbour metadata (`reg_chunk_i`, prev/next overlap hints), stream batches to disk, and expose the `collect_bam_variation` CLI. This is the “control plane” of the tool.
-- **`collect_var.cpp`** — The “biology core” ported from longcallD: merge and filter chunk-level noisy regions (`cgranges`), gather candidate keys from digars, sweep reads for allele depths, run Fisher strand bias in ONT mode, and run the two-pass `classify_cand_vars`-shaped classification (including containment against noisy spans on non-ONT paths).
+- **`collect_var.cpp`** — The “biology core” ported from longcallD: gather candidate keys from digars, sweep reads for allele depths, then merge and filter chunk-level noisy regions (`cgranges`, `pre_process_noisy_regs` timing), run Fisher strand bias in ONT mode, and run the two-pass `classify_cand_vars`-shaped classification (including containment against noisy spans on non-ONT paths).
 - **`bam_digar.cpp`** — The “alignment plane”: stream BAM/CRAM into `ReadRecord` rows, apply read filters, build digars from EQX / MD / `cs` / reference comparison, and detect **per-read** noisy intervals using the same sliding-window rule as longcallD (see §8).
 - **`collect_output.cpp`** — Serializers only: TSV header/body, optional candidate VCF (left-normalized, FILTER/INFO semantics for candidates), and optional read×site read-support TSV. No classification logic lives here.
 - **`collect_types.hpp`** — Shared structs (`Options`, `BamChunk`, `ReadRecord`, `CandidateVariant`, …) and small RAII helpers (`SamFile`, `ReferenceCache`, HTS deleters).
@@ -38,7 +38,7 @@ The main source files are:
 ```text
 collect_pipeline.cpp   region parsing, BED/autosome filters, chunk neighbours, streaming run,
                        getopt CLI (collect_bam_variation), WorkerContext batch workers
-collect_var.cpp        noisy-region prep/post-process, candidate sites, allele counts,
+collect_var.cpp        candidate sites, allele counts, noisy-region prep/post-process,
                        Fisher/strand (ONT), classify_cand_vars-style feedback, sdust LCR
 bam_digar.cpp          BAM/CRAM iteration, filters, EQX/MD/cs/ref digars, per-read noisy windows
 collect_output.cpp     TSV, optional VCF, optional read-support TSV
@@ -484,7 +484,7 @@ The second level requires Digar construction first, because the program cannot k
 
 ## 8. Read-Level Noisy-Region Detection
 
-Noisy-region detection begins **while** Digars are being built for each read. The implementation walks the alignment once; whenever a non–low-quality SNP, insertion, or deletion is recorded, it feeds a **sliding-window accumulator** that sums event “weight” inside a fixed genomic width on the reference. If that sum exceeds a threshold, the read is considered locally unreliable and a **read-level noisy interval** is opened, extended, or merged—**before** chunk-level noisy merging runs in §9–§10.
+Noisy-region detection begins **while** Digars are being built for each read. The implementation walks the alignment once; whenever a non–low-quality SNP, insertion, or deletion is recorded, it feeds a **sliding-window accumulator** that sums event “weight” inside a fixed genomic width on the reference. If that sum exceeds a threshold, the read is considered locally unreliable and a **read-level noisy interval** is opened, extended, or merged—**before** chunk-level union in §9; that list is refined after allele counting in §12.
 
 This design mirrors longcallD’s intent: dense mismatch and indel signal in a short window is a proxy for local misalignment or excessive micro-errors, so simple pileup-style calling there is untrustworthy.
 
@@ -600,118 +600,9 @@ reference slice:
 
 The chunk-level noisy-region list is initially formed by concatenating noisy intervals from non-skipped reads and merging overlapping or adjacent intervals.
 
-## 10. Pre-Processing Noisy Regions
+## 10. Candidate Site Collection
 
-Before candidate sites are collected, chunk-level noisy regions are refined.
-
-The preprocessing order is:
-
-```text
-raw read-supported noisy intervals
-extend through overlapping low-complexity intervals
-merge nearby noisy intervals
-count read support for each merged interval
-discard noisy intervals with insufficient support
-```
-
-### 10.1 Extension Through Low-Complexity Regions
-
-If a noisy interval overlaps a low-complexity interval, it is extended to include that low-complexity sequence.
-
-Example:
-
-```text
-noisy interval:        chr11:1000-1030
-low-complexity repeat: chr11:1020-1100
-
-extended noisy region: chr11:1000-1100
-```
-
-This is useful because indel alignment around homopolymers and short tandem repeats is often unstable. A small noisy signal near the edge of a repeat may represent the entire repeat region rather than only the original small interval.
-
-### 10.2 Merge Nearby Noisy Regions
-
-After extension, nearby noisy intervals are merged using `noisy_reg_merge_dis`, default `500 bp`, and `min_sv_len`, default `30 bp`.
-
-Example:
-
-```text
-noisy A: chr11:1000-1100
-noisy B: chr11:1300-1400
-distance = 199 bp
-
-Because 199 <= 500, merge:
-  chr11:1000-1400
-```
-
-This prevents a complex locus from being split into many small intervals.
-
-### 10.3 Read-Support Filter for Noisy Regions
-
-The code then counts support for each merged noisy interval.
-
-For each non-skipped read:
-
-```text
-if the read overlaps any part of the noisy interval:
-    increment n_total
-    if the read has a read-level noisy interval overlapping it:
-        increment n_noisy
-```
-
-The noisy region is kept only if the following hold:
-
-```text
-n_noisy >= min_alt_depth
-n_noisy / n_total >= min_af
-```
-
-If `min_noisy_reg_total_depth` is greater than zero, the implementation also requires:
-
-```text
-n_total >= min_noisy_reg_total_depth
-```
-
-The default is `0`, which does **not** add an extra check (this matches the longcallD `pre_process_noisy_regs` logic, which only uses the two conditions above with `n_noisy` and the ratio of `n_noisy` to `n_total`). The published LongcallD methods description also lists a **minimum total overlapping read count**; set `--min-noisy-reg-total-depth 5` to enforce that third gate. When `0`, there is no separate “total read coverage” minimum.
-
-With defaults (when `min_noisy_reg_total_depth` is 0 or unset in code):
-
-```text
-min_alt_depth = 2
-min_af = 0.20
-```
-
-Example dropped region:
-
-```text
-merged noisy region: chr11:1000-1100
-20 reads overlap any part of it
-1 read has noisy evidence there
-
-n_noisy = 1 < 2
-The interval is removed from chunk.noisy_regions.
-```
-
-Example kept region:
-
-```text
-merged noisy region: chr11:1000-1100
-20 reads overlap any part of it
-6 reads have noisy evidence there
-
-n_noisy = 6
-n_noisy / n_total = 6 / 20 = 0.30
-0.30 >= 0.20
-The interval remains a trusted noisy region.
-```
-
-This step prevents one poor read from causing an entire locus to be treated as noisy.
-
-Because this support check happens after low-complexity extension and noisy-region merging, the denominator and numerator are measured on the merged interval, not on each original read-level interval. In other words, the code asks whether the final candidate noisy locus is supported by enough reads.
-
-## 11. Candidate Site Collection
-
-After noisy-region preprocessing, the collector builds a raw candidate site list from non-skipped reads.
+After chunk finalization (§9), the collector builds a raw candidate site list from non-skipped reads. This matches longcallD `collect_all_cand_var_sites` (including fuzzy large-insertion collapse within the chunk).
 
 For each read and each Digar:
 
@@ -743,7 +634,7 @@ chr11:1005 DEL length 2
 chr11:1010 INS T
 ```
 
-The duplicated SNP appears once as a site. Allele counts are computed later.
+The duplicated SNP appears once as a site. Allele counts are computed in §11.
 
 Large insertions use fuzzy collapsing. Insertions of at least `30 bp` at the same position are considered equivalent if their lengths are similar:
 
@@ -783,9 +674,9 @@ alternate sequence for SNPs and small insertions
 
 For SNPs, the sort position is the SNP position. For insertions and deletions, the sort position is `pos - 1`, matching the insertion-between-bases convention.
 
-## 12. Allele Count Collection
+## 11. Allele Count Collection
 
-Once unique candidate sites are known, the pipeline performs a second pass over non-skipped reads to count support for each site.
+Once unique candidate sites are known (§10), the pipeline performs a second pass over non-skipped reads to count support for each site (`collect_cand_vars` in longcallD; `collect_allele_counts_from_records` here). **Next**, chunk-level noisy intervals are refined (§12), and only then does variant classification (§13) run.
 
 For each read, the algorithm starts near the first candidate overlapping the read. It then walks the sorted candidate table and the read's variant Digars together.
 
@@ -867,10 +758,119 @@ allele_fraction = 2 / 3 = 0.667
 
 If `--read-support` is enabled, the same pass writes per-read observations. This output is useful for downstream phasing because it records whether each read supports the reference or alternate allele at each candidate site.
 
+## 12. Pre-Processing Noisy Regions
+
+After candidate sites and allele depths are in place (§10–§11), chunk-level noisy regions are refined (`pre_process_noisy_regs`). The provisional list is the read-union from §9; this step extends through low-complexity sequence, merges nearby intervals, and drops intervals with insufficient read support. Classification (§13) uses the refined mask, matching longcallD `collect_var_main`.
+
+The preprocessing order is:
+
+```text
+raw read-supported noisy intervals
+extend through overlapping low-complexity intervals
+merge nearby noisy intervals
+count read support for each merged interval
+discard noisy intervals with insufficient support
+```
+
+### 12.1 Extension Through Low-Complexity Regions
+
+If a noisy interval overlaps a low-complexity interval, it is extended to include that low-complexity sequence.
+
+Example:
+
+```text
+noisy interval:        chr11:1000-1030
+low-complexity repeat: chr11:1020-1100
+
+extended noisy region: chr11:1000-1100
+```
+
+This is useful because indel alignment around homopolymers and short tandem repeats is often unstable. A small noisy signal near the edge of a repeat may represent the entire repeat region rather than only the original small interval.
+
+### 12.2 Merge Nearby Noisy Regions
+
+After extension, nearby noisy intervals are merged using `noisy_reg_merge_dis`, default `500 bp`, and `min_sv_len`, default `30 bp`.
+
+Example:
+
+```text
+noisy A: chr11:1000-1100
+noisy B: chr11:1300-1400
+distance = 199 bp
+
+Because 199 <= 500, merge:
+  chr11:1000-1400
+```
+
+This prevents a complex locus from being split into many small intervals.
+
+### 12.3 Read-Support Filter for Noisy Regions
+
+The code then counts support for each merged noisy interval.
+
+For each non-skipped read:
+
+```text
+if the read overlaps any part of the noisy interval:
+    increment n_total
+    if the read has a read-level noisy interval overlapping it:
+        increment n_noisy
+```
+
+The noisy region is kept only if the following hold:
+
+```text
+n_noisy >= min_alt_depth
+n_noisy / n_total >= min_af
+```
+
+If `min_noisy_reg_total_depth` is greater than zero, the implementation also requires:
+
+```text
+n_total >= min_noisy_reg_total_depth
+```
+
+The default is `0`, which does **not** add an extra check (this matches the longcallD `pre_process_noisy_regs` logic, which only uses the two conditions above with `n_noisy` and the ratio of `n_noisy` to `n_total`). The published LongcallD methods description also lists a **minimum total overlapping read count**; set `--min-noisy-reg-total-depth 5` to enforce that third gate. When `0`, there is no separate “total read coverage” minimum.
+
+With defaults (when `min_noisy_reg_total_depth` is 0 or unset in code):
+
+```text
+min_alt_depth = 2
+min_af = 0.20
+```
+
+Example dropped region:
+
+```text
+merged noisy region: chr11:1000-1100
+20 reads overlap any part of it
+1 read has noisy evidence there
+
+n_noisy = 1 < 2
+The interval is removed from chunk.noisy_regions.
+```
+
+Example kept region:
+
+```text
+merged noisy region: chr11:1000-1100
+20 reads overlap any part of it
+6 reads have noisy evidence there
+
+n_noisy = 6
+n_noisy / n_total = 6 / 20 = 0.30
+0.30 >= 0.20
+The interval remains a trusted noisy region.
+```
+
+This step prevents one poor read from causing an entire locus to be treated as noisy.
+
+Because this support check happens after low-complexity extension and noisy-region merging, the denominator and numerator are measured on the merged interval, not on each original read-level interval. In other words, the code asks whether the final candidate noisy locus is supported by enough reads.
+
 ## 13. Initial Variant Classification
 
 Each candidate is classified using coverage, allele fraction, and local sequence context. A Fisher
-strand-imbalance test is applied only in ONT mode, matching longcallD (section 13.2).
+strand-imbalance test is applied only in ONT mode, matching longcallD (§13.2).
 
 The first computed value is:
 
@@ -1379,9 +1379,9 @@ for each reg_chunk_i batch (typically one contig’s chunks):
         load reference slice
         detect low-complexity reference intervals (sdust)
         merge read-level noisy intervals into chunk noisy intervals
-        extend and filter noisy regions by read support
         collect unique SNP/INS/DEL candidate sites (fuzzy large-insertion collapse within chunk)
         count ref/alt/low-quality/strand support
+        extend and filter noisy regions by read support (pre_process; longcallD order)
         classify candidates (collect_var.cpp)
         add repeat/dense candidates back into noisy regions
         post-process noisy regions

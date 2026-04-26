@@ -740,8 +740,8 @@ static void collect_noisy_reg_start_end_pgphase(const cgranges_t* chunk_noisy_re
  * and finally drops regions that lack sufficient read support (min_alt_depth or min_af)
  * to be deemed true structural variations rather than isolated noise bursts.
  *
- * Designed to execute entirely via zero-copy native struct traversal prior to
- * the variant candidate sweeps.
+ * Call order matches longcallD `collect_var_main`: after deduplicated sites and allele-depth
+ * collection, immediately before `classify_cand_vars`.
  *
  * @param chunk Collection of read records and current candidates in this block.
  * @param opts User-defined filtering thresholds.
