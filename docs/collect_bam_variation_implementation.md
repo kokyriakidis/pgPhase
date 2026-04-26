@@ -661,6 +661,8 @@ chr11:2000 INS T
 These remain separate candidate sites.
 ```
 
+**Deletions (no fuzzy length merge):** longcallD `exact_comp_var_site_ins` applies the 0.8 length rule **only to large insertions**. Deletions are the same site only when they share the same breakpoint and **`ref_len`** (deletion length on the reference). Two deletions at the same position with **different** lengths (e.g. 40 bp vs 50 bp) remain **separate** candidate rows—there is no longcallD-style fuzzy merge for large DELs, and pgPhase matches that.
+
 The sort order is deterministic and longcallD-compatible. It compares:
 
 ```text
