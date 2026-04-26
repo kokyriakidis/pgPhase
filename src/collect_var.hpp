@@ -1,6 +1,11 @@
 #ifndef PGPHASE_COLLECT_VAR_HPP
 #define PGPHASE_COLLECT_VAR_HPP
 
+/**
+ * @file collect_var.hpp
+ * @brief Candidate collection, intervals, noisy regions, and classification API.
+ */
+
 #include "collect_types.hpp"
 
 #include <vector>
@@ -12,7 +17,7 @@ extern "C" {
 namespace pgphase_collect {
 
 /**
- * @brief RAII wrapper around `cgranges_t` (move-only, destroys on reset).
+ * @brief Move-only RAII owner for heap-allocated `cgranges_t`.
  */
 struct CrangesOwner {
     cgranges_t* cr = nullptr;
@@ -25,14 +30,25 @@ struct CrangesOwner {
         return *this;
     }
     ~CrangesOwner() { reset(); }
+    /** @brief Destroys held tree and nulls pointer. */
     void reset() { if (cr) { cr_destroy(cr); cr = nullptr; } }
+    /** @brief Replaces ownership with \a p (previous tree destroyed). */
     void adopt(cgranges_t* p) { reset(); if (p) cr = p; }
+    /** @brief Returns raw pointer and clears ownership without destroy. */
     cgranges_t* release() { cgranges_t* t = cr; cr = nullptr; return t; }
 };
 
-/** @brief Total order on `VariantKey` (longcallD `exact_comp_var_site`). */
+/**
+ * @brief Total order on `VariantKey` (longcallD `exact_comp_var_site`).
+ * @return Negative if `*var1 < *var2`, zero if equal, positive if greater.
+ */
 int exact_comp_var_site(const VariantKey* var1, const VariantKey* var2);
-/** @brief Same order with large-insertion fuzzy merge (longcallD `exact_comp_var_site_ins`). */
+
+/**
+ * @brief Same ordering with large-insertion fuzzy collapse (longcallD `exact_comp_var_site_ins`).
+ * @param min_sv_len Length threshold for insertion fuzzy merge rule.
+ * @return Negative / zero / positive as `exact_comp_var_site`.
+ */
 int exact_comp_var_site_ins(const VariantKey* var1, const VariantKey* var2, int min_sv_len);
 
 /**
@@ -43,24 +59,35 @@ struct VariantKeyLess {
 };
 
 /**
- * @brief Maps one `DigarOp` to a `VariantKey` for the candidate table.
+ * @brief Maps one `DigarOp` to a `VariantKey` (longcallD `make_var_site_from_digar`).
+ * @param tid Read contig index.
+ * @param op SNP/indel digar operation.
  */
 VariantKey variant_key_from_digar(int tid, const DigarOp& op);
 
 /**
- * @brief Deduplicates adjacent-equivalent candidates after sorting (large INS fuzzy rule).
+ * @brief Sorts and deduplicates candidates using fuzzy large-insertion equivalence.
+ * @param variants In/out table.
  */
 void collapse_fuzzy_large_insertions(CandidateTable& variants);
 
 /**
- * @brief Collects candidate sites from reads overlapping a chunk, then fuzzy-deduplicates.
+ * @brief Gathers candidate keys from digars overlapping `chunk`, then collapses fuzzy INS.
+ * @param chunk 1-based inclusive region bounds.
+ * @param reads Parsed reads for the chunk.
+ * @param variants Output candidate rows (counts still zero).
  */
 void collect_candidate_sites_from_records(const RegionChunk& chunk,
                                           const std::vector<ReadRecord>& reads,
                                           CandidateTable& variants);
 
 /**
- * @brief Allele and strand depth counts plus optional read-support rows.
+ * @brief Fills allele/strand depth from digars vs sorted candidates; optional read-support log.
+ * @param reads Chunk reads.
+ * @param variants Sorted candidate table.
+ * @param chunk_region If non-null with `read_support_out`, stamped into support rows.
+ * @param read_support_out Optional observation list.
+ * @param min_bq Minimum base quality for high-quality alt tally.
  */
 void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         CandidateTable& variants,
@@ -69,57 +96,74 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         int min_bq);
 
 /**
- * @brief Merges overlapping/adjacent intervals in place (max label wins).
+ * @brief Sorts and merges overlapping/adjacent intervals; merged label is max of inputs.
+ * @param intervals In/out vector.
  */
 void merge_intervals(std::vector<Interval>& intervals);
 
 /**
- * @brief Converts intervals to an unindexed `cgranges_t` on synthetic contig `"cr"`.
+ * @brief Builds unindexed `cgranges_t` on synthetic contig `"cr"` (0-based half-open storage).
+ * @return New tree or nullptr if nothing to add.
  */
 cgranges_t* intervals_to_cr(const std::vector<Interval>& intervals);
 
 /**
- * @brief Copies intervals from `"cr"` back into a vector.
+ * @brief Reads intervals from contig `"cr"` into \a out.
+ * @param cr Source tree (may be null).
+ * @param out Cleared and filled with 1-based inclusive intervals.
  */
 void intervals_from_cr(const cgranges_t* cr, std::vector<Interval>& out);
 
 /**
- * @brief Indexed interval tree of one read's noisy subregions.
+ * @brief Indexed `cgranges_t` for one read's `noisy_regions`.
  */
 cgranges_t* build_read_noisy_cr(const ReadRecord& read);
 
 /**
- * @brief Reference span for a variant key (1-based; insertion is zero-width).
+ * @brief Reference span used for overlap and noisy logic (insertion is zero-width).
+ * @param key Variant locus.
+ * @param var_start Set to first reference base of span (1-based).
+ * @param var_end Set to last reference base (may be `key.pos - 1` for INS).
  */
 void variant_genomic_span(const VariantKey& key, hts_pos_t& var_start, hts_pos_t& var_end);
 
 /**
- * @brief Merge and filter read-level noisy intervals into `chunk.noisy_regions`.
+ * @brief Merges and filters read-level noisy intervals into `chunk.noisy_regions`.
+ * @param chunk Chunk state with reads and optional low-complexity intervals.
+ * @param opts Depth/ratio/merge thresholds.
  */
 void pre_process_noisy_regs_pgphase(BamChunk& chunk, const Options& opts);
 
 /**
- * @brief Expand noisy bounds using classified candidates; re-merge.
+ * @brief Expands noisy intervals using classified candidates; re-merges (longcallD post-process).
+ * @param chunk Chunk whose `noisy_regions` are updated.
+ * @param cand Current candidate table (categories consulted).
  */
 void post_process_noisy_regs_pgphase(BamChunk& chunk, const CandidateTable& cand);
 
 /**
- * @brief Marks candidates fully inside noisy spans as `NonVariant` (non-ONT path).
+ * @brief Sets category to `NonVariant` for sites fully contained in noisy spans (non-ONT).
+ * @param chunk Chunk with candidates and `noisy_regions`.
  */
 void apply_noisy_containment_filter(BamChunk& chunk);
 
 /**
- * @brief Runs sdust on chunk reference to fill `low_complexity_regions`.
+ * @brief Runs sdust on `chunk.ref_seq` slice to fill `low_complexity_regions`.
+ * @param chunk Must have reference sequence loaded for the window.
  */
 void populate_low_complexity_intervals(BamChunk& chunk);
 
 /**
- * @brief Builds `ordered_read_ids` and unions read noisy intervals into the chunk.
+ * @brief Fills `ordered_read_ids` and unions per-read noisy intervals into the chunk list.
+ * @param chunk Chunk whose `reads` are already populated.
  */
 void populate_chunk_read_indexes(BamChunk& chunk);
 
 /**
- * @brief Classifies all candidates in `chunk` (strand bias, depth, noisy overlap, containment).
+ * @brief Runs full candidate classification for one chunk (two-pass longcallD-shaped logic).
+ * @param chunk Chunk with counts populated.
+ * @param opts Technology and thresholds.
+ * @param header BAM header (reserved for future use; currently unused).
  */
 void classify_chunk_candidates(BamChunk& chunk, const Options& opts, const bam_hdr_t* header);
 

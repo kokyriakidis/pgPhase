@@ -1,3 +1,12 @@
+/**
+ * @file collect_pipeline.cpp
+ * @brief Region chunking, parallel candidate collection, streaming writers, and CLI for collect-bam-variation.
+ *
+ * @details Coordinates are 1-based inclusive (BED is converted in `load_bed_regions`). Chunks are batched by
+ * `reg_chunk_i` in `run_collect_bam_variation` so TSV/VCF/read-support can be streamed without holding
+ * all candidates in memory.
+ */
+
 #include "collect_pipeline.hpp"
 
 #include "bam_digar.hpp"
@@ -21,18 +30,19 @@
 
 namespace pgphase_collect {
 
-/**
- * Region construction, parallel chunk execution, streaming writer, and CLI for
- * `collect-bam-variation`. Coordinates are 1-based inclusive (BED is converted in
- * load_bed_regions). Chunks are batched by `reg_chunk_i` in run_collect_bam_variation
- * so TSV/VCF/read-support can be emitted without storing all candidates at once.
- */
-
 // ════════════════════════════════════════════════════════════════════════════
 // Region chunking
 // ════════════════════════════════════════════════════════════════════════════
 
-/** Parse `chr`, `chr:start`, or `chr:start-end` (commas allowed). Empty string → disabled filter. */
+/**
+ * @brief Parses a genomic region string into a `RegionFilter`.
+ *
+ * Accepts `chrom`, `chrom:pos`, or `chrom:start-end` with optional comma thousands separators.
+ * An empty string yields `enabled == false`.
+ *
+ * @param region Region literal from `-r` or positional arguments.
+ * @return Parsed filter; throws if coordinates are invalid.
+ */
 RegionFilter parse_region(const std::string& region) {
     RegionFilter filter;
     if (region.empty()) return filter;
@@ -62,7 +72,15 @@ RegionFilter parse_region(const std::string& region) {
     return filter;
 }
 
-/** Load BED chrom/start/end; convert 0-based half-open to 1-based inclusive [bed_beg+1, bed_end]. */
+/**
+ * @brief Loads 3-column BED intervals as `RegionFilter` entries.
+ *
+ * Skips blank and `#` lines. Converts BED 0-based half-open `[bed_beg, bed_end)` to
+ * 1-based inclusive `[bed_beg+1, bed_end]` on the reference.
+ *
+ * @param path Path to `--region-file`.
+ * @return List of enabled filters; throws on malformed lines.
+ */
 std::vector<RegionFilter> load_bed_regions(const std::string& path) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("failed to open region file: " + path);
@@ -85,7 +103,13 @@ std::vector<RegionFilter> load_bed_regions(const std::string& path) {
     return regions;
 }
 
-/** BAM SQ name lookup; -1 if absent. */
+/**
+ * @brief Resolves a sequence name to BAM target id (`@SQ`).
+ *
+ * @param header BAM/CRAM header.
+ * @param chrom Contig name (e.g. `chr1`).
+ * @return Target index, or -1 if not found.
+ */
 static int tid_for_name(const bam_hdr_t* header, const std::string& chrom) {
     for (int tid = 0; tid < header->n_targets; ++tid) {
         if (chrom == header->target_name[tid]) return tid;
@@ -93,7 +117,15 @@ static int tid_for_name(const bam_hdr_t* header, const std::string& chrom) {
     return -1;
 }
 
-/** Tile [beg,end] into windows of up to chunk_size bp (last may be shorter). */
+/**
+ * @brief Partitions a 1-based inclusive interval into fixed-width chunks.
+ *
+ * @param tid Contig index for every emitted `RegionChunk`.
+ * @param beg First reference position (1-based inclusive).
+ * @param end Last reference position (1-based inclusive).
+ * @param chunk_size Maximum chunk width in bp.
+ * @return Chunks with `beg`/`end` set; `chunk_id` and neighbors are filled later.
+ */
 static std::vector<RegionChunk> split_region(int tid,
                                              hts_pos_t beg,
                                              hts_pos_t end,
@@ -110,7 +142,14 @@ static std::vector<RegionChunk> split_region(int tid,
     return chunks;
 }
 
-/** Sort by contig/start; set chunk_id, reg_chunk_i, reg_i, prev/next neighbour geometry. */
+/**
+ * @brief Sorts chunks and fills ids used for batching and boundary overlap logic.
+ *
+ * Assigns `chunk_id`, per-contig `reg_chunk_i` and `reg_i`, and `prev_*` / `next_*` neighbor
+ * fields when the adjacent chunk is on the same contig.
+ *
+ * @param chunks In/out list (typically from `split_region` / `add_filter_chunks`).
+ */
 static void annotate_chunk_neighbors(std::vector<RegionChunk>& chunks) {
     std::sort(chunks.begin(), chunks.end(), [](const RegionChunk& lhs, const RegionChunk& rhs) {
         if (lhs.tid != rhs.tid) return lhs.tid < rhs.tid;
@@ -149,7 +188,18 @@ static void annotate_chunk_neighbors(std::vector<RegionChunk>& chunks) {
     }
 }
 
-/** Append chunks for [filter.beg, filter.end] clipped to contig (end=-1 → full contig). */
+/**
+ * @brief Appends `RegionChunk` tiles for one filter to `chunks`.
+ *
+ * Clips `filter.end` to the contig length when `end == -1` (full contig). Validates that the
+ * contig exists in both BAM header and FASTA index.
+ *
+ * @param region Enabled filter with `chrom` and 1-based bounds.
+ * @param header BAM header for contig lengths and name resolution.
+ * @param fai Reference index for `faidx_has_seq`.
+ * @param chunk_size Passed to `split_region`.
+ * @param chunks Destination vector.
+ */
 static void add_filter_chunks(const RegionFilter& region,
                               const bam_hdr_t* header,
                               const faidx_t* fai,
@@ -169,7 +219,17 @@ static void add_filter_chunks(const RegionFilter& region,
     chunks.insert(chunks.end(), region_chunks.begin(), region_chunks.end());
 }
 
-/** Combine -r regions, optional --region-file BED, and optional --autosome filters. */
+/**
+ * @brief Builds the full list of region filters from CLI options.
+ *
+ * Concatenates `-r` entries, BED from `--region-file`, and autosome `chrN`/`N` whole-chromosome
+ * filters when `--autosome` is set (requires contig in both BAM and FASTA).
+ *
+ * @param opts User options.
+ * @param header Primary BAM header.
+ * @param fai Reference FASTA index.
+ * @return Ordered list of filters (may be empty if no `-r`/BED/autosome).
+ */
 static std::vector<RegionFilter> collect_region_filters(const Options& opts,
                                                         const bam_hdr_t* header,
                                                         const faidx_t* fai) {
@@ -197,7 +257,15 @@ static std::vector<RegionFilter> collect_region_filters(const Options& opts,
 }
 
 /**
- * With filters: only those intervals. Without: every indexed FASTA contig. Always annotate_chunk_neighbors.
+ * @brief Produces all `RegionChunk` tiles for the run.
+ *
+ * If any filter is present, only those intervals are tiled; otherwise every BAM contig that
+ * exists in the FASTA index is split. Always ends with `annotate_chunk_neighbors`.
+ *
+ * @param opts Chunk size and region inputs.
+ * @param header BAM header.
+ * @param fai Reference index.
+ * @return Sorted, annotated chunk list (may be empty if no valid contigs).
  */
 std::vector<RegionChunk> build_region_chunks(const Options& opts,
                                              const bam_hdr_t* header,
@@ -225,7 +293,12 @@ std::vector<RegionChunk> build_region_chunks(const Options& opts,
     return chunks;
 }
 
-/** Primary BAM + index + reference FAI, then build_region_chunks. */
+/**
+ * @brief Opens primary alignment + reference and returns chunks from `build_region_chunks`.
+ *
+ * @param opts Must include `primary_bam_file()`, `ref_fasta`, and region-related fields.
+ * @return Chunk list; throws if BAM header, index, or FAI cannot be opened.
+ */
 std::vector<RegionChunk> load_region_chunks(const Options& opts) {
     SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
     std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
@@ -242,8 +315,14 @@ std::vector<RegionChunk> load_region_chunks(const Options& opts) {
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * Per-chunk arrays for downstream phasing hooks: overlap read indices per input BAM, skip counts,
- * placeholder haplotype / phase_set state (longcallD-shaped; not used by candidate-only output).
+ * @brief Initializes longcallD-shaped per-read arrays after reads are loaded.
+ *
+ * Fills overlap read-id lists per input BAM (`up_ovlp_read_i`, `down_ovlp_read_i`) from
+ * `read_overlaps_prev_region` / `read_overlaps_next_region`, skip-count placeholders, and
+ * zeroed `haps` / `phase_scores` / `phase_sets` (unused for candidate-only output).
+ *
+ * @param chunk Chunk whose `reads` and `region` are already valid.
+ * @param n_bams Number of input BAM files in this worker.
  */
 static void initialize_longcalld_chunk_state(BamChunk& chunk, size_t n_bams) {
     chunk.up_ovlp_read_i.assign(n_bams, {});
@@ -308,7 +387,16 @@ static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerC
     finalize_bam_chunk(chunk, context.ref, context.primary_header());
 }
 
-/** Noisy-region prep → unique candidate sites → allele/read-support counts. */
+/**
+ * @brief Candidate discovery and allele counting for one chunk (pre-classification).
+ *
+ * Runs noisy-region preprocessing, builds deduplicated candidate keys from digars, then
+ * `collect_allele_counts_from_records` (optionally appends read-support rows).
+ *
+ * @param chunk Prepared chunk with reads and reference slice.
+ * @param opts Quality thresholds (`min_bq`, noisy options).
+ * @param read_support_out If non-null, receives one row per read×site observation.
+ */
 static void collect_prephase_candidates(BamChunk& chunk,
                                         const Options& opts,
                                         std::vector<ReadSupportRow>* read_support_out) {
@@ -318,7 +406,16 @@ static void collect_prephase_candidates(BamChunk& chunk,
         chunk.reads, chunk.candidates, &chunk.region, read_support_out, opts.min_bq);
 }
 
-/** classify_chunk_candidates → post_process noisy → optional noisy containment (non-ONT). */
+/**
+ * @brief Classifies candidates and applies noisy-region post-processing.
+ *
+ * Order: `classify_chunk_candidates`, `post_process_noisy_regs_pgphase`, then for non-ONT
+ * platforms `apply_noisy_containment_filter`.
+ *
+ * @param chunk Chunk with populated `candidates`.
+ * @param opts Classification options (e.g. ONT vs HiFi).
+ * @param header BAM header for classification.
+ */
 static void classify_and_filter_candidates(BamChunk& chunk,
                                            const Options& opts,
                                            const bam_hdr_t* header) {
@@ -338,10 +435,11 @@ static void classify_and_filter_candidates(BamChunk& chunk,
  * This implements the overarching control flow found in `longcallD`'s 
  * top-level `collect_var_main()`.
  *
- * @param region Sub-region coordinate struct mapping a piece of genome.
- * @param opts Options describing behavior and qualities.
- * @param context Thread-local variables passing caching pointers safely.
- * @return CandidateTable A self-contained list of evaluated sites.
+ * @param region Genomic slice to process.
+ * @param opts Pipeline and quality options.
+ * @param context Per-thread BAM/FAI context.
+ * @param read_support_out Optional buffer for read-support rows from this chunk.
+ * @return `BamChunk` with filled `candidates` and related fields.
  */
 static BamChunk process_chunk(const RegionChunk& region,
                               const Options& opts,
@@ -381,7 +479,9 @@ static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
 }
 
 /**
- * @brief Outputs of parallel chunk processing for one `reg_chunk_i` batch.
+ * @brief Parallel batch result: one `BamChunk` per chunk offset, optional read-support batches.
+ *
+ * `read_support_batches[i]` corresponds to `chunks[i]` when read-support collection is enabled.
  */
 struct ChunkBatchResult {
     std::vector<BamChunk> chunks;
@@ -563,6 +663,9 @@ void run_collect_bam_variation(const Options& opts) {
 
 namespace pgphase_collect {
 
+/**
+ * @brief `getopt_long` option codes for flags without short aliases (values ≥ 1000).
+ */
 enum LongOption {
     kMinAltDepthOption = 1000,
     kMinAfOption,
@@ -704,6 +807,7 @@ int collect_bam_variation(int argc, char* argv[]) {
     int long_index = 0;
     bool read_technology_was_set = false;
     bool read_technology_conflict = false;
+    /** Records technology mode; flags conflict if more than one of --hifi/--ont/--short-reads is set. */
     const auto set_read_technology = [&](ReadTechnology tech) {
         if (read_technology_was_set && opts.read_technology != tech) {
             read_technology_conflict = true;
