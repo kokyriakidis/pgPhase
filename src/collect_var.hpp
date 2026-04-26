@@ -11,7 +11,9 @@ extern "C" {
 
 namespace pgphase_collect {
 
-// ── RAII wrapper for cgranges_t ──────────────────────────────────────────────
+/**
+ * @brief RAII wrapper around `cgranges_t` (move-only, destroys on reset).
+ */
 struct CrangesOwner {
     cgranges_t* cr = nullptr;
     CrangesOwner() = default;
@@ -28,34 +30,37 @@ struct CrangesOwner {
     cgranges_t* release() { cgranges_t* t = cr; cr = nullptr; return t; }
 };
 
-// ── Variant site comparison ──────────────────────────────────────────────────
+/** @brief Total order on `VariantKey` (longcallD `exact_comp_var_site`). */
 int exact_comp_var_site(const VariantKey* var1, const VariantKey* var2);
+/** @brief Same order with large-insertion fuzzy merge (longcallD `exact_comp_var_site_ins`). */
 int exact_comp_var_site_ins(const VariantKey* var1, const VariantKey* var2, int min_sv_len);
 
+/**
+ * @brief Strict-weak ordering functor delegating to `exact_comp_var_site`.
+ */
 struct VariantKeyLess {
     bool operator()(const VariantKey& lhs, const VariantKey& rhs) const;
 };
 
-// ── Candidate site collection ────────────────────────────────────────────────
 /**
- * @brief Isolates variant metrics out from a parsed `DigarOp` node into a searchable key.
+ * @brief Maps one `DigarOp` to a `VariantKey` for the candidate table.
  */
 VariantKey variant_key_from_digar(int tid, const DigarOp& op);
 
-/** Collapses overlapping/adjacent insertion elements bridging fragmented representation mappings inside `longcallD`. */
+/**
+ * @brief Deduplicates adjacent-equivalent candidates after sorting (large INS fuzzy rule).
+ */
 void collapse_fuzzy_large_insertions(CandidateTable& variants);
 
-/** Core parser evaluating `ReadRecord` groups pulling mapped components into the statistical candidate set. */
+/**
+ * @brief Collects candidate sites from reads overlapping a chunk, then fuzzy-deduplicates.
+ */
 void collect_candidate_sites_from_records(const RegionChunk& chunk,
                                           const std::vector<ReadRecord>& reads,
                                           CandidateTable& variants);
 
-// ── Allele counting ──────────────────────────────────────────────────────────
 /**
- * @brief Resolves depth coverage arrays spanning overlapping candidate SNPs/Indels.
- * 
- * Functions identically to `update_cand_var_depth`, feeding specific read inclusion constraints
- * based on minimum qualities and explicit base mismatches. Populates statistical weights.
+ * @brief Allele and strand depth counts plus optional read-support rows.
  */
 void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         CandidateTable& variants,
@@ -63,50 +68,59 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         std::vector<ReadSupportRow>* read_support_out,
                                         int min_bq);
 
-// ── Interval utilities ───────────────────────────────────────────────────────
-
-/** Merges overlapping structural intervals inside a vector. (Maps to `cr_merge`/cgranges). */
+/**
+ * @brief Merges overlapping/adjacent intervals in place (max label wins).
+ */
 void merge_intervals(std::vector<Interval>& intervals);
 
-/** Converts a vector of coordinate spans into an optimized C-based interval tree interval tree (`cgranges_t`). */
+/**
+ * @brief Converts intervals to an unindexed `cgranges_t` on synthetic contig `"cr"`.
+ */
 cgranges_t* intervals_to_cr(const std::vector<Interval>& intervals);
 
-/** Deserializes coordinate spans out from `cgranges_t` back into vectors. */
+/**
+ * @brief Copies intervals from `"cr"` back into a vector.
+ */
 void intervals_from_cr(const cgranges_t* cr, std::vector<Interval>& out);
 
-/** Builds an interval tree encapsulating all noisy clipped stretches inside a specific read. */
+/**
+ * @brief Indexed interval tree of one read's noisy subregions.
+ */
 cgranges_t* build_read_noisy_cr(const ReadRecord& read);
 
-/** Gets 1-based start and end boundary positions out of a Variant token. */
+/**
+ * @brief Reference span for a variant key (1-based; insertion is zero-width).
+ */
 void variant_genomic_span(const VariantKey& key, hts_pos_t& var_start, hts_pos_t& var_end);
 
-// ── Noisy region processing ──────────────────────────────────────────────────
-
-/** 
- * @brief Expands structurally noisy alignments via standard heuristics mapping `longcallD`'s `pre_process_noisy_regs`. 
+/**
+ * @brief Merge and filter read-level noisy intervals into `chunk.noisy_regions`.
  */
 void pre_process_noisy_regs_pgphase(BamChunk& chunk, const Options& opts);
 
-/** 
- * @brief Identifies whether a previously clean candidate overlaps with the final bounds of a noisy block. 
- * Connects to `apply_noisy_containment_filter()`.
+/**
+ * @brief Expand noisy bounds using classified candidates; re-merge.
  */
 void post_process_noisy_regs_pgphase(BamChunk& chunk, const CandidateTable& cand);
 
-/** 
- * @brief Core filtering phase applying `cgranges` overlap scans against `var_t` arrays masking false SNVs heavily contained inside noisy spans. 
+/**
+ * @brief Marks candidates fully inside noisy spans as `NonVariant` (non-ONT path).
  */
 void apply_noisy_containment_filter(BamChunk& chunk);
 
-/** Maps intervals containing long repeating simple subsequences using `sdust` library loops. */
+/**
+ * @brief Runs sdust on chunk reference to fill `low_complexity_regions`.
+ */
 void populate_low_complexity_intervals(BamChunk& chunk);
 
-/** Connects index values map to efficiently query raw alignments during grouping. */
+/**
+ * @brief Builds `ordered_read_ids` and unions read noisy intervals into the chunk.
+ */
 void populate_chunk_read_indexes(BamChunk& chunk);
 
-// ── Variant classification ───────────────────────────────────────────────────
-
-/** Aggregates variant categories passing through filtering (AF, Depth, Content) mapping tags inside `CandidateTable`. */
+/**
+ * @brief Classifies all candidates in `chunk` (strand bias, depth, noisy overlap, containment).
+ */
 void classify_chunk_candidates(BamChunk& chunk, const Options& opts, const bam_hdr_t* header);
 
 } // namespace pgphase_collect

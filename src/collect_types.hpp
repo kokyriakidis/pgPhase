@@ -357,8 +357,16 @@ struct FaiDeleter {
     void operator()(faidx_t* p) const { fai_destroy(p); }
 };
 
+/**
+ * @brief RAII `samFile*` for BAM/CRAM input with optional CRAM reference and HTS threads.
+ */
 class SamFile {
 public:
+    /**
+     * @param path Alignment path (BAM or CRAM).
+     * @param threads Passed to `hts_set_threads` when greater than 1.
+     * @param ref_fasta Required for CRAM decode (`hts_set_fai_filename`).
+     */
     SamFile(const std::string& path, int threads, const std::string& ref_fasta = "") : fp_(sam_open(path.c_str(), "r")) {
         if (fp_ == nullptr) throw std::runtime_error("failed to open BAM/CRAM: " + path);
         const htsFormat* fmt = hts_get_format(fp_);
@@ -374,6 +382,7 @@ public:
         }
     }
 
+    /** @brief Closes the alignment file. */
     ~SamFile() {
         if (fp_ != nullptr) sam_close(fp_);
     }
@@ -381,16 +390,23 @@ public:
     SamFile(const SamFile&) = delete;
     SamFile& operator=(const SamFile&) = delete;
 
+    /** @brief Underlying HTSlib handle. */
     samFile* get() const { return fp_; }
 
 private:
     samFile* fp_ = nullptr;
 };
 
+/**
+ * @brief Lazy per-contig reference sequence cache backed by `faidx_t`.
+ */
 class ReferenceCache {
 public:
     explicit ReferenceCache(faidx_t* fai) : fai_(fai) {}
 
+    /**
+     * @brief Uppercase ACGTN at 1-based \a one_based_pos on \a tid, or `N` if out of range.
+     */
     char base(int tid, hts_pos_t one_based_pos, const bam_hdr_t* header) {
         if (tid < 0 || tid >= header->n_targets || one_based_pos < 1) return 'N';
         load_contig(tid, header);
@@ -398,6 +414,9 @@ public:
         return normalize_base(seq_[static_cast<size_t>(one_based_pos - 1)]);
     }
 
+    /**
+     * @brief Concatenates `len` bases starting at \a one_based_pos; returns `"."` if `len <= 0`.
+     */
     std::string subseq(int tid, hts_pos_t one_based_pos, int len, const bam_hdr_t* header) {
         if (len <= 0) return ".";
         std::string out;
@@ -442,12 +461,18 @@ private:
     std::string seq_;
 };
 
+/**
+ * @brief Opens or builds a FASTA index (`fai_load3` with `FAI_CREATE`).
+ */
 inline faidx_t* load_reference_index(const std::string& ref_fasta) {
     faidx_t* fai = fai_load3(ref_fasta.c_str(), nullptr, nullptr, FAI_CREATE);
     if (fai == nullptr) throw std::runtime_error("failed to load/build reference FASTA index: " + ref_fasta);
     return fai;
 }
 
+/**
+ * @brief Per-worker handles: one `SamFile` + index + header per input path, shared `ReferenceCache`.
+ */
 struct WorkerContext {
     explicit WorkerContext(const Options& opts)
         : fai(load_reference_index(opts.ref_fasta)),
@@ -465,6 +490,7 @@ struct WorkerContext {
         }
     }
 
+    /** @brief Header of the first (primary) BAM in `bam_files`. */
     bam_hdr_t* primary_header() const { return headers.front().get(); }
 
     std::vector<std::unique_ptr<SamFile>> bams;

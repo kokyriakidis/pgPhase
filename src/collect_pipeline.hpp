@@ -9,47 +9,55 @@ namespace pgphase_collect {
 
 /**
  * @brief Public API for region chunking and parallel collect-bam-variation orchestration.
- * 
- * Maps to the upper-level flow control of `longcallD`, breaking down genomic queries
- * into thread-safe discrete blocks (`RegionChunk`), distributing them to parser workers, 
- * and funneling the extracted variants into unified result models.
+ *
+ * Mirrors longcallD-style region partitioning into `RegionChunk` units, worker dispatch,
+ * and merged candidate tables.
  */
 
-// ── Region chunking ──────────────────────────────────────────────────────────
-
-/** Parses a chromosome region string (e.g., "chr1:100-200") into a filter struct. */
+/**
+ * @brief Parses `chr`, `chr:pos`, or `chr:start-end` (commas allowed) into `RegionFilter`.
+ */
 RegionFilter parse_region(const std::string& region);
 
-/** Loads standard 3-column BED regions into inclusion filters. */
+/**
+ * @brief Loads 3-column BED regions as inclusion filters (0-based BED → 1-based inclusive).
+ */
 std::vector<RegionFilter> load_bed_regions(const std::string& path);
 
-/** Divides genomic contigs into evenly sized chunks for parallel read digestion mapping to `longcallD` thread dispatchers. */
+/**
+ * @brief Tiles the genome (or user filters) into chunks of `opts.chunk_size` and annotates neighbors.
+ */
 std::vector<RegionChunk> build_region_chunks(const Options& opts,
                                              const bam_hdr_t* header,
                                              const faidx_t* fai);
 
-/** Identifies genomic ranges to scan, pulling from opts.region_file or full indices. */
+/**
+ * @brief Opens primary BAM + reference index and returns chunks from `build_region_chunks`.
+ */
 std::vector<RegionChunk> load_region_chunks(const Options& opts);
 
-// ── Pipeline ─────────────────────────────────────────────────────────────────
-
 /**
- * @brief Core parallelization dispatcher replacing `longcallD`'s thread pools.
- * 
- * Dispatches chunks to `process_chunk`, waits for all variants, and correctly merges 
- * the results back into a globally-sorted, duplicate-free `CandidateTable`.
+ * @brief Runs all chunks through a worker pool and merges results into one `CandidateTable`.
+ *
+ * @param opts Thread count and paths.
+ * @param chunks Region list from `load_region_chunks`.
+ * @param read_support_batches If non-null, receives one batch of rows per chunk when requested by caller.
  */
 CandidateTable collect_chunks_parallel(
     const Options& opts,
     const std::vector<RegionChunk>& chunks,
     std::vector<std::vector<ReadSupportRow>>* read_support_batches);
 
-/** Main driver method that boots the full pipeline step-by-step. */
+/**
+ * @brief Streaming driver: batch by `reg_chunk_i`, write TSV/VCF/read-support incrementally.
+ */
 void run_collect_bam_variation(const Options& opts);
 
 } // namespace pgphase_collect
 
-// ── CLI entry point ──────────────────────────────────────────────────────────
+/**
+ * @brief CLI entry for `collect-bam-variation` (argv without subcommand name).
+ */
 int collect_bam_variation(int argc, char* argv[]);
 
 #endif

@@ -266,6 +266,16 @@ static void initialize_longcalld_chunk_state(BamChunk& chunk, size_t n_bams) {
     }
 }
 
+/**
+ * @brief Loads all input BAMs for one region chunk and finishes digar/reference setup.
+ *
+ * Queries each BAM for overlapping reads, merges and sorts `chunk.reads`, initializes
+ * per-read overlap indices and placeholder phasing fields, then calls `finalize_bam_chunk`.
+ *
+ * @param chunk Chunk state; `chunk.region` must already be set.
+ * @param opts Read filters, reference path, and technology flags.
+ * @param context Open BAM handles, indexes, headers, and shared reference cache.
+ */
 static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerContext& context) {
     chunk.reads.clear();
     std::vector<OverlapSkipCounts> overlap_skip_counts(context.bams.size());
@@ -317,7 +327,6 @@ static void classify_and_filter_candidates(BamChunk& chunk,
     if (!opts.is_ont()) apply_noisy_containment_filter(chunk);
 }
 
-/** One RegionChunk end-to-end: load reads, collect+count, classify; returns BamChunk. */
 /**
  * @brief Sequentially collects variants from candidate regions.
  *
@@ -371,15 +380,26 @@ static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
     return merged;
 }
 
-/** Worker batch: BamChunks plus optional read-support rows per chunk. */
+/**
+ * @brief Outputs of parallel chunk processing for one `reg_chunk_i` batch.
+ */
 struct ChunkBatchResult {
     std::vector<BamChunk> chunks;
     std::vector<std::vector<ReadSupportRow>> read_support_batches;
 };
 
 /**
- * Process chunks[batch_begin, batch_end) with opts.threads workers (each owns WorkerContext).
- * Fills read_support_batches when collect_read_support.
+ * @brief Runs `process_chunk` on a contiguous slice of region chunks with a thread pool.
+ *
+ * Each worker constructs its own `WorkerContext` (per-thread BAM + FAI handles). On failure,
+ * the first exception is stored and rethrown after all workers join.
+ *
+ * @param opts Thread count and I/O options.
+ * @param chunks Full chunk list; only indices `[batch_begin, batch_end)` are processed.
+ * @param batch_begin First index in `chunks` (inclusive).
+ * @param batch_end One past the last index (exclusive).
+ * @param collect_read_support If true, each slot in `read_support_batches` receives that chunk's rows.
+ * @return Per-chunk `BamChunk` results in offset order, plus optional read-support batches.
  */
 static ChunkBatchResult collect_chunk_batch_parallel(const Options& opts,
                                                      const std::vector<RegionChunk>& chunks,
@@ -457,7 +477,13 @@ CandidateTable collect_chunks_parallel(
 }
 
 /**
- * Stream by reg_chunk_i: concatenate per-chunk candidates per batch, append TSV/VCF/read-support (bounded RAM).
+ * @brief End-to-end collect-bam-variation driver with streaming output.
+ *
+ * Groups chunks by `reg_chunk_i`, processes each batch in parallel, merges candidates in memory
+ * only within the batch, then appends TSV rows and optional VCF / read-support lines. Does not
+ * hold the full genome candidate set in RAM.
+ *
+ * @param opts Output paths, reference, BAM list, and threading configuration.
  */
 void run_collect_bam_variation(const Options& opts) {
     std::unique_ptr<faidx_t, FaiDeleter> fai(load_reference_index(opts.ref_fasta));
@@ -557,6 +583,14 @@ enum LongOption {
     kInputIsListOption
 };
 
+/**
+ * @brief Reads a newline-separated list of BAM/CRAM paths.
+ *
+ * Strips surrounding whitespace, skips blank lines and `#` comments. Requires at least one path.
+ *
+ * @param path Text file passed with `--input-is-list` / `-L`.
+ * @return Non-empty list of alignment file paths.
+ */
 static std::vector<std::string> load_bam_list(const std::string& path) {
     std::ifstream in(path);
     if (!in) throw std::runtime_error("failed to open BAM/CRAM list: " + path);
@@ -573,7 +607,9 @@ static std::vector<std::string> load_bam_list(const std::string& path) {
     return files;
 }
 
-/** --help text for collect-bam-variation. */
+/**
+ * @brief Prints usage and option summary for `collect-bam-variation` to stdout.
+ */
 static void print_collect_help() {
     std::cout
         << "Usage: pgphase collect-bam-variation [options] <ref.fa> <input.bam|bam.list> [region ...]\n"
@@ -614,8 +650,15 @@ static void print_collect_help() {
 } // namespace pgphase_collect
 
 /**
- * Parse `collect-bam-variation` flags into Options, validate thresholds, then run_collect_bam_variation.
- * `main` passes argc/argv with the subcommand already removed.
+ * @brief CLI entry for the `collect-bam-variation` subcommand.
+ *
+ * Parses GNU long options into `Options`, validates numeric thresholds, resolves the BAM list,
+ * then calls `run_collect_bam_variation`. Expects `argv` with the `collect-bam-variation` token
+ * already removed by the caller.
+ *
+ * @param argc Argument count.
+ * @param argv Argument vector (reference FASTA, input BAM or list, optional region strings).
+ * @return 0 on success, 1 on usage or validation error, 1 if `run_collect_bam_variation` throws.
  */
 int collect_bam_variation(int argc, char* argv[]) {
     using namespace pgphase_collect;

@@ -6,7 +6,14 @@
 
 namespace pgphase_collect {
 
-/** SNP / INS / DEL label for TSV, VCF INFO, and read-support TYPE column. */
+/**
+ * @brief Returns the string representation for a VariantType.
+ *
+ * Used for SNP / INS / DEL labels in TSV, VCF INFO, and read-support TYPE columns.
+ *
+ * @param type The variant type enum value.
+ * @return A string literal ("SNP", "INS", "DEL", or "UNKNOWN").
+ */
 std::string type_name(VariantType type) {
     switch (type) {
         case VariantType::Snp:
@@ -19,7 +26,15 @@ std::string type_name(VariantType type) {
     return "UNKNOWN";
 }
 
-/** LongcallD-style category token (e.g. CLEAN_HET_SNP, LOW_COV) for TSV and VCF INFO.CAT. */
+/**
+ * @brief Returns the string representation for a VariantCategory.
+ *
+ * Provides LongcallD-style category tokens (e.g., CLEAN_HET_SNP, LOW_COV)
+ * for TSV and VCF INFO.CAT columns.
+ *
+ * @param category The variant category enum value.
+ * @return A string corresponding to the category label.
+ */
 std::string category_name(VariantCategory category) {
     switch (category) {
         case VariantCategory::LowCoverage:
@@ -48,12 +63,28 @@ std::string category_name(VariantCategory category) {
     return "UNKNOWN";
 }
 
-/** Header row for --read-support: one line per read×candidate observation. */
+/**
+ * @brief Writes the TSV header for read support output.
+ *
+ * Defines the columns for the `--read-support` output format, which consists
+ * of one line per read x candidate observation.
+ *
+ * @param out Output stream to write the header to.
+ */
 void write_read_support_header(std::ostream& out) {
     out << "CHROM\tPOS\tTYPE\tREF_LEN\tALT\tQNAME\tIS_ALT\tLOW_QUAL\tREVERSE\tMAPQ\tCHUNK_BEG\tCHUNK_END\n";
 }
 
-/** Body lines for one chunk's read×site observations (CHROM from header). */
+/**
+ * @brief Writes body lines for read support observations.
+ *
+ * Outputs one chunk's read x site observations including the sequence name
+ * (CHROM) resolved from the BAM header.
+ *
+ * @param out Output stream to write the rows to.
+ * @param header BAM header used to resolve reference sequence IDs to names.
+ * @param rows A vector of `ReadSupportRow` structures containing the observation data.
+ */
 void write_read_support_rows(std::ostream& out,
                              const bam_hdr_t* header,
                              const std::vector<ReadSupportRow>& rows) {
@@ -66,7 +97,15 @@ void write_read_support_rows(std::ostream& out,
     }
 }
 
-/** Concatenate per-chunk batches (order matches streaming chunk processing). */
+/**
+ * @brief Writes the full read support TSV file from all processed chunks.
+ *
+ * Concatenates per-chunk batches of read observations into the final TSV file specified in `opts`.
+ * Order matches the streaming chunk processing.
+ *
+ * @param opts Configuration options containing the primary BAM file and read support output path.
+ * @param by_chunk A vector of vectors, where each inner vector represents a chunk's read observations.
+ */
 void write_read_support_tsv(const Options& opts, const std::vector<std::vector<ReadSupportRow>>& by_chunk) {
     SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
     std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
@@ -81,27 +120,30 @@ void write_read_support_tsv(const Options& opts, const std::vector<std::vector<R
     }
 }
 
-/** Main candidate table: ref/alt sequence, depth, strand counts, AF, category; trailing phase columns are placeholders. */
+/**
+ * @brief Writes the TSV header for the main candidate variant table.
+ *
+ * Defines columns for ref/alt sequence, depth, strand counts, allele fraction (AF),
+ * and category. Trailing phase columns are placeholders.
+ *
+ * @param out Output stream to write the header line to.
+ */
 void write_variants_tsv_header(std::ostream& out) {
     out << "CHROM\tPOS\tTYPE\tREF\tALT\tDP\tREF_COUNT\tALT_COUNT\tLOW_QUAL_COUNT"
         << "\tFORWARD_REF\tREVERSE_REF\tFORWARD_ALT\tREVERSE_ALT"
         << "\tAF\tCATEGORY\tINIT_CAT\tPHASE_SET\tHAP_ALT\tHAP_REF\n";
 }
 
-/** One row per CandidateVariant; REF/ALT from ReferenceCache for SNP/DEL. */
 /**
  * @brief Serializes the mapped candidate variant evaluations to TSV.
  *
- * Implements the dump logic of category classifications and variant counts
- * that allows cross-verification of internal structs (like `NOISY_HET`, `LOW_COV`, 
- * etc) corresponding directly to the internal representations and debugging formats
- * provided in `longcallD`.
+ * Writes one row per CandidateVariant, obtaining REF/ALT sequences from the
+ * `ReferenceCache` for SNPs and deletions. Category and count fields mirror internal
+ * classifications for cross-checks against longcallD-style debugging output.
  *
- * Like longcallD's log dumping mechanisms (when outputting unvcf text modes).
- * 
  * @param out Open file stream targeting a `.tsv`.
- * @param header Raw header (BAM fields).
- * @param opts Options.
+ * @param header BAM header for contig names.
+ * @param ref Reference cache used to extract sequence for SNPs and deletions.
  * @param variants Validated list of categorized variants.
  */
 void write_variants_tsv_records(std::ostream& out,
@@ -130,7 +172,16 @@ void write_variants_tsv_records(std::ostream& out,
     }
 }
 
-/** Open primary BAM for SQ names, write opts.output_tsv (full merged candidate set). */
+/**
+ * @brief Writes the full set of categorized variants to a TSV file.
+ *
+ * Opens the primary BAM file to obtain reference sequence names via the header,
+ * configures the FASTA cache, and streams the full merged candidate set to `opts.output_tsv`.
+ *
+ * @param opts Program options containing I/O paths.
+ * @param fai FASTA index for the reference genome.
+ * @param variants The complete table of evaluated candidate variants.
+ */
 void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
     SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
     std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
@@ -144,7 +195,16 @@ void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& var
     write_variants_tsv_records(out, header.get(), ref, variants);
 }
 
-/** VCF 4.2 header: contigs, FILTER/INFO lines for candidate (not final genotype) semantics. */
+/**
+ * @brief Writes a valid VCF v4.2 header for candidate variants.
+ *
+ * Emits standard VCF pragmas, contig definitions from the BAM header,
+ * and FILTER/INFO lines for candidate (not final genotype) semantics.
+ *
+ * @param out Output stream to write the VCF header to.
+ * @param opts Program options (reserved; currently unused in the header text).
+ * @param header BAM header containing reference names and lengths.
+ */
 void write_variants_vcf_header(std::ostream& out, const Options& opts, const bam_hdr_t* header) {
     (void)opts;
     out << "##fileformat=VCFv4.2\n";
@@ -178,20 +238,19 @@ void write_variants_vcf_header(std::ostream& out, const Options& opts, const bam
 }
 
 /**
- * Left-normalized VCF records: SNP at POS; INS/DEL with anchor base (POS-1) per VCF convention.
- * FILTER flags clean vs filtered candidates; SVTYPE/SVLEN for large indels when |len| >= min_sv_len.
- */
-/**
- * @brief Constructs a valid VCF text representation mapping internal variant keys to VCF.
+ * @brief Writes VCF body records for candidate variants.
  *
- * Implements the standard `write_vcf` routines from `longcallD`, generating correct
- * headers and parsing internal types (Deletions, HET_SNPs, BIAS) to `PASS` or 
- * filtered (`FILTER`) outputs natively mapping `AC`, `AD`, and `GT`.
+ * Produces left-normalized records: SNP at `key.pos`; insertions and deletions use the
+ * anchor base at POS-1 per VCF convention. FILTER is PASS for clean categories, RefCall
+ * for non-variants, NoCall when depth is zero, and LowQual otherwise. INFO includes END,
+ * optional CLEAN, depth and allele fields, AF, CAT, and SVTYPE/SVLEN when |SVLEN| >=
+ * `opts.min_sv_len`.
  *
- * @param out Output target `.vcf`
- * @param opts Options
- * @param fai Cached fasta index reference.
- * @param variants Analyzed candidates list output.
+ * @param out Output stream for the `.vcf` body.
+ * @param opts Options (e.g. `min_sv_len` for tagging large indels).
+ * @param header BAM header for contig names.
+ * @param ref Reference sequence cache for REF/ALT bases.
+ * @param variants Candidate variants to emit.
  */
 void write_variants_vcf_records(std::ostream& out,
                                 const Options& opts,
@@ -259,7 +318,16 @@ void write_variants_vcf_records(std::ostream& out,
     }
 }
 
-/** No-op if opts.output_vcf empty; otherwise write full candidate VCF. */
+/**
+ * @brief Writes optional candidate-variant VCF output.
+ *
+ * If `opts.output_vcf` is non-empty, opens the path, writes the VCF header and all records;
+ * otherwise does nothing.
+ *
+ * @param opts Program options (`output_vcf`, BAM path, reference FASTA).
+ * @param fai FASTA index for reference bases.
+ * @param variants Categorized candidates to serialize.
+ */
 void write_variants_vcf(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
     if (opts.output_vcf.empty()) return;
 
