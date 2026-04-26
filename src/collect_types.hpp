@@ -1,6 +1,11 @@
 #ifndef PGPHASE_COLLECT_TYPES_HPP
 #define PGPHASE_COLLECT_TYPES_HPP
 
+/**
+ * @file collect_types.hpp
+ * @brief Shared types, defaults, and RAII I/O helpers for collect-bam-variation.
+ */
+
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -22,6 +27,11 @@ namespace pgphase_collect {
 // ════════════════════════════════════════════════════════════════════════════
 // Constants
 // ════════════════════════════════════════════════════════════════════════════
+
+/** @name Defaults
+ *  @brief Default thresholds and window sizes (many mirror longcallD constants).
+ */
+///@{
 
 constexpr int kDefaultMinMapq = 30;
 constexpr int kDefaultMinBaseq = 10;
@@ -51,10 +61,15 @@ constexpr int kDefaultNoisyRegMaxXgaps = 5;
  * the published “total read coverage” noisy-region description. */
 constexpr int kDefaultMinNoisyRegTotalDepth = 0;
 
+///@}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Enumerations
 // ════════════════════════════════════════════════════════════════════════════
 
+/**
+ * @brief Variant class aligned with BAM CIGAR op types used in digars.
+ */
 enum class VariantType : uint8_t {
     Snp = 8,       // BAM_CDIFF
     Insertion = 1, // BAM_CINS
@@ -89,6 +104,9 @@ enum class VariantCategory : uint8_t {
     NonVariant
 };
 
+/**
+ * @brief Per-read alignment event type in the digar stream (match, SNP, indel, clip, skip).
+ */
 enum class DigarType : uint8_t {
     Equal,
     Snp,
@@ -99,6 +117,9 @@ enum class DigarType : uint8_t {
     RefSkip
 };
 
+/**
+ * @brief Sequencing preset: affects noisy window size and ONT strand-bias testing.
+ */
 enum class ReadTechnology : uint8_t {
     Hifi,
     Ont,
@@ -109,6 +130,9 @@ enum class ReadTechnology : uint8_t {
 // Options & region input
 // ════════════════════════════════════════════════════════════════════════════
 
+/**
+ * @brief Parsed CLI state for collect-bam-variation (threads, thresholds, paths, regions).
+ */
 struct Options {
     int threads = 1;
     int min_mapq = kDefaultMinMapq;
@@ -142,14 +166,19 @@ struct Options {
     std::string read_support_tsv;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
 
+    /**
+     * @brief First BAM path: `bam_files.front()` when multi-input, else legacy `bam_file`.
+     */
     const std::string& primary_bam_file() const {
         return bam_files.empty() ? bam_file : bam_files.front();
     }
 
+    /** @brief True when `--ont` mode (Fisher strand bias, shorter noisy window default). */
     bool is_ont() const {
         return read_technology == ReadTechnology::Ont;
     }
 
+    /** @brief True when `--short-reads` mode. */
     bool is_short_reads() const {
         return read_technology == ReadTechnology::ShortReads;
     }
@@ -159,7 +188,9 @@ struct Options {
 // Region & read data
 // ════════════════════════════════════════════════════════════════════════════
 
-/** Maps back to `region_t` structure. Dictates coordinate bounds representing where variation scanning operates. */
+/**
+ * @brief User-specified inclusion interval on one contig (1-based inclusive coordinates).
+ */
 struct RegionFilter {
     bool enabled = false;
     std::string chrom;
@@ -167,7 +198,9 @@ struct RegionFilter {
     hts_pos_t end = -1; // 1-based inclusive, -1 means contig end
 };
 
-/** Tracks thread-safe slices of a `RegionFilter`, dispatching localized genomic bounds mapped precisely to `longcallD` partitioning. */
+/**
+ * @brief One tiled window on a contig plus neighbor metadata for chunk-boundary overlap logic.
+ */
 struct RegionChunk {
     int chunk_id = -1;
     int tid = -1;
@@ -184,11 +217,15 @@ struct RegionChunk {
     hts_pos_t next_beg = 0;
     hts_pos_t next_end = 0;
 
+    /** @brief True if `prev_chunk_id` points to the preceding chunk on the same contig. */
     bool has_prev_region() const { return prev_chunk_id >= 0; }
+    /** @brief True if `next_chunk_id` points to the following chunk on the same contig. */
     bool has_next_region() const { return next_chunk_id >= 0; }
 };
 
-/** Equivalent to `longcallD`'s `var_key_t`. Core struct functioning as the hashing identity (TID/Pos/Type/Len/Alt) across variants. */
+/**
+ * @brief Candidate identity: contig, 1-based position, type, ref length, alternate sequence.
+ */
 struct VariantKey {
     int tid = -1;
     hts_pos_t pos = 0; // 1-based. Insertions are between pos - 1 and pos, matching longcallD.
@@ -196,19 +233,26 @@ struct VariantKey {
     int ref_len = 0;
     std::string alt;
 
+    /**
+     * @brief Position key for sorting (indels use `pos - 1` like longcallD).
+     */
     hts_pos_t sort_pos() const {
         return type == VariantType::Snp ? pos : pos - 1;
     }
 };
 
-/** C-compatible interval bounds structure containing generic label maps logic to `noisy_region_t`. */
+/**
+ * @brief Closed interval on the reference with optional integer label (noisy size, merge metadata).
+ */
 struct Interval {
     hts_pos_t beg = 0; // 1-based inclusive
     hts_pos_t end = 0; // 1-based inclusive
     int label = 0;
 };
 
-/** High-level sequence alteration node parsed from alignment files. Counterpart of `digar_op_t` storing individual SNP/Insertion/Deletion components. */
+/**
+ * @brief One CIGAR/MD/CS-derived event on a read (position, type, length, bases, quality flag).
+ */
 struct DigarOp {
     hts_pos_t pos = 0; // 1-based reference coordinate
     DigarType type = DigarType::Equal;
@@ -219,16 +263,19 @@ struct DigarOp {
 };
 
 
-
-
+/** @brief `std::unique_ptr` deleter calling `bam_destroy1`. */
 struct AlignmentDeleter {
     void operator()(bam1_t* p) const { bam_destroy1(p); }
 };
 
+/** @brief `std::unique_ptr` deleter calling `cr_destroy`. */
 struct CgrangesDeleter {
     void operator()(cgranges_t* p) const { if (p) cr_destroy(p); }
 };
 
+/**
+ * @brief One line of `--read-support` TSV: read evidence at a candidate locus.
+ */
 struct ReadSupportRow {
     int tid = -1;
     hts_pos_t pos = 0;
@@ -244,6 +291,9 @@ struct ReadSupportRow {
     hts_pos_t chunk_end = 0;
 };
 
+/**
+ * @brief One input read after parsing: coordinates, digars, qualities, noisy subregions.
+ */
 struct ReadRecord {
     int tid = -1;
     int input_index = 0;
@@ -268,6 +318,9 @@ struct ReadRecord {
     int total_cand_events = 0; // longcallD n_total_cand_vars (includes long-clip noisy windows)
 };
 
+/**
+ * @brief Counts of reads skipped at chunk boundaries when loading from a BAM slice.
+ */
 struct OverlapSkipCounts {
     int upstream = 0;
     int downstream = 0;
@@ -277,6 +330,9 @@ struct OverlapSkipCounts {
 // Variant data
 // ════════════════════════════════════════════════════════════════════════════
 
+/**
+ * @brief Per-candidate depth, strand tallies, categories, and allele fraction.
+ */
 struct VariantCounts {
     int total_cov = 0;
     int ref_cov = 0;   // alle_covs[0] in longcallD
@@ -294,6 +350,9 @@ struct VariantCounts {
     double allele_fraction = 0.0;
 };
 
+/**
+ * @brief Key plus counts and reference-encoded bases for classification.
+ */
 struct CandidateVariant {
     VariantKey key;
     VariantCounts counts;
@@ -301,12 +360,16 @@ struct CandidateVariant {
     uint8_t alt_ref_base = 4; // 0-3=ACGT, 4=unknown; INS/DEL only (longcallD cand_var_t::alt_ref_base)
 };
 
+/** @brief Ordered list of candidates for one chunk or merged batch. */
 using CandidateTable = std::vector<CandidateVariant>;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Chunk data
 // ════════════════════════════════════════════════════════════════════════════
 
+/**
+ * @brief Working state for one region chunk: reads, reference slice, noisy intervals, candidates.
+ */
 struct BamChunk {
     RegionChunk region;
     hts_pos_t ref_beg = 0;
@@ -341,18 +404,22 @@ struct BamChunk {
 // RAII deleters & I/O helpers
 // ════════════════════════════════════════════════════════════════════════════
 
+/** @brief `unique_ptr` deleter for `bam_hdr_t`. */
 struct HeaderDeleter {
     void operator()(bam_hdr_t* p) const { sam_hdr_destroy(p); }
 };
 
+/** @brief `unique_ptr` deleter for `hts_idx_t`. */
 struct IndexDeleter {
     void operator()(hts_idx_t* p) const { hts_idx_destroy(p); }
 };
 
+/** @brief `unique_ptr` deleter for `hts_itr_t`. */
 struct IteratorDeleter {
     void operator()(hts_itr_t* p) const { hts_itr_destroy(p); }
 };
 
+/** @brief `unique_ptr` deleter for `faidx_t`. */
 struct FaiDeleter {
     void operator()(faidx_t* p) const { fai_destroy(p); }
 };
@@ -428,6 +495,7 @@ public:
     }
 
 private:
+    /** @brief Maps IUPAC ambiguity to `N`; uppercases ACGTN. */
     static char normalize_base(char base) {
         base = static_cast<char>(std::toupper(static_cast<unsigned char>(base)));
         switch (base) {
@@ -442,6 +510,7 @@ private:
         }
     }
 
+    /** @brief Fetches whole contig into `seq_` when `tid` changes. */
     void load_contig(int tid, const bam_hdr_t* header) {
         if (tid == loaded_tid_) return;
         hts_pos_t len = 0;
@@ -463,6 +532,9 @@ private:
 
 /**
  * @brief Opens or builds a FASTA index (`fai_load3` with `FAI_CREATE`).
+ * @param ref_fasta Path to reference `.fa`.
+ * @return New `faidx_t*`; caller owns.
+ * @throws std::runtime_error If the index cannot be created.
  */
 inline faidx_t* load_reference_index(const std::string& ref_fasta) {
     faidx_t* fai = fai_load3(ref_fasta.c_str(), nullptr, nullptr, FAI_CREATE);
@@ -471,9 +543,13 @@ inline faidx_t* load_reference_index(const std::string& ref_fasta) {
 }
 
 /**
- * @brief Per-worker handles: one `SamFile` + index + header per input path, shared `ReferenceCache`.
+ * @brief Per-thread alignment and reference context: opens every BAM in `opts.bam_files`.
  */
 struct WorkerContext {
+    /**
+     * @param opts Must list at least one indexed BAM and valid `ref_fasta`.
+     * @throws std::runtime_error On missing index, header read failure, or empty `bam_files`.
+     */
     explicit WorkerContext(const Options& opts)
         : fai(load_reference_index(opts.ref_fasta)),
           ref(fai.get()) {

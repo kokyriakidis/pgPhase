@@ -1,3 +1,11 @@
+/**
+ * @file collect_output.cpp
+ * @brief TSV, optional VCF, and read-support writers for collect-bam-variation candidates.
+ *
+ * @details Outputs describe pre-phasing candidates (not diploid genotypes). Opening the primary BAM
+ * for SQ names may throw `std::runtime_error` on I/O failure.
+ */
+
 #include "collect_output.hpp"
 
 #include <ctime>
@@ -105,6 +113,7 @@ void write_read_support_rows(std::ostream& out,
  *
  * @param opts Configuration options containing the primary BAM file and read support output path.
  * @param by_chunk A vector of vectors, where each inner vector represents a chunk's read observations.
+ * @throws std::runtime_error If the BAM header cannot be read or the output file cannot be opened.
  */
 void write_read_support_tsv(const Options& opts, const std::vector<std::vector<ReadSupportRow>>& by_chunk) {
     SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
@@ -181,6 +190,7 @@ void write_variants_tsv_records(std::ostream& out,
  * @param opts Program options containing I/O paths.
  * @param fai FASTA index for the reference genome.
  * @param variants The complete table of evaluated candidate variants.
+ * @throws std::runtime_error If the BAM header cannot be read or `opts.output_tsv` cannot be opened.
  */
 void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
     SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
@@ -327,6 +337,7 @@ void write_variants_vcf_records(std::ostream& out,
  * @param opts Program options (`output_vcf`, BAM path, reference FASTA).
  * @param fai FASTA index for reference bases.
  * @param variants Categorized candidates to serialize.
+ * @throws std::runtime_error If the BAM header cannot be read or the VCF path cannot be opened.
  */
 void write_variants_vcf(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
     if (opts.output_vcf.empty()) return;
