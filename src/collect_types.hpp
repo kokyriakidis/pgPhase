@@ -2,7 +2,6 @@
 #define PGPHASE_COLLECT_TYPES_HPP
 
 #include <algorithm>
-#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -14,7 +13,15 @@
 #include <htslib/faidx.h>
 #include <htslib/sam.h>
 
+extern "C" {
+#include "cgranges.h"
+}
+
 namespace pgphase_collect {
+
+// ════════════════════════════════════════════════════════════════════════════
+// Constants
+// ════════════════════════════════════════════════════════════════════════════
 
 constexpr int kDefaultMinMapq = 30;
 constexpr int kDefaultMinBaseq = 10;
@@ -39,6 +46,14 @@ constexpr int kNoisyRegFlankLen = 10;
 constexpr int kLongcalldMinSvLen = 30;
 constexpr double kDefaultStrandBiasPvalOnt = 0.01;
 constexpr int kDefaultNoisyRegMaxXgaps = 5;
+/** If `>0`, a merged noisy region is kept only if at least this many (non-skipped) reads overlap it.
+ * 0 = no extra gate (longcallD `pre_process_noisy_regs` has no separate total-depth check). Use 5 to match
+ * the published “total read coverage” noisy-region description. */
+constexpr int kDefaultMinNoisyRegTotalDepth = 0;
+
+// ════════════════════════════════════════════════════════════════════════════
+// Enumerations
+// ════════════════════════════════════════════════════════════════════════════
 
 enum class VariantType : uint8_t {
     Snp = 8,       // BAM_CDIFF
@@ -76,6 +91,10 @@ enum class ReadTechnology : uint8_t {
     ShortReads
 };
 
+// ════════════════════════════════════════════════════════════════════════════
+// Options & region input
+// ════════════════════════════════════════════════════════════════════════════
+
 struct Options {
     int threads = 1;
     int min_mapq = kDefaultMinMapq;
@@ -94,6 +113,7 @@ struct Options {
     ReadTechnology read_technology = ReadTechnology::Hifi;
     double strand_bias_pval = kDefaultStrandBiasPvalOnt;
     int noisy_reg_max_xgaps = kDefaultNoisyRegMaxXgaps;
+    int min_noisy_reg_total_depth = kDefaultMinNoisyRegTotalDepth;
     bool include_filtered = false;
     bool autosome = false;
     bool input_is_list = false;
@@ -121,6 +141,10 @@ struct Options {
     }
 };
 
+// ════════════════════════════════════════════════════════════════════════════
+// Region & read data
+// ════════════════════════════════════════════════════════════════════════════
+
 struct RegionFilter {
     bool enabled = false;
     std::string chrom;
@@ -129,9 +153,23 @@ struct RegionFilter {
 };
 
 struct RegionChunk {
+    int chunk_id = -1;
     int tid = -1;
     hts_pos_t beg = 1; // 1-based inclusive
     hts_pos_t end = 0; // 1-based inclusive
+    int reg_chunk_i = -1;
+    int reg_i = -1;
+    int prev_chunk_id = -1;
+    int prev_tid = -1;
+    hts_pos_t prev_beg = 0;
+    hts_pos_t prev_end = 0;
+    int next_chunk_id = -1;
+    int next_tid = -1;
+    hts_pos_t next_beg = 0;
+    hts_pos_t next_end = 0;
+
+    bool has_prev_region() const { return prev_chunk_id >= 0; }
+    bool has_next_region() const { return next_chunk_id >= 0; }
 };
 
 struct VariantKey {
@@ -144,12 +182,6 @@ struct VariantKey {
     hts_pos_t sort_pos() const {
         return type == VariantType::Snp ? pos : pos - 1;
     }
-};
-
-struct ReadEvent {
-    VariantKey key;
-    int qi = -1;
-    bool low_quality = false;
 };
 
 struct Interval {
@@ -174,6 +206,10 @@ struct AlignmentDeleter {
     void operator()(bam1_t* p) const { bam_destroy1(p); }
 };
 
+struct CgrangesDeleter {
+    void operator()(cgranges_t* p) const { if (p) cr_destroy(p); }
+};
+
 struct ReadSupportRow {
     int tid = -1;
     hts_pos_t pos = 0;
@@ -191,32 +227,47 @@ struct ReadSupportRow {
 
 struct ReadRecord {
     int tid = -1;
+    int input_index = 0;
     hts_pos_t beg = 0;
     hts_pos_t end = 0;
     bool reverse = false;
     int nm = 0;
     int mapq = 0;
     std::string qname;
+    // Kept for future phasing/BAM-output consumers; candidate collection itself works from digars.
     std::unique_ptr<bam1_t, AlignmentDeleter> alignment;
-    std::vector<uint8_t> packed_seq;
+    // Per-base qualities are copied out because allele quality/depth accounting needs them after parsing.
     std::vector<uint8_t> qual;
+    // longcallD digar equivalent: ordered per-read =/X/I/D/clip/refskip operations.
     std::vector<DigarOp> digars;
+    // Dense-error intervals discovered while building digars; merged into chunk-level noisy regions.
     std::vector<Interval> noisy_regions;
-    std::vector<ReadEvent> events;
     bool is_skipped = false;
+    bool is_ont_palindrome = false;
+    int n_clean_agree_snps = 0;    // populated during phasing (Step 2)
+    int n_clean_conflict_snps = 0; // populated during phasing (Step 2)
     int total_cand_events = 0; // longcallD n_total_cand_vars (includes long-clip noisy windows)
-    const char* digar_source = "ref"; // eqx/cs/md/ref (which builder populated digars)
 };
+
+struct OverlapSkipCounts {
+    int upstream = 0;
+    int downstream = 0;
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// Variant data
+// ════════════════════════════════════════════════════════════════════════════
 
 struct VariantCounts {
     int total_cov = 0;
-    int ref_cov = 0;
-    int alt_cov = 0;
+    int ref_cov = 0;   // alle_covs[0] in longcallD
+    int alt_cov = 0;   // alle_covs[1] in longcallD
     int low_qual_cov = 0;
-    int forward_ref = 0;
-    int reverse_ref = 0;
-    int forward_alt = 0;
-    int reverse_alt = 0;
+    int forward_ref = 0;  // strand_to_alle_covs[0][0]
+    int reverse_ref = 0;  // strand_to_alle_covs[1][0]
+    int forward_alt = 0;  // strand_to_alle_covs[0][1]
+    int reverse_alt = 0;  // strand_to_alle_covs[1][1]
+    int n_uniq_alles = 2; // always 2 for Step 1 (ref + primary alt)
     VariantCategory category = VariantCategory::LowCoverage;
     double allele_fraction = 0.0;
 };
@@ -224,9 +275,15 @@ struct VariantCounts {
 struct CandidateVariant {
     VariantKey key;
     VariantCounts counts;
+    uint8_t ref_base = 4;     // 0-3=ACGT, 4=unknown; SNPs only (longcallD cand_var_t::ref_base)
+    uint8_t alt_ref_base = 4; // 0-3=ACGT, 4=unknown; INS/DEL only (longcallD cand_var_t::alt_ref_base)
 };
 
 using CandidateTable = std::vector<CandidateVariant>;
+
+// ════════════════════════════════════════════════════════════════════════════
+// Chunk data
+// ════════════════════════════════════════════════════════════════════════════
 
 struct BamChunk {
     RegionChunk region;
@@ -237,15 +294,30 @@ struct BamChunk {
     std::vector<int> ordered_read_ids;
     std::vector<Interval> noisy_regions;
     std::vector<ReadRecord> reads;
+    std::vector<std::vector<int>> up_ovlp_read_i;
+    std::vector<std::vector<int>> down_ovlp_read_i;
+    std::vector<int> n_up_ovlp_skip_reads;
+    std::vector<int> n_down_ovlp_skip_reads;
+    std::vector<int> haps;
+    std::vector<int> phase_scores;
+    std::vector<hts_pos_t> phase_sets;
     CandidateTable candidates;
-    /** Global base-quality histogram over all reads in the chunk (longcallD-style). */
-    std::array<int64_t, 256> qual_hist{};
+    // longcallD var_noisy_read_cov_cr / var_noisy_read_err_cr / var_noisy_read_marks:
+    // interval-tree cache for var_noisy_reads_ratio(), built lazily before classification.
+    std::unique_ptr<cgranges_t, CgrangesDeleter> var_noisy_read_cov_cr; // read coverage spans
+    std::unique_ptr<cgranges_t, CgrangesDeleter> var_noisy_read_err_cr; // merged XID intervals per read
+    std::vector<int> var_noisy_read_marks; // per-read dedup mark (size = reads.size())
+    int var_noisy_read_mark_id = 0;
     int chunk_min_qual = 0;
     int chunk_first_quar_qual = 0;
     int chunk_median_qual = 0;
     int chunk_third_quar_qual = 0;
     int chunk_max_qual = 0;
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// RAII deleters & I/O helpers
+// ════════════════════════════════════════════════════════════════════════════
 
 struct HeaderDeleter {
     void operator()(bam_hdr_t* p) const { sam_hdr_destroy(p); }
