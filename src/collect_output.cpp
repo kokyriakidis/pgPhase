@@ -6,6 +6,7 @@
 
 namespace pgphase_collect {
 
+/** SNP / INS / DEL label for TSV, VCF INFO, and read-support TYPE column. */
 std::string type_name(VariantType type) {
     switch (type) {
         case VariantType::Snp:
@@ -18,6 +19,7 @@ std::string type_name(VariantType type) {
     return "UNKNOWN";
 }
 
+/** LongcallD-style category token (e.g. CLEAN_HET_SNP, LOW_COV) for TSV and VCF INFO.CAT. */
 std::string category_name(VariantCategory category) {
     switch (category) {
         case VariantCategory::LowCoverage:
@@ -43,6 +45,26 @@ std::string category_name(VariantCategory category) {
     }
     return "UNKNOWN";
 }
+
+/** Header row for --read-support: one line per read×candidate observation. */
+void write_read_support_header(std::ostream& out) {
+    out << "CHROM\tPOS\tTYPE\tREF_LEN\tALT\tQNAME\tIS_ALT\tLOW_QUAL\tREVERSE\tMAPQ\tCHUNK_BEG\tCHUNK_END\n";
+}
+
+/** Body lines for one chunk's read×site observations (CHROM from header). */
+void write_read_support_rows(std::ostream& out,
+                             const bam_hdr_t* header,
+                             const std::vector<ReadSupportRow>& rows) {
+    for (const ReadSupportRow& r : rows) {
+        const char* chrom = header->target_name[r.tid];
+        out << chrom << '\t' << r.pos << '\t' << type_name(r.type) << '\t' << r.ref_len << '\t'
+            << (r.alt.empty() ? "." : r.alt) << '\t' << r.qname << '\t' << r.is_alt << '\t' << r.is_low_qual
+            << '\t' << (r.reverse ? 1 : 0) << '\t' << r.mapq << '\t' << r.chunk_beg << '\t' << r.chunk_end
+            << '\n';
+    }
+}
+
+/** Concatenate per-chunk batches (order matches streaming chunk processing). */
 void write_read_support_tsv(const Options& opts, const std::vector<std::vector<ReadSupportRow>>& by_chunk) {
     SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
     std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
@@ -51,32 +73,24 @@ void write_read_support_tsv(const Options& opts, const std::vector<std::vector<R
     std::ofstream out(opts.read_support_tsv);
     if (!out) throw std::runtime_error("failed to open read support output: " + opts.read_support_tsv);
 
-    out << "CHROM\tPOS\tTYPE\tREF_LEN\tALT\tQNAME\tIS_ALT\tLOW_QUAL\tREVERSE\tMAPQ\tCHUNK_BEG\tCHUNK_END\n";
-
+    write_read_support_header(out);
     for (const std::vector<ReadSupportRow>& batch : by_chunk) {
-        for (const ReadSupportRow& r : batch) {
-            const char* chrom = header->target_name[r.tid];
-            out << chrom << '\t' << r.pos << '\t' << type_name(r.type) << '\t' << r.ref_len << '\t'
-                << (r.alt.empty() ? "." : r.alt) << '\t' << r.qname << '\t' << r.is_alt << '\t' << r.is_low_qual
-                << '\t' << (r.reverse ? 1 : 0) << '\t' << r.mapq << '\t' << r.chunk_beg << '\t' << r.chunk_end
-                << '\n';
-        }
+        write_read_support_rows(out, header.get(), batch);
     }
 }
 
-void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
-    SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
-    std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
-    if (!header) throw std::runtime_error("failed to read BAM header");
-    ReferenceCache ref(fai);
-
-    std::ofstream out(opts.output_tsv);
-    if (!out) throw std::runtime_error("failed to open output: " + opts.output_tsv);
-
+/** Main candidate table: ref/alt sequence, depth, strand counts, AF, category; trailing phase columns are placeholders. */
+void write_variants_tsv_header(std::ostream& out) {
     out << "CHROM\tPOS\tTYPE\tREF\tALT\tDP\tREF_COUNT\tALT_COUNT\tLOW_QUAL_COUNT"
         << "\tFORWARD_REF\tREVERSE_REF\tFORWARD_ALT\tREVERSE_ALT"
         << "\tAF\tCATEGORY\tPHASE_SET\tHAP_ALT\tHAP_REF\n";
+}
 
+/** One row per CandidateVariant; REF/ALT from ReferenceCache for SNP/DEL. */
+void write_variants_tsv_records(std::ostream& out,
+                                const bam_hdr_t* header,
+                                ReferenceCache& ref,
+                                const CandidateTable& variants) {
     for (const CandidateVariant& candidate : variants) {
         const VariantKey& key = candidate.key;
         const VariantCounts& counts = candidate.counts;
@@ -85,9 +99,9 @@ void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& var
         std::string alt_seq = key.alt.empty() ? "." : key.alt;
 
         if (key.type == VariantType::Snp) {
-            ref_seq = std::string(1, ref.base(key.tid, key.pos, header.get()));
+            ref_seq = std::string(1, ref.base(key.tid, key.pos, header));
         } else if (key.type == VariantType::Deletion) {
-            ref_seq = ref.subseq(key.tid, key.pos, key.ref_len, header.get());
+            ref_seq = ref.subseq(key.tid, key.pos, key.ref_len, header);
         }
 
         out << chrom << '\t' << key.pos << '\t' << type_name(key.type) << '\t' << ref_seq << '\t'
@@ -99,17 +113,23 @@ void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& var
     }
 }
 
-void write_variants_vcf(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
-    if (opts.output_vcf.empty()) return;
-
+/** Open primary BAM for SQ names, write opts.output_tsv (full merged candidate set). */
+void write_variants(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
     SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
     std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
     if (!header) throw std::runtime_error("failed to read BAM header");
     ReferenceCache ref(fai);
 
-    std::ofstream out(opts.output_vcf);
-    if (!out) throw std::runtime_error("failed to open VCF output: " + opts.output_vcf);
+    std::ofstream out(opts.output_tsv);
+    if (!out) throw std::runtime_error("failed to open output: " + opts.output_tsv);
 
+    write_variants_tsv_header(out);
+    write_variants_tsv_records(out, header.get(), ref, variants);
+}
+
+/** VCF 4.2 header: contigs, FILTER/INFO lines for candidate (not final genotype) semantics. */
+void write_variants_vcf_header(std::ostream& out, const Options& opts, const bam_hdr_t* header) {
+    (void)opts;
     out << "##fileformat=VCFv4.2\n";
     {
         std::time_t t = std::time(nullptr);
@@ -138,7 +158,17 @@ void write_variants_vcf(const Options& opts, faidx_t* fai, const CandidateTable&
         out << "##contig=<ID=" << header->target_name[tid] << ",length=" << header->target_len[tid] << ">\n";
     }
     out << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
+}
 
+/**
+ * Left-normalized VCF records: SNP at POS; INS/DEL with anchor base (POS-1) per VCF convention.
+ * FILTER flags clean vs filtered candidates; SVTYPE/SVLEN for large indels when |len| >= min_sv_len.
+ */
+void write_variants_vcf_records(std::ostream& out,
+                                const Options& opts,
+                                const bam_hdr_t* header,
+                                ReferenceCache& ref,
+                                const CandidateTable& variants) {
     for (const CandidateVariant& candidate : variants) {
         const VariantKey& key = candidate.key;
         const VariantCounts& counts = candidate.counts;
@@ -149,19 +179,19 @@ void write_variants_vcf(const Options& opts, faidx_t* fai, const CandidateTable&
         std::string alt_seq;
 
         if (key.type == VariantType::Snp) {
-            ref_seq = std::string(1, ref.base(key.tid, key.pos, header.get()));
+            ref_seq = std::string(1, ref.base(key.tid, key.pos, header));
             alt_seq = key.alt.empty() ? "." : key.alt;
         } else if (key.type == VariantType::Insertion) {
             const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
             pos = anchor_pos;
-            const char anchor_base = ref.base(key.tid, anchor_pos, header.get());
+            const char anchor_base = ref.base(key.tid, anchor_pos, header);
             ref_seq = std::string(1, anchor_base);
             alt_seq = ref_seq + key.alt;
         } else { // Deletion
             const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
             pos = anchor_pos;
-            const char anchor_base = ref.base(key.tid, anchor_pos, header.get());
-            const std::string del_seq = ref.subseq(key.tid, key.pos, key.ref_len, header.get());
+            const char anchor_base = ref.base(key.tid, anchor_pos, header);
+            const std::string del_seq = ref.subseq(key.tid, key.pos, key.ref_len, header);
             ref_seq = std::string(1, anchor_base) + del_seq;
             alt_seq = std::string(1, anchor_base);
         }
@@ -198,6 +228,22 @@ void write_variants_vcf(const Options& opts, faidx_t* fai, const CandidateTable&
         out << chrom << '\t' << pos << "\t.\t" << ref_seq << '\t' << alt_seq << "\t.\t" << filter << '\t'
             << info.str() << '\n';
     }
+}
+
+/** No-op if opts.output_vcf empty; otherwise write full candidate VCF. */
+void write_variants_vcf(const Options& opts, faidx_t* fai, const CandidateTable& variants) {
+    if (opts.output_vcf.empty()) return;
+
+    SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
+    std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
+    if (!header) throw std::runtime_error("failed to read BAM header");
+    ReferenceCache ref(fai);
+
+    std::ofstream out(opts.output_vcf);
+    if (!out) throw std::runtime_error("failed to open VCF output: " + opts.output_vcf);
+
+    write_variants_vcf_header(out, opts, header.get());
+    write_variants_vcf_records(out, opts, header.get(), ref, variants);
 }
 
 } // namespace pgphase_collect

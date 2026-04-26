@@ -1,7 +1,6 @@
 #include "bam_digar.hpp"
 
-#include "candidate_collection.hpp"
-#include "noisy_regions.hpp"
+#include "collect_var.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -12,6 +11,9 @@
 
 namespace pgphase_collect {
 
+// ════════════════════════════════════════════════════════════════════════════
+// Noisy sliding window
+// ════════════════════════════════════════════════════════════════════════════
 
 /**
  * longcallD `xid_queue_t` + `push_xid_size_queue_win` (bam_utils.c):
@@ -97,6 +99,7 @@ static void xid_push_win(XidQueue& q,
     cur_q_end = q.rear;
 }
 
+/** Return the per-technology default slide window, or opts.noisy_reg_slide_win if overridden. */
 static int effective_noisy_slide_win(const Options& opts) {
     if (opts.noisy_reg_slide_win > 0) return opts.noisy_reg_slide_win;
     if (opts.is_ont()) return kDefaultNoisyRegSlideWinOnt;
@@ -119,12 +122,17 @@ struct NoisyRegionBuilder {
         xid_push_win(q, pos, len, count, noisy_out, cur_start, cur_end, q_start, q_end);
     }
 
+    bool suppress_left_clip = false;
+    bool suppress_right_clip = false;
+
     void add_end_clip_region(int cigar_idx, int n_cigar, hts_pos_t ref_pos, hts_pos_t tlen, int clip_len) {
         if (clip_len < kLongClipLength) return;
         if (cigar_idx == 0 && ref_pos > 10) { // left end clip
-            noisy_out.push_back(Interval{ref_pos, std::min<hts_pos_t>(tlen, ref_pos + kClipFlank), clip_len});
+            if (!suppress_left_clip)
+                noisy_out.push_back(Interval{ref_pos, std::min<hts_pos_t>(tlen, ref_pos + kClipFlank), clip_len});
         } else if (cigar_idx == n_cigar - 1 && ref_pos < tlen - 10) { // right end clip
-            noisy_out.push_back(Interval{std::max<hts_pos_t>(1, ref_pos - kClipFlank), ref_pos, clip_len});
+            if (!suppress_right_clip)
+                noisy_out.push_back(Interval{std::max<hts_pos_t>(1, ref_pos - kClipFlank), ref_pos, clip_len});
         }
     }
 
@@ -137,27 +145,20 @@ struct NoisyRegionBuilder {
         noisy_out.push_back(Interval{cur_start, cur_end, var_size});
     }
 };
+// ════════════════════════════════════════════════════════════════════════════
+// Read sequence & quality utilities
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Increment read.total_cand_events for one SNP/INS/DEL.
+ *  total_cand_events counts all candidate-quality events including long-clip noisy windows,
+ *  used by read_has_too_many_variants to decide whether to skip the read. */
 static inline void record_variant_event(ReadRecord& read, int tid, const DigarOp& digar) {
-    VariantKey key;
-    key.tid = tid;
-    key.pos = digar.pos;
-    if (digar.type == DigarType::Snp) {
-        key.type = VariantType::Snp;
-        key.ref_len = 1;
-        key.alt = digar.alt;
-    } else if (digar.type == DigarType::Insertion) {
-        key.type = VariantType::Insertion;
-        key.ref_len = 0;
-        key.alt = digar.alt;
-    } else {
-        key.type = VariantType::Deletion;
-        key.ref_len = digar.len;
-        key.alt.clear();
-    }
-    read.events.push_back(ReadEvent{std::move(key), digar.qi, digar.low_quality});
+    (void)tid;
+    (void)digar;
     read.total_cand_events++;
 }
 
+/** Parse a "CHR:POS" debug-site string; returns false if malformed. */
 inline bool parse_debug_site(const std::string& site, std::string& chrom_out, hts_pos_t& pos_out) {
     const size_t colon = site.find(':');
     if (colon == std::string::npos) return false;
@@ -176,6 +177,7 @@ inline bool parse_debug_site(const std::string& site, std::string& chrom_out, ht
     }
 }
 
+/** If opts.debug_site matches this read's span, dump per-digar hits to stderr for manual inspection. */
 inline void maybe_dump_debug_site(const Options& opts, const bam_hdr_t* header, const ReadRecord& read) {
     if (opts.debug_site.empty() || header == nullptr) return;
     std::string chrom;
@@ -202,7 +204,6 @@ inline void maybe_dump_debug_site(const Options& opts, const bam_hdr_t* header, 
         std::string alt = d.alt;
         if (alt.size() > 16) alt = alt.substr(0, 16) + "...";
         std::cerr << "DebugSite\t" << chrom << ":" << pos << "\tread=" << read.qname << "\t"
-                  << "src=" << (read.digar_source ? read.digar_source : "na") << "\t"
                   << "skipped=" << (read.is_skipped ? 1 : 0) << "\t"
                   << "mapped=" << mapped_len << "\tnoisy=" << noisy_len << "\t"
                   << "cand=" << read.total_cand_events << "\t"
@@ -212,6 +213,7 @@ inline void maybe_dump_debug_site(const Options& opts, const bam_hdr_t* header, 
 }
 
 
+/** Return the base at query position qi as an uppercase char, 'N' if ambiguous or out of range. */
 char read_base(const bam1_t* aln, int qi) {
     if (qi < 0 || qi >= aln->core.l_qseq) return 'N';
     const uint8_t* seq = bam_get_seq(aln);
@@ -232,12 +234,6 @@ int base_quality(const bam1_t* aln, int qi) {
     return bam_get_qual(aln)[qi];
 }
 
-std::vector<uint8_t> copy_packed_sequence(const bam1_t* aln) {
-    const size_t bytes = (static_cast<size_t>(aln->core.l_qseq) + 1) / 2;
-    const uint8_t* seq = bam_get_seq(aln);
-    return std::vector<uint8_t>(seq, seq + bytes);
-}
-
 std::vector<uint8_t> copy_qualities(const bam1_t* aln) {
     const uint8_t* qual = bam_get_qual(aln);
     return std::vector<uint8_t>(qual, qual + aln->core.l_qseq);
@@ -248,6 +244,7 @@ int aux_int_or_default(const bam1_t* aln, const char tag[2], int default_value) 
     return data == nullptr ? default_value : bam_aux2i(data);
 }
 
+/** An insertion is low-quality only if ALL of its bases are below min_bq (longcallD behaviour). */
 bool insertion_is_low_quality(const bam1_t* aln, int qi, int len, int min_bq) {
     for (int i = 0; i < len; ++i) {
         if (base_quality(aln, qi + i) >= min_bq) return false;
@@ -255,11 +252,16 @@ bool insertion_is_low_quality(const bam1_t* aln, int qi, int len, int min_bq) {
     return true;
 }
 
+/** A deletion is low-quality if BOTH flanking bases (qi-1 and qi) are below min_bq. */
 bool deletion_is_low_quality(const bam1_t* aln, int qi, int min_bq) {
     const bool left_ok = qi == 0 || base_quality(aln, qi - 1) >= min_bq;
     const bool right_ok = qi >= aln->core.l_qseq || base_quality(aln, qi) >= min_bq;
     return !(left_ok && right_ok);
 }
+// ════════════════════════════════════════════════════════════════════════════
+// Digar building
+// ════════════════════════════════════════════════════════════════════════════
+
 void append_digar(std::vector<DigarOp>& digars, DigarOp op) {
     if (op.len <= 0) return;
     if (!digars.empty()) {
@@ -278,19 +280,19 @@ void append_digar(std::vector<DigarOp>& digars, DigarOp op) {
     digars.push_back(std::move(op));
 }
 void recompute_chunk_qual_stats(BamChunk& chunk) {
-    chunk.qual_hist.fill(0);
+    int64_t qual_hist[256] = {};
     for (const ReadRecord& r : chunk.reads) {
         if (r.is_skipped) continue;
         for (uint8_t q : r.qual) {
-            chunk.qual_hist[static_cast<size_t>(q)]++;
+            qual_hist[static_cast<size_t>(q)]++;
         }
     }
     int64_t n_total = 0;
-    for (int i = 0; i < 256; ++i) n_total += chunk.qual_hist[static_cast<size_t>(i)];
+    for (int i = 0; i < 256; ++i) n_total += qual_hist[i];
     std::vector<int> valid_quals;
     valid_quals.reserve(256);
     for (int i = 0; i < 256; ++i) {
-        const int64_t c = chunk.qual_hist[static_cast<size_t>(i)];
+        const int64_t c = qual_hist[i];
         if (c <= 0) continue;
         if (n_total > 0 && c * 10000LL >= n_total) valid_quals.push_back(i);
     }
@@ -309,11 +311,13 @@ void recompute_chunk_qual_stats(BamChunk& chunk) {
     chunk.chunk_max_qual = valid_quals.back();
 }
 
+/** Contig length from header; 0 if header/tid is invalid. Used to bound end-clip noisy windows. */
 static hts_pos_t contig_len_from_header(const bam_hdr_t* header, int tid) {
     if (header == nullptr || tid < 0 || tid >= header->n_targets) return 0;
     return static_cast<hts_pos_t>(header->target_len[tid]);
 }
 
+/** True if CIGAR uses =/X ops (no M): selects the EQX parser path which needs no reference. */
 static bool cigar_has_eqx_without_m(const bam1_t* aln) {
     const uint32_t* cigar = bam_get_cigar(aln);
     const int n_cigar = aln->core.n_cigar;
@@ -327,13 +331,12 @@ static bool cigar_has_eqx_without_m(const bam1_t* aln) {
     return saw_eqx;
 }
 
-static void digar_sort_events_and_merge_noisy(ReadRecord& read) {
-    std::sort(read.events.begin(), read.events.end(), [](const ReadEvent& lhs, const ReadEvent& rhs) {
-        return VariantKeyLess{}(lhs.key, rhs.key);
-    });
+/** Merge adjacent noisy intervals after digar construction. */
+static void digar_merge_noisy(ReadRecord& read) {
     merge_intervals(read.noisy_regions);
 }
 
+/** Build digars by comparing each M base against the reference (slowest path; no MD/cs tag). */
 static void build_digars_ref_cigar(const bam1_t* aln,
                                    const bam_hdr_t* header,
                                    ReferenceCache& ref,
@@ -345,6 +348,8 @@ static void build_digars_ref_cigar(const bam1_t* aln,
     const hts_pos_t tlen = contig_len_from_header(header, aln->core.tid);
     NoisyRegionBuilder noisy_builder(
         static_cast<int>(std::max<uint32_t>(1u, aln->core.n_cigar * 2u + 8u)), opts, read.noisy_regions);
+    noisy_builder.suppress_left_clip  = read.is_ont_palindrome && bam_is_rev(aln);
+    noisy_builder.suppress_right_clip = read.is_ont_palindrome && !bam_is_rev(aln);
 
     for (uint32_t i = 0; i < aln->core.n_cigar; ++i) {
         const int op = bam_cigar_op(cigar[i]);
@@ -411,6 +416,7 @@ static void build_digars_ref_cigar(const bam1_t* aln,
     noisy_builder.flush();
 }
 
+/** Build digars from =/X CIGAR ops; no reference lookup needed since mismatches are explicit. */
 static void build_digars_eqx_cigar(const bam1_t* aln,
                                    const bam_hdr_t* header,
                                    const Options& opts,
@@ -422,6 +428,8 @@ static void build_digars_eqx_cigar(const bam1_t* aln,
     const hts_pos_t tlen = contig_len_from_header(header, aln->core.tid);
     NoisyRegionBuilder noisy_builder(
         static_cast<int>(std::max<uint32_t>(1u, aln->core.n_cigar * 2u + 8u)), opts, read.noisy_regions);
+    noisy_builder.suppress_left_clip  = read.is_ont_palindrome && bam_is_rev(aln);
+    noisy_builder.suppress_right_clip = read.is_ont_palindrome && !bam_is_rev(aln);
 
     for (uint32_t i = 0; i < aln->core.n_cigar; ++i) {
         const int op = bam_cigar_op(cigar[i]);
@@ -474,6 +482,8 @@ static void build_digars_eqx_cigar(const bam1_t* aln,
     noisy_builder.flush();
 }
 
+/** Build digars from M-CIGAR + MD tag; faster than ref lookup but requires a valid MD string.
+ *  Returns false (caller falls back to ref path) if MD is absent, malformed, or inconsistent. */
 static bool build_digars_md_cigar(const bam1_t* aln,
                                   const bam_hdr_t* header,
                                   const Options& opts,
@@ -492,6 +502,8 @@ static bool build_digars_md_cigar(const bam1_t* aln,
     const int n_cigar = aln->core.n_cigar;
     const hts_pos_t tlen = contig_len_from_header(header, aln->core.tid);
     NoisyRegionBuilder noisy_builder(static_cast<int>(std::max(1, n_cigar * 2 + 8)), opts, read.noisy_regions);
+    noisy_builder.suppress_left_clip  = read.is_ont_palindrome && bam_is_rev(aln);
+    noisy_builder.suppress_right_clip = read.is_ont_palindrome && !bam_is_rev(aln);
     int last_eq_len = 0;
 
     for (int i = 0; i < n_cigar; ++i) {
@@ -611,6 +623,8 @@ static int cs_char_to_nt4(char c) {
     }
 }
 
+/** Build digars from the minimap2 cs tag (handles :, =, *, -, +, ~ cs operations).
+ *  Returns false (caller falls back to ref path) if cs is absent or malformed. */
 static bool build_digars_cs_tag(const bam1_t* aln,
                                 const bam_hdr_t* header,
                                 const Options& opts,
@@ -629,6 +643,8 @@ static bool build_digars_cs_tag(const bam1_t* aln,
     int query_pos = 0;
     NoisyRegionBuilder noisy_builder(
         static_cast<int>(std::max<uint32_t>(1u, aln->core.n_cigar * 2u + 8u)), opts, read.noisy_regions);
+    noisy_builder.suppress_left_clip  = read.is_ont_palindrome && bam_is_rev(aln);
+    noisy_builder.suppress_right_clip = read.is_ont_palindrome && !bam_is_rev(aln);
     const hts_pos_t tlen = contig_len_from_header(header, aln->core.tid);
 
     if (n_cigar > 0) {
@@ -744,40 +760,34 @@ void build_digars_and_events(const bam1_t* aln,
                              const Options& opts,
                              ReadRecord& read) {
     read.digars.clear();
-    read.events.clear();
     read.noisy_regions.clear();
     read.total_cand_events = 0;
     read.digars.reserve(static_cast<size_t>(aln->core.n_cigar) * 2u + 8u);
-    read.events.reserve(static_cast<size_t>(aln->core.n_cigar) + 8u);
 
     if (cigar_has_eqx_without_m(aln)) {
-        read.digar_source = "eqx";
         build_digars_eqx_cigar(aln, header, opts, read);
     } else if (bam_aux_get(const_cast<bam1_t*>(aln), "cs") != nullptr) {
-        read.digar_source = "cs";
         if (!build_digars_cs_tag(aln, header, opts, read)) {
             read.digars.clear();
-            read.events.clear();
             read.noisy_regions.clear();
-            read.digar_source = "ref";
             build_digars_ref_cigar(aln, header, ref, opts, read);
         }
     } else if (bam_aux_get(const_cast<bam1_t*>(aln), "MD") != nullptr) {
-        read.digar_source = "md";
         if (!build_digars_md_cigar(aln, header, opts, read)) {
             read.digars.clear();
-            read.events.clear();
             read.noisy_regions.clear();
-            read.digar_source = "ref";
             build_digars_ref_cigar(aln, header, ref, opts, read);
         }
     } else {
-        read.digar_source = "ref";
         build_digars_ref_cigar(aln, header, ref, opts, read);
     }
 
-    digar_sort_events_and_merge_noisy(read);
+    digar_merge_noisy(read);
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Read filtering
+// ════════════════════════════════════════════════════════════════════════════
 
 bool read_passes_filters(const bam1_t* aln, const Options& opts) {
     if (aln->core.tid < 0 || (aln->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY))) {
@@ -789,6 +799,25 @@ bool read_passes_filters(const bam1_t* aln, const Options& opts) {
     }
     return true;
 }
+
+static bool overlaps_region(int read_tid,
+                            hts_pos_t read_beg,
+                            hts_pos_t read_end,
+                            int region_tid,
+                            hts_pos_t region_beg,
+                            hts_pos_t region_end) {
+    if (region_tid < 0 || read_tid != region_tid) return false;
+    return !(read_end < region_beg || read_beg > region_end);
+}
+
+bool read_overlaps_prev_region(const RegionChunk& chunk, int read_tid, hts_pos_t read_beg, hts_pos_t read_end) {
+    return overlaps_region(read_tid, read_beg, read_end, chunk.prev_tid, chunk.prev_beg, chunk.prev_end);
+}
+
+bool read_overlaps_next_region(const RegionChunk& chunk, int read_tid, hts_pos_t read_beg, hts_pos_t read_end) {
+    return overlaps_region(read_tid, read_beg, read_end, chunk.next_tid, chunk.next_beg, chunk.next_end);
+}
+
 bool read_has_too_many_variants(const ReadRecord& read, const Options& opts) {
     const hts_pos_t mapped_len = std::max<hts_pos_t>(1, read.end - read.beg + 1);
     if (opts.max_var_ratio_per_read > 0.0) {
@@ -816,45 +845,111 @@ std::unique_ptr<hts_itr_t, IteratorDeleter> make_chunk_iterator(const hts_idx_t*
     return std::unique_ptr<hts_itr_t, IteratorDeleter>(raw);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// ONT palindrome detection
+// ════════════════════════════════════════════════════════════════════════════
+
+/** longcallD `is_ont_palindrome_clip` (bam_utils.c): detect palindromic ONT reads via SA tag.
+ *  A read is palindromic when a supplementary alignment on the same contig overlaps the primary
+ *  span, indicating the read folded back on itself and mapped twice to the same region. */
+static bool detect_ont_palindrome(const bam1_t* aln, const bam_hdr_t* header, const Options& opts) {
+    if (!opts.is_ont()) return false;
+    const uint8_t* sa_raw = bam_aux_get(aln, "SA");
+    if (!sa_raw) return false;
+    const char* sa = bam_aux2Z(sa_raw);
+    if (!sa || !*sa) return false;
+
+    const hts_pos_t primary_pos = aln->core.pos + 1;
+    const hts_pos_t primary_end = bam_endpos(aln);
+    const int primary_tid = aln->core.tid;
+    const char* primary_chrom = (header && primary_tid >= 0 && primary_tid < header->n_targets)
+                                    ? header->target_name[primary_tid] : nullptr;
+
+    char rname[512], cigar_buf[512];
+    char strand = '+';
+    int sa_pos = 0, mapq = 0, nm = 0;
+    const char* p = sa;
+    while (*p) {
+        const char* entry_end = std::strchr(p, ';');
+        if (!entry_end) entry_end = p + std::strlen(p);
+        rname[0] = cigar_buf[0] = '\0';
+        if (std::sscanf(p, "%511[^,],%d,%c,%511[^,],%d,%d",
+                        rname, &sa_pos, &strand, cigar_buf, &mapq, &nm) == 6) {
+            if (!primary_chrom || std::strcmp(rname, primary_chrom) == 0) {
+                hts_pos_t sa_end = static_cast<hts_pos_t>(sa_pos);
+                for (const char* cp = cigar_buf; *cp; ) {
+                    const int len = static_cast<int>(std::strtol(cp, const_cast<char**>(&cp), 10));
+                    if (*cp == 'M' || *cp == 'D' || *cp == '=' || *cp == 'X') sa_end += len;
+                    if (*cp) ++cp;
+                }
+                if (sa_end >= primary_pos && static_cast<hts_pos_t>(sa_pos) <= primary_end) {
+                    return true;
+                }
+            }
+        }
+        if (!*entry_end) break;
+        p = entry_end + 1;
+    }
+    return false;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// BAM loading
+// ════════════════════════════════════════════════════════════════════════════
+
 std::vector<ReadRecord> load_read_records_for_chunk(const Options& opts,
                                                     const RegionChunk& chunk,
+                                                    int input_index,
                                                     SamFile& bam,
                                                     bam_hdr_t* header,
                                                     const hts_idx_t* index,
-                                                    ReferenceCache& ref) {
+                                                    ReferenceCache& ref,
+                                                    OverlapSkipCounts* overlap_skip_counts) {
     auto iter = make_chunk_iterator(index, chunk);
     if (!iter) throw std::runtime_error("failed to create BAM iterator for chunk");
 
     std::vector<ReadRecord> reads;
+    reads.reserve(4096);
     std::unique_ptr<bam1_t, AlignmentDeleter> aln(bam_init1());
     while (sam_itr_next(bam.get(), iter.get(), aln.get()) >= 0) {
-        if (!read_passes_filters(aln.get(), opts)) continue;
+        const int read_tid = aln->core.tid;
+        const hts_pos_t read_beg = aln->core.pos + 1;
+        const hts_pos_t read_end = bam_endpos(aln.get());
+        const bool overlaps_prev = read_overlaps_prev_region(chunk, read_tid, read_beg, read_end);
+        const bool overlaps_next = read_overlaps_next_region(chunk, read_tid, read_beg, read_end);
+
+        if (!read_passes_filters(aln.get(), opts)) {
+            if (overlap_skip_counts != nullptr) {
+                if (overlaps_prev) ++overlap_skip_counts->upstream;
+                if (overlaps_next) ++overlap_skip_counts->downstream;
+            }
+            continue;
+        }
 
         ReadRecord read;
-        read.tid = aln->core.tid;
-        read.beg = aln->core.pos + 1;
-        read.end = bam_endpos(aln.get());
+        read.tid = read_tid;
+        read.input_index = input_index;
+        read.beg = read_beg;
+        read.end = read_end;
         read.reverse = bam_is_rev(aln.get());
         read.nm = aux_int_or_default(aln.get(), "NM", 0);
         read.mapq = static_cast<int>(aln->core.qual);
         read.qname = bam_get_qname(aln.get());
-        read.packed_seq = copy_packed_sequence(aln.get());
         read.qual = copy_qualities(aln.get());
         read.alignment.reset(bam_dup1(aln.get()));
         if (!read.alignment) throw std::runtime_error("failed to duplicate BAM alignment");
+        read.is_ont_palindrome = detect_ont_palindrome(aln.get(), header, opts);
         build_digars_and_events(aln.get(), header, ref, opts, read);
         read.is_skipped = read_has_too_many_variants(read, opts);
         maybe_dump_debug_site(opts, header, read);
         reads.push_back(std::move(read));
     }
-    std::sort(reads.begin(), reads.end(), [](const ReadRecord& lhs, const ReadRecord& rhs) {
-        if (lhs.beg != rhs.beg) return lhs.beg < rhs.beg;
-        if (lhs.end != rhs.end) return lhs.end < rhs.end;
-        if (lhs.nm != rhs.nm) return lhs.nm < rhs.nm;
-        return lhs.qname < rhs.qname;
-    });
     return reads;
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Chunk finalization
+// ════════════════════════════════════════════════════════════════════════════
 
 void populate_reference_slice(BamChunk& chunk, ReferenceCache& ref, const bam_hdr_t* header) {
     const ReadRecord* first_active = nullptr;

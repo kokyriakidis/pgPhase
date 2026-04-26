@@ -1,7 +1,7 @@
 #include <iostream>
 #include <string>
 
-#include "collect_bam_variation.hpp"
+#include "collect_pipeline.hpp"
 
 namespace {
 
