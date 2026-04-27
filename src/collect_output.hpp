@@ -104,6 +104,20 @@ void write_variants_vcf_records(std::ostream& out,
                                 const CandidateTable& variants);
 
 /**
+ * @brief Writes VCF v4.2 header with FORMAT/GT:PS columns for phased candidate output.
+ */
+void write_phased_variants_vcf_header(std::ostream& out, const Options& opts, const bam_hdr_t* header);
+
+/**
+ * @brief Writes phased VCF records with sample `GT:PS` from candidate `hap_*` / `phase_set`.
+ */
+void write_phased_variants_vcf_records(std::ostream& out,
+                                       const Options& opts,
+                                       const bam_hdr_t* header,
+                                       ReferenceCache& ref,
+                                       const CandidateTable& variants);
+
+/**
  * @brief Writes a standalone read-support file from precomputed per-chunk batches.
  * @param opts Must set `read_support_tsv` and BAM/ref paths.
  * @param by_chunk Observations grouped by chunk order.

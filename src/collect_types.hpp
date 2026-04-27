@@ -164,6 +164,7 @@ struct Options {
     std::vector<std::string> bam_files;
     std::string output_tsv = "output.tsv";
     std::string output_vcf;
+    std::string output_phased_vcf;
     /** If non-empty, write per-read allele observations for downstream phasing. */
     std::string read_support_tsv;
     /** If non-empty, write per-read HAP / PHASE_SET after k-means phasing (per chunk). */
