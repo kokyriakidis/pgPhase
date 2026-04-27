@@ -560,6 +560,14 @@ void run_collect_bam_variation(const Options& opts) {
         if (!vcf_out) throw std::runtime_error("failed to open VCF output: " + opts.output_vcf);
         write_variants_vcf_header(vcf_out, opts, header.get());
     }
+    std::ofstream phased_vcf_out;
+    if (!opts.output_phased_vcf.empty()) {
+        phased_vcf_out.open(opts.output_phased_vcf);
+        if (!phased_vcf_out) {
+            throw std::runtime_error("failed to open phased VCF output: " + opts.output_phased_vcf);
+        }
+        write_phased_variants_vcf_header(phased_vcf_out, opts, header.get());
+    }
 
     std::ofstream read_support_out;
     if (!opts.read_support_tsv.empty()) {
@@ -598,6 +606,9 @@ void run_collect_bam_variation(const Options& opts) {
         if (!opts.output_vcf.empty()) {
             write_variants_vcf_records(vcf_out, opts, header.get(), ref, variants);
         }
+        if (!opts.output_phased_vcf.empty()) {
+            write_phased_variants_vcf_records(phased_vcf_out, opts, header.get(), ref, variants);
+        }
         if (!opts.read_support_tsv.empty()) {
             for (const std::vector<ReadSupportRow>& rows : batch.read_support_batches) {
                 n_read_support_rows += rows.size();
@@ -620,6 +631,9 @@ void run_collect_bam_variation(const Options& opts) {
               << opts.output_tsv << "\n";
     if (!opts.output_vcf.empty()) {
         std::cerr << "Wrote candidate VCF to " << opts.output_vcf << "\n";
+    }
+    if (!opts.output_phased_vcf.empty()) {
+        std::cerr << "Wrote phased candidate VCF to " << opts.output_phased_vcf << "\n";
     }
     if (!opts.read_support_tsv.empty()) {
         std::cerr << "Wrote " << n_read_support_rows << " read x candidate observations to "
@@ -660,7 +674,8 @@ enum LongOption {
     kNoisySlideWinOption,
     kDebugSiteOption,
     kInputIsListOption,
-    kPhaseReadTsvOption
+    kPhaseReadTsvOption,
+    kPhasedVcfOutputOption
 };
 
 /**
@@ -711,6 +726,7 @@ static void print_collect_help() {
         << "      --include-filtered        Include QC-fail and duplicate reads\n"
         << "  -o, --output FILE             Output TSV file [output.tsv]\n"
         << "  -v, --vcf-output FILE         Optional VCF output for collected candidates\n"
+        << "      --phased-vcf-output FILE  Optional phased VCF (GT:PS from hap/phase_set scaffold)\n"
         << "      --read-support FILE       Per-read ref/alt observations at candidates (for phasing)\n"
         << "      --phase-read-tsv FILE     Per-read HAP / PHASE_SET after k-means phasing\n"
         << "      --chunk-size INT          Region chunk size in bp [500000]\n"
@@ -764,6 +780,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"include-filtered",          no_argument,       nullptr, 'f'},
         {"output",                    required_argument, nullptr, 'o'},
         {"vcf-output",                required_argument, nullptr, 'v'},
+        {"phased-vcf-output",         required_argument, nullptr, kPhasedVcfOutputOption},
         {"read-support",              required_argument, nullptr, kReadSupportOption},
         {"phase-read-tsv",            required_argument, nullptr, kPhaseReadTsvOption},
         {"chunk-size",                required_argument, nullptr, kChunkSizeOption},
@@ -815,6 +832,7 @@ int collect_bam_variation(int argc, char* argv[]) {
             case 'f': opts.include_filtered = true; break;
             case 'o': opts.output_tsv = optarg; break;
             case 'v': opts.output_vcf = optarg; break;
+            case kPhasedVcfOutputOption: opts.output_phased_vcf = optarg; break;
             case kReadSupportOption:    opts.read_support_tsv = optarg; break;
             case kPhaseReadTsvOption:   opts.phase_read_tsv = optarg; break;
             case kChunkSizeOption:      opts.chunk_size = std::stoll(optarg); break;

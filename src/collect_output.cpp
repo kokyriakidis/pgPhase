@@ -272,6 +272,110 @@ void write_variants_vcf_header(std::ostream& out, const Options& opts, const bam
     out << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n";
 }
 
+void write_phased_variants_vcf_header(std::ostream& out, const Options& opts, const bam_hdr_t* header) {
+    (void)opts;
+    out << "##fileformat=VCFv4.2\n";
+    {
+        std::time_t t = std::time(nullptr);
+        std::tm* tm = std::localtime(&t);
+        char date_buf[16] = {0};
+        if (tm != nullptr && std::strftime(date_buf, sizeof(date_buf), "%Y%m%d", tm) > 0) {
+            out << "##fileDate=" << date_buf << "\n";
+        }
+    }
+    out << "##source=pgphase collect-bam-variation\n";
+    out << "##FILTER=<ID=PASS,Description=\"All filters passed\">\n";
+    out << "##FILTER=<ID=LowQual,Description=\"Low quality candidate\">\n";
+    out << "##FILTER=<ID=RefCall,Description=\"Reference call candidate\">\n";
+    out << "##FILTER=<ID=NoCall,Description=\"Site has depth=0 resulting in no call\">\n";
+    out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the variant described in this record\">\n";
+    out << "##INFO=<ID=CLEAN,Number=0,Type=Flag,Description=\"Clean-region candidate variant\">\n";
+    out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">\n";
+    out << "##INFO=<ID=SVLEN,Number=A,Type=Integer,Description=\"Difference in length between REF and ALT alleles\">\n";
+    out << "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Total depth\">\n";
+    out << "##INFO=<ID=REFC,Number=1,Type=Integer,Description=\"Reference allele count\">\n";
+    out << "##INFO=<ID=ALTC,Number=1,Type=Integer,Description=\"Alternate allele count\">\n";
+    out << "##INFO=<ID=LQC,Number=1,Type=Integer,Description=\"Low-quality observation count\">\n";
+    out << "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Alternate allele fraction\">\n";
+    out << "##INFO=<ID=CAT,Number=1,Type=String,Description=\"pgPhase candidate category\">\n";
+    out << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n";
+    out << "##FORMAT=<ID=PS,Number=1,Type=Integer,Description=\"Phase set anchor coordinate\">\n";
+    for (int32_t tid = 0; tid < header->n_targets; ++tid) {
+        out << "##contig=<ID=" << header->target_name[tid] << ",length=" << header->target_len[tid] << ">\n";
+    }
+    out << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n";
+}
+
+namespace {
+struct VcfRecordCore {
+    hts_pos_t pos = 0;
+    std::string ref_seq;
+    std::string alt_seq;
+    std::string filter;
+    std::string info;
+};
+
+static VcfRecordCore build_vcf_record_core(const CandidateVariant& candidate,
+                                           const Options& opts,
+                                           const bam_hdr_t* header,
+                                           ReferenceCache& ref) {
+    const VariantKey& key = candidate.key;
+    const VariantCounts& counts = candidate.counts;
+    (void)header;
+
+    VcfRecordCore core;
+    core.pos = key.pos;
+    if (key.type == VariantType::Snp) {
+        core.ref_seq = std::string(1, ref.base(key.tid, key.pos, header));
+        core.alt_seq = key.alt.empty() ? "." : key.alt;
+    } else if (key.type == VariantType::Insertion) {
+        const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
+        core.pos = anchor_pos;
+        const char anchor_base = ref.base(key.tid, anchor_pos, header);
+        core.ref_seq = std::string(1, anchor_base);
+        core.alt_seq = core.ref_seq + key.alt;
+    } else { // Deletion
+        const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
+        core.pos = anchor_pos;
+        const char anchor_base = ref.base(key.tid, anchor_pos, header);
+        const std::string del_seq = ref.subseq(key.tid, key.pos, key.ref_len, header);
+        core.ref_seq = std::string(1, anchor_base) + del_seq;
+        core.alt_seq = std::string(1, anchor_base);
+    }
+
+    core.filter = "PASS";
+    if (counts.total_cov == 0) {
+        core.filter = "NoCall";
+    } else if (counts.category == VariantCategory::NonVariant) {
+        core.filter = "RefCall";
+    } else if (counts.category != VariantCategory::CleanHetSnp &&
+               counts.category != VariantCategory::CleanHetIndel &&
+               counts.category != VariantCategory::CleanHom) {
+        core.filter = "LowQual";
+    }
+
+    const hts_pos_t end_pos = core.pos + static_cast<hts_pos_t>(core.ref_seq.size()) - 1;
+    std::ostringstream info;
+    info << "END=" << end_pos;
+    if (counts.category == VariantCategory::CleanHetSnp || counts.category == VariantCategory::CleanHetIndel ||
+        counts.category == VariantCategory::CleanHom) {
+        info << ";CLEAN";
+    }
+    if (key.type == VariantType::Insertion || key.type == VariantType::Deletion) {
+        const int svlen = (key.type == VariantType::Insertion) ? static_cast<int>(key.alt.size()) : -key.ref_len;
+        if (std::abs(svlen) >= opts.min_sv_len) {
+            info << ";SVTYPE=" << (svlen > 0 ? "INS" : "DEL");
+            info << ";SVLEN=" << svlen;
+        }
+    }
+    info << ";DP=" << counts.total_cov << ";REFC=" << counts.ref_cov << ";ALTC=" << counts.alt_cov
+         << ";LQC=" << counts.low_qual_cov << ";AF=" << counts.allele_fraction
+         << ";CAT=" << category_name(counts.category);
+    core.info = info.str();
+    return core;
+}
+} // namespace
+
 /**
  * @brief Writes VCF body records for candidate variants.
  *
@@ -294,62 +398,35 @@ void write_variants_vcf_records(std::ostream& out,
                                 const CandidateTable& variants) {
     for (const CandidateVariant& candidate : variants) {
         const VariantKey& key = candidate.key;
-        const VariantCounts& counts = candidate.counts;
         const std::string chrom = header->target_name[key.tid];
+        const VcfRecordCore core = build_vcf_record_core(candidate, opts, header, ref);
+        out << chrom << '\t' << core.pos << "\t.\t" << core.ref_seq << '\t' << core.alt_seq
+            << "\t.\t" << core.filter << '\t' << core.info << '\n';
+    }
+}
 
-        hts_pos_t pos = key.pos;
-        std::string ref_seq;
-        std::string alt_seq;
+void write_phased_variants_vcf_records(std::ostream& out,
+                                       const Options& opts,
+                                       const bam_hdr_t* header,
+                                       ReferenceCache& ref,
+                                       const CandidateTable& variants) {
+    for (const CandidateVariant& candidate : variants) {
+        const VariantKey& key = candidate.key;
+        const std::string chrom = header->target_name[key.tid];
+        const VcfRecordCore core = build_vcf_record_core(candidate, opts, header, ref);
 
-        if (key.type == VariantType::Snp) {
-            ref_seq = std::string(1, ref.base(key.tid, key.pos, header));
-            alt_seq = key.alt.empty() ? "." : key.alt;
-        } else if (key.type == VariantType::Insertion) {
-            const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
-            pos = anchor_pos;
-            const char anchor_base = ref.base(key.tid, anchor_pos, header);
-            ref_seq = std::string(1, anchor_base);
-            alt_seq = ref_seq + key.alt;
-        } else { // Deletion
-            const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
-            pos = anchor_pos;
-            const char anchor_base = ref.base(key.tid, anchor_pos, header);
-            const std::string del_seq = ref.subseq(key.tid, key.pos, key.ref_len, header);
-            ref_seq = std::string(1, anchor_base) + del_seq;
-            alt_seq = std::string(1, anchor_base);
+        std::string gt = "./.";
+        if (candidate.hap_alt == 1 && candidate.hap_ref == 2) gt = "1|0";
+        else if (candidate.hap_alt == 2 && candidate.hap_ref == 1) gt = "0|1";
+        else if (candidate.hap_alt == 3) gt = "1|1";
+        else if (candidate.counts.category == VariantCategory::NonVariant) gt = "0/0";
+
+        std::string ps = ".";
+        if ((gt == "1|0" || gt == "0|1") && candidate.phase_set > 0) {
+            ps = std::to_string(candidate.phase_set);
         }
-
-        std::string filter = "PASS";
-        if (counts.total_cov == 0) {
-            filter = "NoCall";
-        } else if (counts.category == VariantCategory::NonVariant) {
-            filter = "RefCall";
-        } else if (counts.category != VariantCategory::CleanHetSnp &&
-                   counts.category != VariantCategory::CleanHetIndel &&
-                   counts.category != VariantCategory::CleanHom) {
-            filter = "LowQual";
-        }
-
-        const hts_pos_t end_pos = pos + static_cast<hts_pos_t>(ref_seq.size()) - 1;
-        std::ostringstream info;
-        info << "END=" << end_pos;
-        if (counts.category == VariantCategory::CleanHetSnp || counts.category == VariantCategory::CleanHetIndel ||
-            counts.category == VariantCategory::CleanHom) {
-            info << ";CLEAN";
-        }
-        if (key.type == VariantType::Insertion || key.type == VariantType::Deletion) {
-            const int svlen = (key.type == VariantType::Insertion) ? static_cast<int>(key.alt.size()) : -key.ref_len;
-            if (std::abs(svlen) >= opts.min_sv_len) {
-                info << ";SVTYPE=" << (svlen > 0 ? "INS" : "DEL");
-                info << ";SVLEN=" << svlen;
-            }
-        }
-        info << ";DP=" << counts.total_cov << ";REFC=" << counts.ref_cov << ";ALTC=" << counts.alt_cov
-             << ";LQC=" << counts.low_qual_cov << ";AF=" << counts.allele_fraction
-             << ";CAT=" << category_name(counts.category);
-
-        out << chrom << '\t' << pos << "\t.\t" << ref_seq << '\t' << alt_seq << "\t.\t" << filter << '\t'
-            << info.str() << '\n';
+        out << chrom << '\t' << core.pos << "\t.\t" << core.ref_seq << '\t' << core.alt_seq
+            << "\t.\t" << core.filter << '\t' << core.info << "\tGT:PS\t" << gt << ':' << ps << '\n';
     }
 }
 
