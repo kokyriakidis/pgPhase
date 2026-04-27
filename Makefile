@@ -16,6 +16,7 @@ SOURCES_CXX = src/main.cpp \
 	src/collect_pipeline.cpp \
 	src/bam_digar.cpp \
 	src/collect_var.cpp \
+	src/collect_phase.cpp \
 	src/collect_output.cpp
 SOURCES_C = src/sdust.c src/cgranges.c src/kalloc.c
 

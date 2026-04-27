@@ -7,6 +7,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
@@ -152,6 +153,7 @@ struct Options {
     double strand_bias_pval = kDefaultStrandBiasPvalOnt;
     int noisy_reg_max_xgaps = kDefaultNoisyRegMaxXgaps;
     int min_noisy_reg_total_depth = kDefaultMinNoisyRegTotalDepth;
+    int verbose = 0;
     bool include_filtered = false;
     bool autosome = false;
     bool input_is_list = false;
@@ -164,6 +166,8 @@ struct Options {
     std::string output_vcf;
     /** If non-empty, write per-read allele observations for downstream phasing. */
     std::string read_support_tsv;
+    /** If non-empty, write per-read HAP / PHASE_SET after k-means phasing (per chunk). */
+    std::string phase_read_tsv;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
 
     /**
@@ -342,7 +346,14 @@ struct VariantCounts {
     int reverse_ref = 0;  // strand_to_alle_covs[1][0]
     int forward_alt = 0;  // strand_to_alle_covs[0][1]
     int reverse_alt = 0;  // strand_to_alle_covs[1][1]
-    int n_uniq_alles = 2; // always 2 for Step 1 (ref + primary alt)
+    /** longcallD `n_uniq_alles`; width of `alle_covs` / `hap_to_alle_profile` when multi-allele. */
+    int n_uniq_alles = 2;
+    /**
+     * longcallD `alle_covs` (optional). When empty, init consensus uses `ref_cov`/`alt_cov` as
+     * alleles 0/1 only. When non-empty, `get_var_init_max_cov_allele` scans with strict `>` ties
+     * (lower index wins), matching longcallD.
+     */
+    std::vector<int> alle_covs;
     /** After full classify_cand_vars (noisy overlap, LOW_AF→LOW_COV rewrite, etc.). */
     VariantCategory category = VariantCategory::LowCoverage;
     /** longcallD first-loop `classify_var_cate` only (matches CandVarCate before `After classify var:`). */
@@ -358,10 +369,41 @@ struct CandidateVariant {
     VariantCounts counts;
     uint8_t ref_base = 4;     // 0-3=ACGT, 4=unknown; SNPs only (longcallD cand_var_t::ref_base)
     uint8_t alt_ref_base = 4; // 0-3=ACGT, 4=unknown; INS/DEL only (longcallD cand_var_t::alt_ref_base)
+    hts_pos_t phase_set = 0;
+    int hap_alt = 0;
+    int hap_ref = 0;
+    /** True when the variant lies in a homopolymer or STR run (longcallD `is_homopolymer_indel`). */
+    bool is_homopolymer_indel = false;
+    /**
+     * Per-haplotype allele count profiles for k-means phasing (longcallD `hap_to_alle_profile`).
+     * Indexed [hap 0–2][allele i]. hap=0 unused here; haps 1–2 are diploid. Length matches
+     * `counts.n_uniq_alles` / `counts.alle_covs.size()` (default 2). Reset each phasing call.
+     */
+    std::array<std::vector<int>, 3> hap_to_alle_profile{};
+    /**
+     * Consensus allele per haplotype (longcallD `hap_to_cons_alle`).
+     * -1 = unknown/undecided; 0 = ref; 1 = alt. Written by k-means and read by scoring functions.
+     */
+    std::array<int, 3> hap_to_cons_alle{-1, -1, -1};
 };
 
 /** @brief Ordered list of candidates for one chunk or merged batch. */
 using CandidateTable = std::vector<CandidateVariant>;
+
+/**
+ * @brief Per-read candidate allele profile, matching longcallD's read-wise variant profile shape.
+ *
+ * `alleles[i]` corresponds to candidate `start_var_idx + i`.
+ * Values follow longcallD convention: 0=reference, 1=alternate, -1=other/non-informative,
+ * -2=low-quality alternate observation.
+ */
+struct ReadVariantProfile {
+    int read_id = -1;
+    int start_var_idx = -1;
+    int end_var_idx = -1;
+    std::vector<int> alleles;
+    std::vector<int> alt_qi;
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 // Chunk data
@@ -384,8 +426,10 @@ struct BamChunk {
     std::vector<int> n_up_ovlp_skip_reads;
     std::vector<int> n_down_ovlp_skip_reads;
     std::vector<int> haps;
-    std::vector<int> phase_scores;
     std::vector<hts_pos_t> phase_sets;
+    std::vector<ReadVariantProfile> read_var_profile;
+    /** Interval tree [start_var_idx, end_var_idx+1) → read_i, built by `collect_read_var_profile`. */
+    std::unique_ptr<cgranges_t, CgrangesDeleter> read_var_cr;
     CandidateTable candidates;
     // longcallD var_noisy_read_cov_cr / var_noisy_read_err_cr / var_noisy_read_marks:
     // interval-tree cache for var_noisy_reads_ratio(), built lazily before classification.

@@ -93,6 +93,29 @@ void write_read_support_header(std::ostream& out) {
  * @param header BAM header used to resolve reference sequence IDs to names.
  * @param rows A vector of `ReadSupportRow` structures containing the observation data.
  */
+void write_phase_read_tsv_header(std::ostream& out) {
+    out << "CHUNK_ID\tREG_CHUNK_I\tCHROM\tCHUNK_BEG\tCHUNK_END\t"
+        << "QNAME\tREAD_CHROM\tINPUT_IDX\tREAD_BEG\tREAD_END\tMAPQ\tREVERSE\tSKIPPED\t"
+        << "HAP\tPHASE_SET\n";
+}
+
+void write_phase_read_tsv_rows(std::ostream& out, const bam_hdr_t* header, const BamChunk& chunk) {
+    const RegionChunk& reg = chunk.region;
+    const char* chunk_chrom =
+        (reg.tid >= 0 && reg.tid < header->n_targets) ? header->target_name[reg.tid] : ".";
+    for (size_t i = 0; i < chunk.reads.size(); ++i) {
+        const ReadRecord& r = chunk.reads[i];
+        const char* read_chrom =
+            (r.tid >= 0 && r.tid < header->n_targets) ? header->target_name[r.tid] : ".";
+        const int hap = i < chunk.haps.size() ? chunk.haps[i] : 0;
+        const hts_pos_t ps = i < chunk.phase_sets.size() ? chunk.phase_sets[i] : static_cast<hts_pos_t>(-1);
+        out << reg.chunk_id << '\t' << reg.reg_chunk_i << '\t' << chunk_chrom << '\t' << reg.beg << '\t'
+            << reg.end << '\t' << r.qname << '\t' << read_chrom << '\t' << r.input_index << '\t' << r.beg
+            << '\t' << r.end << '\t' << r.mapq << '\t' << (r.reverse ? 1 : 0) << '\t' << (r.is_skipped ? 1 : 0)
+            << '\t' << hap << '\t' << ps << '\n';
+    }
+}
+
 void write_read_support_rows(std::ostream& out,
                              const bam_hdr_t* header,
                              const std::vector<ReadSupportRow>& rows) {
@@ -133,7 +156,8 @@ void write_read_support_tsv(const Options& opts, const std::vector<std::vector<R
  * @brief Writes the TSV header for the main candidate variant table.
  *
  * Defines columns for ref/alt sequence, depth, strand counts, allele fraction (AF),
- * and category. Trailing phase columns are placeholders.
+ * and category. Trailing columns carry the k-means phasing scaffold (`PHASE_SET`, `HAP_ALT`, `HAP_REF`)
+ * when `collect_var_main` has run phasing; otherwise they are zero.
  *
  * @param out Output stream to write the header line to.
  */
@@ -177,7 +201,8 @@ void write_variants_tsv_records(std::ostream& out,
             << counts.alt_cov << '\t' << counts.low_qual_cov << '\t' << counts.forward_ref << '\t'
             << counts.reverse_ref << '\t' << counts.forward_alt << '\t' << counts.reverse_alt << '\t'
             << counts.allele_fraction << '\t' << category_name(counts.category) << '\t'
-            << category_name(counts.candvarcate_initial) << '\t' << 0 << '\t' << 0 << '\t' << 0 << '\n';
+            << category_name(counts.candvarcate_initial) << '\t' << candidate.phase_set << '\t'
+            << candidate.hap_alt << '\t' << candidate.hap_ref << '\n';
     }
 }
 

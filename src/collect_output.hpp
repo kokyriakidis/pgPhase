@@ -19,8 +19,9 @@ namespace pgphase_collect {
  *
  * @details Contract: outputs describe **pre-phasing candidates**, not final diploid genotypes. TSV includes
  * CATEGORY (final, post-containment) and INIT_CAT (longcallD first `classify_var_cate` only, for parity
- * checks). VCF uses FILTER from final category; INFO.CAT matches final labels. PHASE_SET / hap in TSV
- * are placeholders (0). Read-support TSV is optional auxiliary evidence for downstream phasing tools.
+ * checks). VCF uses FILTER from final category; INFO.CAT matches final labels. Candidate TSV includes
+ * `PHASE_SET` / `HAP_ALT` / `HAP_REF` from k-means. Optional `--phase-read-tsv` lists per-read scaffold
+ * fields (`HAP`, `PHASE_SET`) for debugging phasing.
  */
 
 /**
@@ -48,6 +49,19 @@ void write_read_support_header(std::ostream& out);
 void write_read_support_rows(std::ostream& out,
                              const bam_hdr_t* header,
                              const std::vector<ReadSupportRow>& rows);
+
+/**
+ * @brief Header line for `--phase-read-tsv` (per-read fields after `assign_hap_based_on_germline_het_vars_kmeans`).
+ */
+void write_phase_read_tsv_header(std::ostream& out);
+
+/**
+ * @brief Appends one line per read in \a chunk with haplotype scaffold columns.
+ * @param out Output stream.
+ * @param header BAM header for sequence names.
+ * @param chunk Chunk after `collect_var_main` (phasing may be a no-op if there are no scaffold variants).
+ */
+void write_phase_read_tsv_rows(std::ostream& out, const bam_hdr_t* header, const BamChunk& chunk);
 
 /**
  * @brief Writes the main candidate-table TSV header (one line).

@@ -4,6 +4,10 @@
 /**
  * @file collect_var.hpp
  * @brief Candidate collection, intervals, noisy regions, and classification API.
+ *
+ * The public entry point for the per-chunk biological workflow is `collect_var_main`,
+ * modeled after longcallD's numbered `collect_var_main` pipeline. Higher-level code
+ * still owns BAM/FASTA I/O, chunk loading, threading, and output streaming.
  */
 
 #include "collect_types.hpp"
@@ -167,6 +171,25 @@ void populate_chunk_read_indexes(BamChunk& chunk);
  * @param header BAM header (reserved for future use; currently unused).
  */
 void classify_chunk_candidates(BamChunk& chunk, const Options& opts, const bam_hdr_t* header);
+
+/**
+ * @brief Runs the longcallD-shaped per-chunk candidate collection pipeline.
+ *
+ * Expects `chunk.reads`, `chunk.ref_seq`, read indexes, low-complexity intervals, and
+ * initial noisy regions to already be populated by the BAM/FASTA loading layer. The
+ * numbered body in `collect_var.cpp` mirrors longcallD `collect_var_main`: collect
+ * sites, count alleles, pre-process noisy spans, classify candidates, post-process
+ * noisy spans, and apply final containment filtering.
+ *
+ * @param chunk Prepared chunk to fill/classify in place.
+ * @param opts Collection and classification options.
+ * @param header Primary BAM header for classification context.
+ * @param read_support_out Optional buffer receiving read×candidate observations.
+ */
+void collect_var_main(BamChunk& chunk,
+                      const Options& opts,
+                      const bam_hdr_t* header,
+                      std::vector<ReadSupportRow>* read_support_out = nullptr);
 
 } // namespace pgphase_collect
 

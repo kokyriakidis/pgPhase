@@ -4,6 +4,7 @@
  */
 
 #include "collect_var.hpp"
+#include "collect_phase.hpp"
 
 #include "sdust.h"
 
@@ -11,6 +12,7 @@
 #include <cfloat>
 #include <climits>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -1536,6 +1538,8 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
 
     for (size_t i = 0; i < variants.size(); ++i) {
         variants[i].counts.category = cats[i];
+        variants[i].is_homopolymer_indel =
+            (variants[i].counts.candvarcate_initial == VariantCategory::RepeatHetIndel);
     }
 }
 
@@ -1565,6 +1569,212 @@ void classify_chunk_candidates(BamChunk& chunk, const Options& opts, const bam_h
     (void)header;
     classify_cand_vars_pgphase(chunk, opts);
     resolve_simple_noisy_candidates(chunk.candidates);
+}
+
+
+static inline int read_order_visit_count(const BamChunk& chunk) {
+    return chunk.ordered_read_ids.empty() ? static_cast<int>(chunk.reads.size())
+                                         : static_cast<int>(chunk.ordered_read_ids.size());
+}
+
+/**
+ * @brief Per-read candidate allele sweep (longcallD `collect_read_var_profile`).
+ *
+ * Visits reads in `ordered_read_ids` order when populated (same as longcallD), else `0..n-1`.
+ * Populates `chunk.read_var_profile` and `chunk.read_var_cr` ([start_var_idx, end_var_idx+1) → read_i).
+ */
+static void collect_read_var_profile(const Options& opts, BamChunk& chunk) {
+    const CandidateTable& variants = chunk.candidates;
+    const int n = static_cast<int>(variants.size());
+    chunk.read_var_profile.assign(chunk.reads.size(), ReadVariantProfile{});
+    for (size_t i = 0; i < chunk.reads.size(); ++i)
+        chunk.read_var_profile[i].read_id = static_cast<int>(i);
+
+    cgranges_t* cr = cr_init();
+
+    if (n == 0) {
+        cr_index(cr);
+        chunk.read_var_cr.reset(cr);
+        return;
+    }
+
+    for (int ord = 0; ord < read_order_visit_count(chunk); ++ord) {
+        const int read_i = chunk.ordered_read_ids.empty()
+                               ? ord
+                               : chunk.ordered_read_ids[static_cast<size_t>(ord)];
+        if (read_i < 0 || static_cast<size_t>(read_i) >= chunk.reads.size()) continue;
+        const ReadRecord& read = chunk.reads[static_cast<size_t>(read_i)];
+        if (read.is_skipped || read.tid < 0) continue;
+
+        ReadVariantProfile cur;
+        cur.read_id = static_cast<int>(read_i);
+        int site_i = get_var_site_start(variants, read.beg, n);
+        size_t digar_i = 0;
+        const std::vector<DigarOp>& dig = read.digars;
+
+        const auto append_observation = [&](int idx, int allele, int alt_qi) {
+            if (cur.start_var_idx < 0) cur.start_var_idx = idx;
+            while (cur.start_var_idx + static_cast<int>(cur.alleles.size()) < idx) {
+                cur.alleles.push_back(-1);
+                cur.alt_qi.push_back(-1);
+            }
+            cur.end_var_idx = idx;
+            cur.alleles.push_back(allele);
+            cur.alt_qi.push_back(alt_qi);
+        };
+
+        while (site_i < n && digar_i < dig.size()) {
+            const int stid = variants[static_cast<size_t>(site_i)].key.tid;
+            if (stid != read.tid) {
+                if (stid < read.tid) { ++site_i; } else { break; }
+                continue;
+            }
+            if (variants[static_cast<size_t>(site_i)].key.pos > read.end) break;
+            if (!is_variant_digar_for_cand_sweep(dig[digar_i])) { ++digar_i; continue; }
+
+            const DigarOp& d = dig[digar_i];
+            VariantKey dkey = variant_key_from_digar(read.tid, d);
+            const int ret = exact_comp_var_site_ins(
+                &variants[static_cast<size_t>(site_i)].key, &dkey, kLongcalldMinSvLen);
+            if (ret < 0) {
+                append_observation(site_i, 0, -1);
+                ++site_i;
+            } else if (ret == 0) {
+                const bool low_quality = d.low_quality || get_digar_ave_qual(d, read.qual) < opts.min_bq;
+                append_observation(site_i, low_quality ? -2 : 1, d.qi);
+                ++site_i;
+            } else {
+                ++digar_i;
+            }
+        }
+
+        for (; site_i < n; ++site_i) {
+            const int stid = variants[static_cast<size_t>(site_i)].key.tid;
+            if (stid != read.tid) { if (stid < read.tid) continue; break; }
+            if (variants[static_cast<size_t>(site_i)].key.pos > read.end) break;
+            append_observation(site_i, 0, -1);
+        }
+
+        if (cur.start_var_idx >= 0) {
+            cr_add(cr, "cr", cur.start_var_idx, cur.end_var_idx + 1,
+                   static_cast<int32_t>(read_i));
+            chunk.read_var_profile[read_i] = std::move(cur);
+        }
+    }
+    cr_index(cr);
+    chunk.read_var_cr.reset(cr);
+}
+
+/**
+ * @brief Prints longcallD-style noisy-region summary at `--verbose 2`.
+ */
+static void dump_all_noisy_regions(const BamChunk& chunk, const Options& opts, const bam_hdr_t* header) {
+    if (opts.verbose < 2) return;
+    const char* chrom = "unknown";
+    if (header != nullptr && chunk.region.tid >= 0 && chunk.region.tid < header->n_targets) {
+        chrom = header->target_name[chunk.region.tid];
+    }
+    std::fprintf(stderr, "AllNoisyRegions: %s:%" PRId64 "-%" PRId64 " (%zu)\n",
+                 chrom,
+                 static_cast<int64_t>(chunk.region.beg),
+                 static_cast<int64_t>(chunk.region.end),
+                 chunk.noisy_regions.size());
+    for (const Interval& region : chunk.noisy_regions) {
+        std::fprintf(stderr, "NoisyRegion: %s:%" PRId64 "-%" PRId64 " (%d)\n",
+                     chrom,
+                     static_cast<int64_t>(region.beg - 1),
+                     static_cast<int64_t>(region.end),
+                     region.label);
+    }
+}
+
+/**
+ * @brief Per-chunk candidate collection and phasing scaffold, arranged like longcallD `collect_var_main`.
+ *
+ * BAM/FASTA I/O is intentionally outside this function: callers prepare `chunk.reads`,
+ * reference slices, and initial noisy/low-complexity state before entering the numbered
+ * steps below.
+ *
+ * **Phase 1 — site collection (steps 1.1–1.2)**
+ * Candidate sites (SNP/INS/DEL) are extracted from read digars, then each site is visited
+ * again to accumulate ref/alt/low-qual counts and optional per-read support rows.
+ *
+ * **Phase 2 — classification (steps 2.1–2.6)**
+ * Read-level noisy intervals are merged and filtered (`pre_process_noisy_regs`), candidates
+ * are labelled (CLEAN_HET_SNP, LOW_COV, STRAND_BIAS, REP_HET_INDEL, …), noisy regions are
+ * widened using classified context (`post_process_noisy_regs`), and — for non-ONT reads —
+ * candidates fully contained in noisy spans are demoted to NON_VAR.
+ *
+ * **Guard** — if both `chunk.candidates` and `chunk.noisy_regions` are empty after
+ * classification the function returns early: there is nothing to phase and nothing to
+ * propagate to downstream callers.
+ *
+ * **Phase 3 — phasing scaffold (steps 3.1–3.2)**
+ * `collect_read_var_profile` builds a sparse per-read allele table: for every candidate site
+ * each read covers, it records 0 (ref), 1 (alt), or -2 (low-quality alt).
+ * `assign_hap_based_on_germline_het_vars_kmeans` runs **once** here with **`kCandGermlineClean`**
+ * (longcallD `LONGCALLD_CLEAN_HET_SNP | LONGCALLD_CLEAN_HET_INDEL | LONGCALLD_CLEAN_HOM_VAR`).
+ * longcallD’s comments describe additional rounds (`+ NOISY_CAND_*`, somatic); the **second**
+ * germline k-means with `LONGCALLD_CAND_GERMLINE_VAR_CATE` happens **after** noisy-region MSA (step 4),
+ * which collect-bam-variation does not implement. **`kCandGermlineVarCate`** remains in
+ * `collect_phase.hpp` for parity with that later call when step 4 exists.
+ *
+ * **Example — two het sites phased by shared reads, one hom site**
+ * @code
+ *   Candidate sites:   A (pos 100, CleanHetSnp)   B (pos 200, CleanHetSnp)   C (pos 300, CleanHom)
+ *
+ *   Read 1: ----[A=alt]--------[B=ref]----     Agrees with (A=1, B=0) consensus
+ *   Read 2: ----[A=alt]--------[B=ref]----     Reinforces (A=1, B=0)
+ *   Read 3:            --------[B=alt]--[C=alt] Conflicting read if assigned to same hap; implies opposite
+ *
+ *   K-Means Output Phase set anchored at A:
+ *     A → phase_set=100, hap_alt=1, hap_ref=2   (anchor: alt on hap1)
+ *     B → phase_set=100, hap_alt=2, hap_ref=1   (polarized relative to A: alt on hap2)
+ *     C → phase_set=300, hap_alt=3, hap_ref=0   (CleanHom: alt on both, no K-Means iteration involvement)
+ * @endcode
+ *
+ * @param chunk Chunk with reads and region pre-filled by the caller.
+ * @param opts Thresholds (min BQ, AF, strand p-value, SV length, verbosity, …).
+ * @param header BAM header for contig names used in verbose logging.
+ * @param read_support_out If non-null, per-read allele observations are appended here.
+ */
+void collect_var_main(BamChunk& chunk,
+                      const Options& opts,
+                      const bam_hdr_t* header,
+                      std::vector<ReadSupportRow>* read_support_out) {
+    // 1.1. collect X/I/D candidate sites from parsed read digars.
+    collect_candidate_sites_from_records(chunk.region, chunk.reads, chunk.candidates);
+
+    // 1.2. collect reference and alternate allele support for every candidate site.
+    collect_allele_counts_from_records(
+        chunk.reads, chunk.candidates, &chunk.region, read_support_out, opts.min_bq);
+
+    // 2.1. pre-process read-level noisy regions before classification.
+    pre_process_noisy_regs_pgphase(chunk, opts);
+
+    // 2.2. identify clean, repeat/noisy, low-AF, strand-biased, and low-coverage candidates.
+    // 2.3. add repeat/dense candidate spans back into the noisy-region model.
+    // 2.4. reserve somatic/mosaic classification for the longcallD-compatible somatic branch.
+    classify_chunk_candidates(chunk, opts, header);
+
+    // 2.5. post-process noisy regions using classified candidate context.
+    post_process_noisy_regs_pgphase(chunk, chunk.candidates);
+
+    // 2.6. final non-ONT containment pass: candidates fully inside noisy spans become NON_VAR.
+    if (!opts.is_ont()) apply_noisy_containment_filter(chunk);
+
+    dump_all_noisy_regions(chunk, opts, header);
+    // longcallD returns here only when no candidates and no noisy intervals; it otherwise runs
+    // noisy-region MSA (step 4) even with zero candidates — not implemented in collect-bam-variation.
+    if (chunk.candidates.empty() && chunk.noisy_regions.empty()) return;
+
+    if (!chunk.candidates.empty()) {
+        // 3.1. collect clean-region read-wise variant profiles.
+        collect_read_var_profile(opts, chunk);
+
+        // 3.2. co-phasing using clean-region SNPs + indels + clean hom (longcallD collect_var_main).
+        assign_hap_based_on_germline_het_vars_kmeans(chunk, opts, kCandGermlineClean);
+    }
 }
 
 } // namespace pgphase_collect

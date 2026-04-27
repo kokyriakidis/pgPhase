@@ -319,7 +319,7 @@ std::vector<RegionChunk> load_region_chunks(const Options& opts) {
  *
  * Fills overlap read-id lists per input BAM (`up_ovlp_read_i`, `down_ovlp_read_i`) from
  * `read_overlaps_prev_region` / `read_overlaps_next_region`, skip-count placeholders, and
- * zeroed `haps` / `phase_scores` / `phase_sets` (unused for candidate-only output).
+ * zeroed `haps` / `phase_sets` before `collect_var_main` repopulates them during k-means phasing.
  *
  * @param chunk Chunk whose `reads` and `region` are already valid.
  * @param n_bams Number of input BAM files in this worker.
@@ -330,7 +330,6 @@ static void initialize_longcalld_chunk_state(BamChunk& chunk, size_t n_bams) {
     chunk.n_up_ovlp_skip_reads.assign(n_bams, 0);
     chunk.n_down_ovlp_skip_reads.assign(n_bams, 0);
     chunk.haps.assign(chunk.reads.size(), 0);
-    chunk.phase_scores.assign(chunk.reads.size(), 0);
     chunk.phase_sets.assign(chunk.reads.size(), -1);
 
     for (size_t read_i = 0; read_i < chunk.reads.size(); ++read_i) {
@@ -388,53 +387,10 @@ static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerC
 }
 
 /**
- * @brief Candidate discovery and allele counting for one chunk (pre-classification).
- *
- * Matches longcallD `collect_var_main` ordering: deduplicated sites from digars, then allele
- * counts, then `pre_process_noisy_regs`-shaped refinement of chunk noisy regions (before
- * classification). Optionally appends read-support rows during the allele sweep.
- *
- * @param chunk Prepared chunk with reads and reference slice.
- * @param opts Quality thresholds (`min_bq`, noisy options).
- * @param read_support_out If non-null, receives one row per read×site observation.
- */
-static void collect_prephase_candidates(BamChunk& chunk,
-                                        const Options& opts,
-                                        std::vector<ReadSupportRow>* read_support_out) {
-    collect_candidate_sites_from_records(chunk.region, chunk.reads, chunk.candidates);
-    collect_allele_counts_from_records(
-        chunk.reads, chunk.candidates, &chunk.region, read_support_out, opts.min_bq);
-    pre_process_noisy_regs_pgphase(chunk, opts);
-}
-
-/**
- * @brief Classifies candidates and applies noisy-region post-processing.
- *
- * Order: `classify_chunk_candidates`, `post_process_noisy_regs_pgphase`, then for non-ONT
- * platforms `apply_noisy_containment_filter`.
- *
- * @param chunk Chunk with populated `candidates`.
- * @param opts Classification options (e.g. ONT vs HiFi).
- * @param header BAM header for classification.
- */
-static void classify_and_filter_candidates(BamChunk& chunk,
-                                           const Options& opts,
-                                           const bam_hdr_t* header) {
-    classify_chunk_candidates(chunk, opts, header);
-    post_process_noisy_regs_pgphase(chunk, chunk.candidates);
-    if (!opts.is_ont()) apply_noisy_containment_filter(chunk);
-}
-
-/**
  * @brief Sequentially collects variants from candidate regions.
  *
- * Implements the core multi-stage worker thread map-reduce pattern:
- * It pulls bam portions by region coordinates, identifies individual variants via 
- * parsed CIGAR operations/CS tags, and assigns them categories (HET, STRAND BIAS, 
- * LOW COVERAGE, etc) prior to merging the sub-chunks together.
- *
- * This implements the overarching control flow found in `longcallD`'s 
- * top-level `collect_var_main()`.
+ * Loads one genomic slice from the BAM/FASTA layer, then delegates the numbered
+ * longcallD-shaped candidate workflow to `collect_var_main`.
  *
  * @param region Genomic slice to process.
  * @param opts Pipeline and quality options.
@@ -449,8 +405,7 @@ static BamChunk process_chunk(const RegionChunk& region,
     BamChunk chunk;
     chunk.region = region;
     load_and_prepare_chunk(chunk, opts, context);
-    collect_prephase_candidates(chunk, opts, read_support_out);
-    classify_and_filter_candidates(chunk, opts, context.primary_header());
+    collect_var_main(chunk, opts, context.primary_header(), read_support_out);
     return chunk;
 }
 
@@ -615,8 +570,18 @@ void run_collect_bam_variation(const Options& opts) {
         write_read_support_header(read_support_out);
     }
 
+    std::ofstream phase_read_out;
+    if (!opts.phase_read_tsv.empty()) {
+        phase_read_out.open(opts.phase_read_tsv);
+        if (!phase_read_out) {
+            throw std::runtime_error("failed to open phase-read output: " + opts.phase_read_tsv);
+        }
+        write_phase_read_tsv_header(phase_read_out);
+    }
+
     size_t n_variants = 0;
     size_t n_read_support_rows = 0;
+    size_t n_phase_read_rows = 0;
     size_t batch_begin = 0;
     while (batch_begin < chunks.size()) {
         size_t batch_end = batch_begin + 1;
@@ -639,6 +604,12 @@ void run_collect_bam_variation(const Options& opts) {
                 write_read_support_rows(read_support_out, header.get(), rows);
             }
         }
+        if (!opts.phase_read_tsv.empty()) {
+            for (const BamChunk& ch : batch.chunks) {
+                n_phase_read_rows += ch.reads.size();
+                write_phase_read_tsv_rows(phase_read_out, header.get(), ch);
+            }
+        }
 
         batch_begin = batch_end;
     }
@@ -653,6 +624,10 @@ void run_collect_bam_variation(const Options& opts) {
     if (!opts.read_support_tsv.empty()) {
         std::cerr << "Wrote " << n_read_support_rows << " read x candidate observations to "
                   << opts.read_support_tsv << "\n";
+    }
+    if (!opts.phase_read_tsv.empty()) {
+        std::cerr << "Wrote " << n_phase_read_rows << " per-read phasing rows to " << opts.phase_read_tsv
+                  << "\n";
     }
 }
 
@@ -684,7 +659,8 @@ enum LongOption {
     kMaxNoisyFracOption,
     kNoisySlideWinOption,
     kDebugSiteOption,
-    kInputIsListOption
+    kInputIsListOption,
+    kPhaseReadTsvOption
 };
 
 /**
@@ -736,6 +712,7 @@ static void print_collect_help() {
         << "  -o, --output FILE             Output TSV file [output.tsv]\n"
         << "  -v, --vcf-output FILE         Optional VCF output for collected candidates\n"
         << "      --read-support FILE       Per-read ref/alt observations at candidates (for phasing)\n"
+        << "      --phase-read-tsv FILE     Per-read HAP / PHASE_SET after k-means phasing\n"
         << "      --chunk-size INT          Region chunk size in bp [500000]\n"
         << "      --noisy-merge-dis INT     Max distance (bp) to merge noisy/SV windows [500]\n"
         << "      --min-sv-len INT          min_sv_len for noisy-region cgranges merge [30]\n"
@@ -746,6 +723,7 @@ static void print_collect_help() {
         << "      --strand-bias-pval FLOAT  max p-value for ONT strand filter [0.01]\n"
         << "      --noisy-max-xgaps INT     max indel len (bp) for STR/homopolymer flags [5]\n"
         << "      --min-noisy-reg-total-depth INT   Min reads overlapping a noisy region to keep it [0 off; 5 = paper]\n"
+        << "  -V, --verbose INT            Verbosity level; 2 prints longcallD-style noisy-region logs [0]\n"
         << "\n"
         << "Regions can also be supplied after <input.bam|bam.list>, e.g.\n"
         << "  pgphase collect-bam-variation ref.fa hifi.bam chr11:1000-2000 chr12:1-500\n";
@@ -787,6 +765,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"output",                    required_argument, nullptr, 'o'},
         {"vcf-output",                required_argument, nullptr, 'v'},
         {"read-support",              required_argument, nullptr, kReadSupportOption},
+        {"phase-read-tsv",            required_argument, nullptr, kPhaseReadTsvOption},
         {"chunk-size",                required_argument, nullptr, kChunkSizeOption},
         {"noisy-merge-dis",           required_argument, nullptr, kNoisyRegMergeDisOption},
         {"min-sv-len",                required_argument, nullptr, kMinSvLenOption},
@@ -800,6 +779,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"strand-bias-pval",          required_argument, nullptr, kStrandBiasPvalOption},
         {"noisy-max-xgaps",           required_argument, nullptr, kNoisyMaxXgapsOption},
         {"min-noisy-reg-total-depth", required_argument, nullptr, kMinNoisyRegTotalDepthOption},
+        {"verbose",                  required_argument, nullptr, 'V'},
         {"help",                      no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
     };
@@ -818,7 +798,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         read_technology_was_set = true;
     };
 
-    while ((opt = getopt_long(argc, argv, "t:q:B:D:r:R:aj:o:v:hX:L", long_options, &long_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:q:B:D:r:R:aj:o:v:hX:LV:", long_options, &long_index)) != -1) {
         switch (opt) {
             case 't': opts.threads = std::stoi(optarg); break;
             case 'q': opts.min_mapq = std::stoi(optarg); break;
@@ -836,6 +816,7 @@ int collect_bam_variation(int argc, char* argv[]) {
             case 'o': opts.output_tsv = optarg; break;
             case 'v': opts.output_vcf = optarg; break;
             case kReadSupportOption:    opts.read_support_tsv = optarg; break;
+            case kPhaseReadTsvOption:   opts.phase_read_tsv = optarg; break;
             case kChunkSizeOption:      opts.chunk_size = std::stoll(optarg); break;
             case kNoisyRegMergeDisOption: opts.noisy_reg_merge_dis = std::stoi(optarg); break;
             case kMinSvLenOption:       opts.min_sv_len = std::stoi(optarg); break;
@@ -851,6 +832,7 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kMinNoisyRegTotalDepthOption:
                 opts.min_noisy_reg_total_depth = std::stoi(optarg);
                 break;
+            case 'V': opts.verbose = std::stoi(optarg); break;
             case 'h': print_collect_help(); return 0;
             default:  print_collect_help(); return 1;
         }
@@ -862,7 +844,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         opts.strand_bias_pval < 0.0 || opts.strand_bias_pval > 1.0 ||
         opts.max_var_ratio_per_read < 0.0 || opts.max_noisy_frac_per_read < 0.0 ||
         opts.noisy_reg_max_xgaps < 0 || opts.min_noisy_reg_total_depth < 0 ||
-        opts.noisy_reg_slide_win < -1) {
+        opts.noisy_reg_slide_win < -1 || opts.verbose < 0) {
         std::cerr << "Error: numeric thresholds are invalid\n";
         return 1;
     }
