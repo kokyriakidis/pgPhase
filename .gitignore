@@ -1,6 +1,12 @@
 # Build outputs
 /pgphase
 /pgphase_*
+/dist/
+/release/
+*.tar
+*.tar.gz
+*.tgz
+*.zip
 *.o
 *.a
 *.so
