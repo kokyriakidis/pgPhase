@@ -31,12 +31,21 @@ OBJS += $(EDLIB_OBJ)
 
 LDFLAGS ?= -lhts -lm -lz -lpthread
 
-.PHONY: all clean check third-party-libs
+.PHONY: all clean check third-party-libs portable-bundle release release-strict
 
 all: pgphase
 
 check: pgphase
 	bash scripts/validate_collect_gates.sh
+
+portable-bundle: pgphase
+	bash scripts/make_portable_bundle.sh
+
+release: pgphase
+	bash scripts/make_release_bundle.sh
+
+release-strict: pgphase
+	RUN_CHECKS=1 bash scripts/make_release_bundle.sh
 
 src/align.o: src/align.cpp
 	$(CXX) $(CXXFLAGS) $(ALIGN_CPPFLAGS) -c $< -o $@
