@@ -1,4 +1,4 @@
-# pgPhase
+# pgphase
 
 ## Portable binary bundle (Linux/macOS)
 
