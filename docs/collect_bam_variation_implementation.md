@@ -13,6 +13,23 @@ The implementation is organized as a **staged pipeline** so that memory stays bo
 
 Together, these files implement “longcallD-shaped” candidate collection in C++17 with explicit streaming and multi-BAM pooling.
 
+### Reading guide and conventions
+
+This document is organized in execution order. Sections `§1`–`§23` describe algorithmic stages and output
+contracts; `§24`–`§28` provide reproducibility, boundary, parity-log, and runtime guard material.
+
+Coordinate conventions used throughout:
+
+- Genomic intervals in pipeline state are primarily **1-based inclusive**.
+- `htslib`/`cgranges` operations are **0-based half-open** and are converted at boundaries.
+- Indels follow VCF anchor semantics (`sort_pos = pos - 1` for insertions/deletions).
+
+Representation conventions used throughout:
+
+- Candidate TSV is the internal explanatory surface (includes filtered categories).
+- Optional VCF/phased VCF outputs are projected call surfaces (category/depth gated).
+- Same-position multi-allelic behavior is represented as multiple biallelic records when alleles survive gates.
+
 ### Source documentation (Doxygen)
 
 The `collect_*` sources and headers are written for **Doxygen-style** extraction:
@@ -671,6 +688,23 @@ These remain separate candidate sites.
 
 **Deletions (no fuzzy length merge):** longcallD `exact_comp_var_site_ins` applies the 0.8 length rule **only to large insertions**. Deletions are the same site only when they share the same breakpoint and **`ref_len`** (deletion length on the reference). Two deletions at the same position with **different** lengths (e.g. 40 bp vs 50 bp) remain **separate** candidate rows—there is no longcallD-style fuzzy merge for large DELs, and pgPhase matches that.
 
+### 10.1 Worked Case: Same-Position Multi-Length Deletions (`chr11:1255550`)
+
+At `chr11:1255550`, two phased deletion rows may be emitted with different lengths (for example
+`SVLEN=-118` and `SVLEN=-236`). This follows directly from the deletion keying and downstream gates:
+
+1. Candidate construction keeps deletions with different `ref_len` as separate rows (no deletion fuzzy merge).
+2. Allele counting accumulates support independently per deletion length.
+3. Noisy-region classification and Step 4 noisy MSA recall remove weak/unstable alternatives and retain
+   supported alleles.
+4. Phasing (`§18`, Step 3.2 + Step 4 re-run when applicable) assigns hap-consensus state per surviving row.
+5. Projected phased VCF emission (`§22.1`) writes one biallelic record per surviving deletion allele with
+   its own `GT:PS`.
+
+Therefore, multiple raw deletion representations at the same anchor can collapse to exactly two emitted
+phased deletion records when those two are the only alleles that survive support, noisy-region, and
+projection gates.
+
 The sort order is deterministic and longcallD-compatible. It compares:
 
 ```text
@@ -1255,6 +1289,8 @@ After the clean-category k-means pass, pgPhase mirrors longcallD step 4 on final
 5. Update noisy coverage/profile fields (`total_cov`, `ref_cov`, `alt_cov`, `LQC`) from full-cover reads.
 6. Re-run read profiling and k-means with `kCandGermlineVarCate` when new variants were added.
 
+Step 4 re-phasing can modify pre-existing within-chunk hap assignments and phase-set structure, not only phase newly recovered sites.
+
 Implementation details aligned to longcallD:
 
 - **Call order parity:** `collect_reg_ref_bseq` runs before `collect_noisy_reg_reads` so read extraction uses the clipped noisy boundaries.
@@ -1340,6 +1376,7 @@ Projected phased VCF output derives GT orientation from `hap_to_cons_alle`.
 ### 19.2 Phase-Set Anchor Semantics
 
 `min_cur_ps` is the earliest phase-set anchor among boundary-spanning reads in the current chunk; `max_pre_ps` is the latest anchor among the matching reads in the previous chunk. After stitching, all variants and reads that carried `min_cur_ps` now carry `max_pre_ps`, effectively **extending the previous chunk's phase block** into the current one and merging them into a single continuous block.
+`min_cur_ps` is the earliest phase-set anchor among boundary-spanning reads in the current chunk; `max_pre_ps` is the latest anchor among matching reads in the previous chunk. After stitching, candidate rows in the current chunk carrying `min_cur_ps` are rewritten to `max_pre_ps`, effectively extending the previous chunk’s phase block into the current chunk when boundary evidence supports it.
 
 ### 19.3 Worked Example — No Flip Needed
 
@@ -1377,10 +1414,6 @@ C1 variants with ps=500000:
   hap_to_cons_alle[1] ↔ [2] swapped
   hap_alt: 1→2, 2→1;  hap_ref: 1→2, 2→1
   phase_set: 500000 → 450000
-
-C1 reads with ps=500000:
-  haps: 1→2, 2→1
-  phase_sets: 500000 → 450000
 
 Result: C1 labels are coherent with C0; both in one phase block anchored at 450000.
 ```
