@@ -1827,6 +1827,26 @@ refined phased BAM : pgphase == longcallD (0 diff lines)
 
 The zero-diff check is done on sorted SAM views of emitted BAMs, ensuring record-order neutrality.
 
+### 23.1.9 Output alignment indexing (`.bai` / `.crai`)
+
+After phased alignment writing completes, pgPhase now auto-indexes binary alignment outputs:
+
+```text
+if output format == BAM  -> build .bai
+if output format == CRAM -> build .crai
+if output format == SAM  -> no index
+```
+
+Implementation details:
+
+- `collect_pipeline.cpp` closes the phased writer first (`phased_aln_writer.reset()`), ensuring all
+  records are flushed to disk before indexing.
+- Index creation uses HTSlib `sam_index_build(output_path, 0)`.
+- Failure to index is treated as a hard runtime error (`failed to index output alignment: <path>`).
+
+This mirrors practical longcallD workflows where output BAM/CRAM is expected to be immediately
+queryable in IGV/samtools without a manual follow-up `samtools index` step.
+
 ## 24. Determinism and Reproducibility
 
 Several implementation choices are designed to make output deterministic:
@@ -1848,6 +1868,22 @@ bash scripts/compare_phased_vcf.sh chr11 --ont
 ```
 
 The script passes the selected mode flag through to `pgphase` and keys same-position multi-allelic records by ALT for non-SVLEN records, avoiding false diffs from key collapse.
+
+For phased BAM parity validation, two helper scripts are available:
+
+```text
+bash scripts/verify_refine_bam_parity.sh
+  Runs pgPhase + longcallD in normal and --refine-aln modes,
+  diffs sorted SAM output, and reports pass/fail.
+
+bash scripts/verify_refine_regression.sh
+  Runs pgPhase only (no longcallD dependency),
+  compares sorted SAM SHA-256 hashes against pinned known-good values
+  for normal and --refine-aln fixtures.
+```
+
+`verify_refine_regression.sh` also prints offending unified-diff lines when a hash mismatch is
+detected (first 200 lines for normal/refine), and preserves temp artifacts for inspection on fail.
 
 ## 25. Non-Goals and Current Boundaries
 

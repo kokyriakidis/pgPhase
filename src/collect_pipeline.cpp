@@ -30,6 +30,8 @@
 #include <thread>
 #include <vector>
 
+#include <htslib/sam.h>
+
 namespace pgphase_collect {
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -719,10 +721,23 @@ void run_collect_bam_variation(const Options& opts) {
                   << "\n";
     }
     if (!opts.output_aln.empty()) {
+        // Ensure output handle is closed/flushed before indexing.
+        phased_aln_writer.reset();
         if (opts.output_aln_format == OutputAlignmentFormat::Cram) {
             std::cerr << "Output " << n_out_aln_reads << " reads to CRAM\n";
         } else {
             std::cerr << "Output " << n_out_aln_reads << " reads to BAM\n";
+        }
+        if (opts.output_aln_format == OutputAlignmentFormat::Bam ||
+            opts.output_aln_format == OutputAlignmentFormat::Cram) {
+            if (sam_index_build(opts.output_aln.c_str(), 0) != 0) {
+                throw std::runtime_error("failed to index output alignment: " + opts.output_aln);
+            }
+            if (opts.output_aln_format == OutputAlignmentFormat::Cram) {
+                std::cerr << "Indexed output CRAM: " << opts.output_aln << ".crai\n";
+            } else {
+                std::cerr << "Indexed output BAM: " << opts.output_aln << ".bai\n";
+            }
         }
     }
 }
