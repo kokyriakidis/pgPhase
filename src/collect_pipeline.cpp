@@ -10,6 +10,7 @@
 #include "collect_pipeline.hpp"
 
 #include "bam_digar.hpp"
+#include "collect_bam_output.hpp"
 #include "collect_output.hpp"
 #include "collect_phase.hpp"
 #include "collect_var.hpp"
@@ -400,15 +401,18 @@ static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerC
  *   - read_var_profile   — longcallD never frees it in mid or post_free
  *   - haps, phase_sets, up/down_ovlp_read_i, candidates — needed for stitching/output
  */
-static void mid_free_chunk(BamChunk& chunk) {
+static void mid_free_chunk(BamChunk& chunk, const Options& opts) {
     // mirrors bam_chunk_free_digar: per-read digar ops, base quals, noisy sub-intervals
-    for (ReadRecord& r : chunk.reads) {
-        r.digars.clear();
-        r.digars.shrink_to_fit();
-        r.qual.clear();
-        r.qual.shrink_to_fit();
-        r.noisy_regions.clear();
-        r.noisy_regions.shrink_to_fit();
+    const bool keep_digars_for_refine = !opts.output_aln.empty() && opts.refine_aln;
+    if (!keep_digars_for_refine) {
+        for (ReadRecord& r : chunk.reads) {
+            r.digars.clear();
+            r.digars.shrink_to_fit();
+            r.qual.clear();
+            r.qual.shrink_to_fit();
+            r.noisy_regions.clear();
+            r.noisy_regions.shrink_to_fit();
+        }
     }
     // mirrors cr_destroy(low_comp_cr)
     chunk.low_complexity_regions.clear();
@@ -449,7 +453,7 @@ static BamChunk process_chunk(const RegionChunk& region,
     chunk.region = region;
     load_and_prepare_chunk(chunk, opts, context);
     collect_var_main(chunk, opts, context.primary_header(), read_support_out);
-    mid_free_chunk(chunk);
+    mid_free_chunk(chunk, opts);
     return chunk;
 }
 
@@ -648,10 +652,15 @@ void run_collect_bam_variation(const Options& opts) {
         }
         write_phase_read_tsv_header(phase_read_out);
     }
+    std::unique_ptr<PhasedAlignmentWriter> phased_aln_writer;
+    if (!opts.output_aln.empty()) {
+        phased_aln_writer = std::make_unique<PhasedAlignmentWriter>(opts, header.get());
+    }
 
     size_t n_variants = 0;
     size_t n_read_support_rows = 0;
     size_t n_phase_read_rows = 0;
+    size_t n_out_aln_reads = 0;
     size_t batch_begin = 0;
     while (batch_begin < chunks.size()) {
         size_t batch_end = batch_begin + 1;
@@ -684,6 +693,9 @@ void run_collect_bam_variation(const Options& opts) {
                 write_phase_read_tsv_rows(phase_read_out, header.get(), ch);
             }
         }
+        if (phased_aln_writer) {
+            n_out_aln_reads += static_cast<size_t>(phased_aln_writer->write_chunks(batch.chunks));
+        }
 
         batch_begin = batch_end;
     }
@@ -705,6 +717,13 @@ void run_collect_bam_variation(const Options& opts) {
     if (!opts.phase_read_tsv.empty()) {
         std::cerr << "Wrote " << n_phase_read_rows << " per-read phasing rows to " << opts.phase_read_tsv
                   << "\n";
+    }
+    if (!opts.output_aln.empty()) {
+        if (opts.output_aln_format == OutputAlignmentFormat::Cram) {
+            std::cerr << "Output " << n_out_aln_reads << " reads to CRAM\n";
+        } else {
+            std::cerr << "Output " << n_out_aln_reads << " reads to BAM\n";
+        }
     }
 }
 
@@ -737,6 +756,7 @@ enum LongOption {
     kNoisySlideWinOption,
     kDebugSiteOption,
     kInputIsListOption,
+    kRefineAlnOption,
     kPhaseReadTsvOption,
     kPhasedVcfOutputOption
 };
@@ -790,6 +810,11 @@ static void print_collect_help() {
         << "  -o, --output FILE             Output TSV file [output.tsv]\n"
         << "  -v, --vcf-output FILE         Optional VCF output for collected candidates\n"
         << "      --phased-vcf-output FILE  Optional phased VCF (GT:PS from hap/phase_set scaffold)\n"
+        << "  -S/b/C --out-sam/bam/cram FILE\n"
+        << "                                output phased SAM/BAM/CRAM file []\n"
+        << "                                note: multiple input BAM/CRAM files will be merged in SAM/BAM/CRAM output\n"
+        << "      --refine-aln              refine alignment in SAM/BAM/CRAM output\n"
+        << "                                note: output SAM/BAM/CRAM may be unsorted when --refine-aln is set\n"
         << "      --read-support FILE       Per-read ref/alt observations at candidates (for phasing)\n"
         << "      --phase-read-tsv FILE     Per-read HAP / PHASE_SET after k-means phasing\n"
         << "      --chunk-size INT          Region chunk size in bp [500000]\n"
@@ -824,6 +849,14 @@ static void print_collect_help() {
 int collect_bam_variation(int argc, char* argv[]) {
     using namespace pgphase_collect;
     Options opts;
+    {
+        std::ostringstream cmd;
+        cmd << "pgphase collect-bam-variation";
+        for (int i = 1; i < argc; ++i) {
+            cmd << ' ' << argv[i];
+        }
+        opts.command_line = cmd.str();
+    }
     std::vector<std::string> extra_bam_files;
     optind = 1;
 
@@ -844,6 +877,10 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"output",                    required_argument, nullptr, 'o'},
         {"vcf-output",                required_argument, nullptr, 'v'},
         {"phased-vcf-output",         required_argument, nullptr, kPhasedVcfOutputOption},
+        {"out-sam",                   required_argument, nullptr, 'S'},
+        {"out-bam",                   required_argument, nullptr, 'b'},
+        {"out-cram",                  required_argument, nullptr, 'C'},
+        {"refine-aln",                no_argument,       nullptr, kRefineAlnOption},
         {"read-support",              required_argument, nullptr, kReadSupportOption},
         {"phase-read-tsv",            required_argument, nullptr, kPhaseReadTsvOption},
         {"chunk-size",                required_argument, nullptr, kChunkSizeOption},
@@ -878,7 +915,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         read_technology_was_set = true;
     };
 
-    while ((opt = getopt_long(argc, argv, "t:q:B:D:r:R:aj:o:v:hX:LV:", long_options, &long_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:q:B:D:r:R:aj:o:v:S:b:C:hX:LV:", long_options, &long_index)) != -1) {
         switch (opt) {
             case 't': opts.threads = std::stoi(optarg); break;
             case 'q': opts.min_mapq = std::stoi(optarg); break;
@@ -895,7 +932,20 @@ int collect_bam_variation(int argc, char* argv[]) {
             case 'f': opts.include_filtered = true; break;
             case 'o': opts.output_tsv = optarg; break;
             case 'v': opts.output_vcf = optarg; break;
+            case 'S':
+                opts.output_aln = optarg;
+                opts.output_aln_format = OutputAlignmentFormat::Sam;
+                break;
+            case 'b':
+                opts.output_aln = optarg;
+                opts.output_aln_format = OutputAlignmentFormat::Bam;
+                break;
+            case 'C':
+                opts.output_aln = optarg;
+                opts.output_aln_format = OutputAlignmentFormat::Cram;
+                break;
             case kPhasedVcfOutputOption: opts.output_phased_vcf = optarg; break;
+            case kRefineAlnOption:      opts.refine_aln = true; break;
             case kReadSupportOption:    opts.read_support_tsv = optarg; break;
             case kPhaseReadTsvOption:   opts.phase_read_tsv = optarg; break;
             case kChunkSizeOption:      opts.chunk_size = std::stoll(optarg); break;

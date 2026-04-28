@@ -1653,6 +1653,180 @@ For phasing, this file is valuable because it converts the candidate set into re
 
 The read-support output uses the same candidate table as the TSV. Consequently, it can include observations for candidates that are later classified as filtered categories. A phasing stage combines read-support rows with the candidate category table and selects categories appropriate for the intended phasing model.
 
+## 23.1 Optional Phased Alignment Output (SAM/BAM/CRAM)
+
+If `-S`, `-b`, or `-C` is provided, `collect-bam-variation` emits a phased alignment stream with
+`HP`/`PS` tags, following longcallD `write_read_to_bam` behavior. This output can be emitted in:
+
+```text
+-S / --out-sam   FILE   text SAM
+-b / --out-bam   FILE   BAM
+-C / --out-cram  FILE   CRAM (requires reference)
+```
+
+`--refine-aln` enables longcallD-style alignment refinement before writing phased reads.
+
+### 23.1.1 CLI and mode semantics
+
+Implementation surface:
+
+- `collect_pipeline.cpp` parses `-S/-b/-C` into `Options::output_aln` + `Options::output_aln_format`.
+- `--refine-aln` sets `Options::refine_aln`.
+- `Options::command_line` stores the full CLI string for `@PG CL`.
+
+Mode selection is **flag-driven**, not filename-extension-driven:
+
+```text
+-S -> hts mode "w"
+-b -> hts mode "wb"
+-C -> hts mode "wc"
+```
+
+This matches longcallD's output-open behavior (`hts_open` mode selected by CLI option).
+
+### 23.1.2 Writer construction and header behavior
+
+The writer lives in `collect_bam_output.cpp` (`PhasedAlignmentWriter`).
+
+On construction:
+
+1. Open output alignment handle (`hts_open` with mode above).
+2. For CRAM output, bind reference (`hts_set_fai_filename`) for encoding.
+3. Set output threads (`hts_set_threads`).
+4. Duplicate input header and add `@PG` line:
+   - `ID=pgphase`
+   - `VN=0.0.0`
+   - `CL=<captured command line>`
+5. Write output header (`sam_hdr_write`).
+6. Open all input BAM/CRAM files again for write-back iteration and load their headers/indexes.
+
+Failure handling is longcallD-style fatal behavior in this path (error message + immediate terminate),
+not deferred exception recovery.
+
+### 23.1.3 Read iteration and overlap-skipping model
+
+For each processed chunk, the writer re-iterates input BAM records over that chunk interval:
+
+```text
+iter = sam_itr_queryi(idx, tid, reg_beg-1, reg_end)
+```
+
+Per input BAM partition `bi`, longcallD-style overlap bookkeeping is used:
+
+- `chunk.up_ovlp_read_i[bi]` controls how many already-emitted **processed** reads to skip.
+- `chunk.n_up_ovlp_skip_reads[bi]` controls how many already-emitted **unprocessed** reads to skip.
+
+This prevents duplicate output for reads that span adjacent chunks while preserving full per-chunk
+stream behavior.
+
+Filtering inside the write loop mirrors longcallD:
+
+```text
+unprocessed if:
+  BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY
+  or MAPQ < min_mapq
+```
+
+Unprocessed records are still written (after overlap-skip), but `HP`/`PS` are stripped.
+
+### 23.1.4 HP/PS tagging rules
+
+For processed records:
+
+- `HP`:
+  - set/update when `hap != 0`
+  - remove when `hap == 0`
+- `PS`:
+  - set/update when `phase_set > 0`
+  - remove when `phase_set <= 0`
+
+Tag type and append semantics match longcallD (`'i'`, 4-byte payload).
+If tag exists and value is unchanged, it is left untouched; if value differs, old tag is removed and
+new value appended.
+
+### 23.1.5 `--refine-aln` behavior
+
+When `--refine-aln` is enabled, processed reads run through `refine_bam1` before tag write:
+
+1. Set `core.pos` from first digar position (`1-based -> BAM 0-based`).
+2. Rebuild CIGAR from read digars using longcallD merge behavior (`longcalld_push_cigar` equivalent):
+   - adjacent same op merged by length accumulation,
+   - hard clips in primary (non-supplementary) CIGAR converted to soft clips.
+3. If old/new CIGAR differ:
+   - rebuild BAM data layout (QNAME + new CIGAR + rest of payload),
+   - update `core.n_cigar`, `l_data`.
+4. Recompute auxiliary tags (if present):
+   - `NM` from SNP/INS/DEL edit counts,
+   - `MD` from ref-aligned mismatch/deletion trace,
+   - `cs` from digar operations and reference bases.
+
+Important parity detail:
+
+```text
+NM/MD/cs are updated only when those tags already exist on the record,
+matching longcallD update_bam1_tags behavior.
+```
+
+So this path does not synthesize missing `MD`/`cs`; it updates existing tags when refined alignment
+changes them.
+
+### 23.1.6 Post-MSA digar rewrite (critical for refine parity)
+
+A strict parity-critical step occurs before final BAM refinement in noisy regions:
+
+- `align.cpp` now performs longcallD-style post-MSA digar rewrite
+  (`update_digars_from_aln_str` / `update_digars_from_msa1` equivalents),
+  using:
+  - left/right digar chopping helpers,
+  - full/left/right MSA digar reconstruction,
+  - longcallD merge semantics for rebuilt digars.
+
+This rewrite is gated exactly to refine-alignment output mode:
+
+```text
+n_cons > 0 && opts.refine_aln && !opts.output_aln.empty()
+```
+
+Without this rewrite, refine output can still be close, but CIGAR/NM parity diverges at noisy loci.
+With it enabled, refined BAM parity aligns with longcallD for the tested fixtures.
+
+### 23.1.7 Worked behavior example
+
+Example command:
+
+```text
+pgphase collect-bam-variation -t1 --hifi --refine-aln \
+  -b phased_refined.bam ref.fa sample.bam chr11:1255000-1260000 -o out.tsv
+```
+
+For each processed read in chunk:
+
+```text
+chunk haps/phase_sets -> update HP/PS
+chunk digars          -> refine CIGAR/POS
+existing NM/MD/cs     -> rewrite to refined values
+write BAM record
+```
+
+For each filtered/unprocessed read:
+
+```text
+strip HP/PS
+write original alignment payload unchanged
+```
+
+### 23.1.8 Validation and parity status
+
+On the repository parity dataset (`test_data/HG002_chr11_hifi_test.bam`,
+`chr11:1255000-1260000`), after the strict parity ports in this path:
+
+```text
+normal phased BAM  : pgphase == longcallD (0 diff lines)
+refined phased BAM : pgphase == longcallD (0 diff lines)
+```
+
+The zero-diff check is done on sorted SAM views of emitted BAMs, ensuring record-order neutrality.
+
 ## 24. Determinism and Reproducibility
 
 Several implementation choices are designed to make output deterministic:

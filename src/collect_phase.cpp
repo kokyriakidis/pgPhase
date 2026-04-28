@@ -674,11 +674,19 @@ static void flip_chunk_hap(BamChunk& pre, BamChunk& cur) {
             if (v.phase_set != min_cur_ps) continue;
             std::swap(v.hap_to_cons_alle[1], v.hap_to_cons_alle[2]);
         }
+        for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
+            if (cur.reads[read_i].is_skipped || cur.haps[read_i] == 0) continue;
+            if (cur.phase_sets[read_i] == min_cur_ps) cur.haps[read_i] = 3 - cur.haps[read_i];
+        }
     }
     if (max_pre_ps != -1 && min_cur_ps != INT64_MAX) {
         for (CandidateVariant& v : cur.candidates) {
             if (v.phase_set == -1) continue;
             if (v.phase_set == min_cur_ps) v.phase_set = max_pre_ps;
+        }
+        for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
+            if (cur.phase_sets[read_i] == -1) continue;
+            if (cur.phase_sets[read_i] == min_cur_ps) cur.phase_sets[read_i] = max_pre_ps;
         }
     }
 }

@@ -409,19 +409,6 @@ bool deletion_is_low_quality(const bam1_t* aln, int qi, int min_bq) {
  */
 void append_digar(std::vector<DigarOp>& digars, DigarOp op) {
     if (op.len <= 0) return;
-    if (!digars.empty()) {
-        DigarOp& prev = digars.back();
-        // longcallD `push_digar1` (eqx/MD) never coalesces adjacent INS/DEL; only the separate
-        // `push_digar_alt_seq` path can merge, and the EQX loop uses one digar per CIGAR op.
-        // Coalescing I+I here (same low_qual) can make alt lengths and sort order differ from
-        // longcallD so `exact_comp_var_site_ins` dedup in `collect_all_cand_var_sites` no longer
-        // lines up. Merge **Equal** runs only.
-        const bool mergeable = prev.type == op.type && prev.low_quality == op.low_quality && op.type == DigarType::Equal;
-        if (mergeable) {
-            prev.len += op.len;
-            return;
-        }
-    }
     digars.push_back(std::move(op));
 }
 

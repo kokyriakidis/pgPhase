@@ -294,6 +294,331 @@ NoisyReadInfo collect_noisy_read_info(const Options& opts, const BamChunk& chunk
     return info;
 }
 
+static inline int digar_type_to_bam_op(DigarType t) {
+    switch (t) {
+        case DigarType::Equal: return BAM_CEQUAL;
+        case DigarType::Snp: return BAM_CDIFF;
+        case DigarType::Insertion: return BAM_CINS;
+        case DigarType::Deletion: return BAM_CDEL;
+        case DigarType::SoftClip: return BAM_CSOFT_CLIP;
+        case DigarType::HardClip: return BAM_CHARD_CLIP;
+        case DigarType::RefSkip: return BAM_CREF_SKIP;
+    }
+    return BAM_CEQUAL;
+}
+
+static inline DigarType bam_op_to_digar_type(int op) {
+    switch (op) {
+        case BAM_CEQUAL: return DigarType::Equal;
+        case BAM_CDIFF: return DigarType::Snp;
+        case BAM_CINS: return DigarType::Insertion;
+        case BAM_CDEL: return DigarType::Deletion;
+        case BAM_CSOFT_CLIP: return DigarType::SoftClip;
+        case BAM_CHARD_CLIP: return DigarType::HardClip;
+        case BAM_CREF_SKIP: return DigarType::RefSkip;
+        default: return DigarType::Equal;
+    }
+}
+
+static inline bool same_digar_for_merge(const DigarOp& a, const DigarOp& b) {
+    const int aop = digar_type_to_bam_op(a.type);
+    if (aop != BAM_CEQUAL && aop != BAM_CINS && aop != BAM_CDEL) return false;
+    return a.type == b.type && a.low_quality == b.low_quality;
+}
+
+static inline void push_digar0(std::vector<DigarOp>& out, const DigarOp& d) {
+    if (d.len <= 0) return;
+    if (out.empty() || !same_digar_for_merge(out.back(), d)) {
+        out.push_back(d);
+        return;
+    }
+    if (out.back().type == DigarType::Insertion) {
+        out.back().alt += d.alt;
+    }
+    out.back().len += d.len;
+}
+
+static inline void push_digar_alt_seq(std::vector<DigarOp>& out, const DigarOp& d) {
+    if (d.len <= 0) return;
+    if (out.empty() || !same_digar_for_merge(out.back(), d)) {
+        out.push_back(d);
+        return;
+    }
+    if (out.back().type == DigarType::Insertion) {
+        out.back().alt += d.alt;
+    }
+    out.back().len += d.len;
+}
+
+static inline int digar_q_end(const DigarOp& d) {
+    const int op = digar_type_to_bam_op(d.type);
+    if (op == BAM_CDIFF || op == BAM_CEQUAL || op == BAM_CINS) return d.qi + d.len - 1;
+    return d.qi;
+}
+
+static inline hts_pos_t digar_ref_end(const DigarOp& d) {
+    const int op = digar_type_to_bam_op(d.type);
+    if (op == BAM_CDIFF || op == BAM_CEQUAL || op == BAM_CDEL) return d.pos + d.len - 1;
+    return d.pos;
+}
+
+static std::vector<DigarOp> collect_left_digars(const std::vector<DigarOp>& digars,
+                                                 int read_noisy_beg,
+                                                 hts_pos_t ref_noisy_beg) {
+    std::vector<DigarOp> left;
+    for (size_t i = 0; i < digars.size(); ++i) {
+        const DigarOp& d = digars[i];
+        const int op = digar_type_to_bam_op(d.type);
+        if (i == 0 && (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP)) {
+            push_digar0(left, d);
+            continue;
+        }
+        const int dq_end = digar_q_end(d);
+        const hts_pos_t dr_end = digar_ref_end(d);
+        if (d.qi >= read_noisy_beg && d.pos >= ref_noisy_beg) break;
+        if (dq_end < read_noisy_beg && dr_end < ref_noisy_beg) {
+            push_digar0(left, d);
+        } else if (dq_end >= read_noisy_beg || dr_end >= ref_noisy_beg) {
+            DigarOp c = d;
+            if (op == BAM_CINS || op == BAM_CEQUAL || op == BAM_CDIFF) {
+                c.len = read_noisy_beg - c.qi;
+            } else if (op == BAM_CDEL) {
+                c.len = static_cast<int>(ref_noisy_beg - c.pos);
+            }
+            push_digar0(left, c);
+            break;
+        }
+    }
+    return left;
+}
+
+static std::vector<DigarOp> collect_right_digars(const std::vector<DigarOp>& digars,
+                                                  int read_noisy_end,
+                                                  hts_pos_t ref_noisy_end) {
+    std::vector<DigarOp> right;
+    for (size_t i = 0; i < digars.size(); ++i) {
+        const DigarOp& d = digars[i];
+        const int op = digar_type_to_bam_op(d.type);
+        if (i + 1 == digars.size() && (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP)) {
+            push_digar0(right, d);
+            continue;
+        }
+        const int dq_end = digar_q_end(d);
+        const hts_pos_t dr_end = digar_ref_end(d);
+        if (dq_end <= read_noisy_end && dr_end <= ref_noisy_end) continue;
+        if (d.qi > read_noisy_end && d.pos > ref_noisy_end) {
+            push_digar0(right, d);
+        } else if (d.qi <= read_noisy_end || d.pos <= ref_noisy_end) {
+            DigarOp c = d;
+            if (op == BAM_CINS || op == BAM_CEQUAL || op == BAM_CDIFF) {
+                c.len = dq_end - read_noisy_end;
+                c.qi = read_noisy_end + 1;
+                if (op == BAM_CINS && !d.alt.empty()) {
+                    const int shift = read_noisy_end + 1 - d.qi;
+                    if (shift >= 0 && shift < static_cast<int>(d.alt.size())) {
+                        c.alt = d.alt.substr(static_cast<size_t>(shift));
+                    } else {
+                        c.alt.clear();
+                    }
+                } else if (op != BAM_CINS) {
+                    c.pos = ref_noisy_end + 1;
+                }
+            } else if (op == BAM_CDEL) {
+                c.len = static_cast<int>(dr_end - ref_noisy_end);
+                c.pos = ref_noisy_end + 1;
+            }
+            push_digar0(right, c);
+        }
+    }
+    return right;
+}
+
+static std::vector<DigarOp> collect_full_msa_digars(int read_beg, hts_pos_t ref_beg,
+                                                     const AlnStr& ref_read) {
+    std::vector<DigarOp> out;
+    const int msa_len = ref_read.aln_len;
+    if (msa_len <= 0) return out;
+    int read_pos = read_beg;
+    hts_pos_t ref_pos = ref_beg;
+    for (int i = 0; i < msa_len; ++i) {
+        const uint8_t rb = ref_read.target_aln[static_cast<size_t>(i)];
+        const uint8_t qb = ref_read.query_aln [static_cast<size_t>(i)];
+        if (rb == 5 && qb == 5) continue;
+        if (qb != 5 && rb != 5) {
+            DigarOp d{ref_pos, qb == rb ? DigarType::Equal : DigarType::Snp, 1, read_pos, false, ""};
+            if (d.type == DigarType::Snp) d.alt = std::string(1, "ACGTN"[qb < 5 ? qb : 4]);
+            push_digar0(out, d);
+            ++read_pos;
+            ++ref_pos;
+        } else if (qb != 5) {
+            DigarOp d{ref_pos, DigarType::Insertion, 1, read_pos, false, std::string(1, "ACGTN"[qb < 5 ? qb : 4])};
+            push_digar0(out, d);
+            ++read_pos;
+        } else {
+            DigarOp d{ref_pos, DigarType::Deletion, 1, read_pos, false, ""};
+            push_digar0(out, d);
+            ++ref_pos;
+        }
+    }
+    return out;
+}
+
+static std::vector<DigarOp> collect_left_msa_digars(int read_beg, int read_end, int qlen,
+                                                     hts_pos_t ref_beg, const AlnStr& ref_read) {
+    std::vector<DigarOp> out;
+    const int msa_len = ref_read.aln_len;
+    if (msa_len <= 0) return out;
+    int read_pos = read_beg;
+    int read_end_pos = read_pos - 1;
+    hts_pos_t ref_pos = ref_beg;
+    int right_read_end = msa_len - 1;
+    int right_skipped = 0;
+    bool covered = false;
+    for (int i = msa_len - 1; i >= 0; --i) {
+        const uint8_t rb = ref_read.target_aln[static_cast<size_t>(i)];
+        const uint8_t qb = ref_read.query_aln [static_cast<size_t>(i)];
+        if (rb != 5) covered = true;
+        if (covered && qb != 5) { right_read_end = i; break; }
+        if (!covered && qb != 5) ++right_skipped;
+    }
+    for (int i = 0; i < msa_len; ++i) if (ref_read.query_aln[static_cast<size_t>(i)] != 5) ++read_end_pos;
+    for (int i = 0; i < msa_len; ++i) {
+        const uint8_t rb = ref_read.target_aln[static_cast<size_t>(i)];
+        const uint8_t qb = ref_read.query_aln [static_cast<size_t>(i)];
+        if (rb == 5 && qb == 5) continue;
+        if (qb != 5 && rb != 5) {
+            if (i <= right_read_end) {
+                DigarOp d{ref_pos, qb == rb ? DigarType::Equal : DigarType::Snp, 1, read_pos, false, ""};
+                if (d.type == DigarType::Snp) d.alt = std::string(1, "ACGTN"[qb < 5 ? qb : 4]);
+                push_digar0(out, d);
+            }
+            ++read_pos; ++ref_pos;
+        } else if (qb != 5) {
+            if (i <= right_read_end) {
+                DigarOp d{ref_pos, DigarType::Insertion, 1, read_pos, false, std::string(1, "ACGTN"[qb < 5 ? qb : 4])};
+                push_digar0(out, d);
+            }
+            ++read_pos;
+        } else {
+            if (i <= right_read_end) {
+                DigarOp d{ref_pos, DigarType::Deletion, 1, read_pos, false, ""};
+                push_digar0(out, d);
+            }
+            ++ref_pos;
+        }
+    }
+    if (read_end_pos < qlen - 1 || right_skipped > 0) {
+        DigarOp d{ref_pos, DigarType::SoftClip, qlen - 1 - read_end_pos + right_skipped, read_end_pos + 1, false, ""};
+        push_digar0(out, d);
+    }
+    return out;
+}
+
+static std::vector<DigarOp> collect_right_msa_digars(int read_end, hts_pos_t ref_beg, hts_pos_t ref_end,
+                                                      const AlnStr& ref_read) {
+    std::vector<DigarOp> out;
+    const int msa_len = ref_read.aln_len;
+    if (msa_len <= 0) return out;
+    int read_pos = read_end + 1;
+    hts_pos_t ref_pos = ref_beg;
+    hts_pos_t ref_cursor = ref_end + 1;
+    int left_read_start = 0;
+    int left_skipped = 0;
+    bool covered = false;
+    for (int i = 0; i < msa_len; ++i) {
+        const uint8_t rb = ref_read.target_aln[static_cast<size_t>(i)];
+        const uint8_t qb = ref_read.query_aln [static_cast<size_t>(i)];
+        if (rb != 5) covered = true;
+        if (covered && qb != 5) { left_read_start = i; break; }
+        if (!covered && qb != 5) ++left_skipped;
+    }
+    for (int i = msa_len - 1; i >= 0; --i) {
+        if (ref_read.target_aln[static_cast<size_t>(i)] != 5) --ref_cursor;
+        if (ref_read.query_aln[static_cast<size_t>(i)] != 5) {
+            --read_pos;
+            ref_pos = ref_cursor;
+        }
+    }
+    if (read_pos > 0 || left_skipped > 0) {
+        DigarOp d{ref_pos, DigarType::SoftClip, read_pos + left_skipped, 0, false, ""};
+        push_digar0(out, d);
+    }
+    read_pos += left_skipped;
+    for (int i = left_read_start; i < msa_len; ++i) {
+        const uint8_t rb = ref_read.target_aln[static_cast<size_t>(i)];
+        const uint8_t qb = ref_read.query_aln [static_cast<size_t>(i)];
+        if (rb == 5 && qb == 5) continue;
+        if (qb != 5 && rb != 5) {
+            DigarOp d{ref_pos, qb == rb ? DigarType::Equal : DigarType::Snp, 1, read_pos, false, ""};
+            if (d.type == DigarType::Snp) d.alt = std::string(1, "ACGTN"[qb < 5 ? qb : 4]);
+            push_digar0(out, d);
+            ++read_pos; ++ref_pos;
+        } else if (qb != 5) {
+            DigarOp d{ref_pos, DigarType::Insertion, 1, read_pos, false, std::string(1, "ACGTN"[qb < 5 ? qb : 4])};
+            push_digar0(out, d);
+            ++read_pos;
+        } else {
+            DigarOp d{ref_pos, DigarType::Deletion, 1, read_pos, false, ""};
+            push_digar0(out, d);
+            ++ref_pos;
+        }
+    }
+    return out;
+}
+
+static void update_digars_from_msa1(ReadRecord& read, const AlnStr& ref_read_aln, int full_cover,
+                                    hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
+                                    int read_beg, int read_end) {
+    if (noisyIsNotCover(full_cover)) return;
+    std::vector<DigarOp> left, right, msa, merged;
+    if (noisyIsBothCover(full_cover) ||
+        (noisyIsLeftCover(full_cover) && noisyIsRightGap(full_cover)) ||
+        (noisyIsRightCover(full_cover) && noisyIsLeftGap(full_cover))) {
+        left = collect_left_digars(read.digars, read_beg, noisy_reg_beg);
+        right = collect_right_digars(read.digars, read_end, noisy_reg_end);
+        msa = collect_full_msa_digars(read_beg, noisy_reg_beg, ref_read_aln);
+        for (const DigarOp& d : left) push_digar_alt_seq(merged, d);
+        for (const DigarOp& d : msa) push_digar0(merged, d);
+        for (const DigarOp& d : right) push_digar_alt_seq(merged, d);
+    } else if (noisyIsLeftCover(full_cover)) {
+        left = collect_left_digars(read.digars, read_beg, noisy_reg_beg);
+        msa = collect_left_msa_digars(read_beg, read_end, static_cast<int>(read.qual.size()), noisy_reg_beg, ref_read_aln);
+        for (const DigarOp& d : left) push_digar_alt_seq(merged, d);
+        for (const DigarOp& d : msa) push_digar0(merged, d);
+    } else if (noisyIsRightCover(full_cover)) {
+        right = collect_right_digars(read.digars, read_end, noisy_reg_end);
+        msa = collect_right_msa_digars(read_end, noisy_reg_beg, noisy_reg_end, ref_read_aln);
+        for (const DigarOp& d : msa) push_digar0(merged, d);
+        for (const DigarOp& d : right) push_digar_alt_seq(merged, d);
+    }
+    if (!merged.empty()) read.digars.swap(merged);
+}
+
+static void update_digars_from_aln_str(BamChunk& chunk,
+                                       hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
+                                       const std::vector<int>& read_id_to_full_covers,
+                                       const std::vector<int>& read_reg_beg,
+                                       const std::vector<int>& read_reg_end,
+                                       const std::array<std::vector<AlnStr>, 2>& aln_strs,
+                                       int n_cons,
+                                       const std::array<int, 2>& clu_n_seqs,
+                                       const std::array<std::vector<int>, 2>& clu_read_ids) {
+    for (int ci = 0; ci < n_cons; ++ci) {
+        const int n_seqs = clu_n_seqs[static_cast<size_t>(ci)];
+        for (int read_i = 0; read_i < n_seqs; ++read_i) {
+            const int read_id = clu_read_ids[static_cast<size_t>(ci)][static_cast<size_t>(read_i)];
+            const int read_beg = read_reg_beg[static_cast<size_t>(read_id)];
+            const int read_end = read_reg_end[static_cast<size_t>(read_id)];
+            const size_t ref_read_slot = static_cast<size_t>((read_i + 1) * 2);
+            if (ref_read_slot >= aln_strs[static_cast<size_t>(ci)].size()) continue;
+            const AlnStr& ref_read = aln_strs[static_cast<size_t>(ci)][ref_read_slot];
+            update_digars_from_msa1(chunk.reads[static_cast<size_t>(read_id)], ref_read,
+                                    read_id_to_full_covers[static_cast<size_t>(read_id)],
+                                    noisy_reg_beg, noisy_reg_end, read_beg, read_end);
+        }
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // sort_noisy_region_reads  (mirrors longcallD align.c)
 // ════════════════════════════════════════════════════════════════════════════
@@ -1124,8 +1449,13 @@ int wfa_collect_noisy_aln_str_no_ps_hap(const Options& opts, NoisyReadInfo& info
             // cons-vs-read aln: slot (k+1)*2 - 1.
             const size_t cons_read_slot = static_cast<size_t>((k + 1) * 2 - 1);
             make_cons_read_aln_str(cons_row, read_row, msa_len,
-                                   info.fully_covers[static_cast<size_t>(ci)],
+                                  info.fully_covers[static_cast<size_t>(read_i)],
                                    aln_strs[static_cast<size_t>(ci)][cons_read_slot]);
+            const size_t ref_read_slot = static_cast<size_t>((k + 1) * 2);
+            make_ref_read_aln_str(opts,
+                                  aln_strs[static_cast<size_t>(ci)][0],
+                                  aln_strs[static_cast<size_t>(ci)][cons_read_slot],
+                                  aln_strs[static_cast<size_t>(ci)][ref_read_slot]);
             if (opts.verbose >= 2) {
                 std::fprintf(stderr, "%d:\n", read_id);
                 std::fprintf(stderr, "cons:\t");
@@ -1248,6 +1578,11 @@ int wfa_collect_noisy_aln_str_with_ps_hap(const Options& opts, bool sampling_rea
             make_cons_read_aln_str(cons_row, read_row, msa_len,
                                    info.fully_covers[static_cast<size_t>(i)],
                                    aln_strs[static_cast<size_t>(ci)][cons_read_slot]);
+            const size_t ref_read_slot = static_cast<size_t>((k_out + 1) * 2);
+            make_ref_read_aln_str(opts,
+                                  aln_strs[static_cast<size_t>(ci)][0],
+                                  aln_strs[static_cast<size_t>(ci)][cons_read_slot],
+                                  aln_strs[static_cast<size_t>(ci)][ref_read_slot]);
             if (opts.verbose >= 2) {
                 std::fprintf(stderr, "%d\tps=%" PRId64 "\thap=%d\tfull_cover=%d\n",
                              info.noisy_read_ids[static_cast<size_t>(i)],
@@ -1276,7 +1611,7 @@ int wfa_collect_noisy_aln_str_with_ps_hap(const Options& opts, bool sampling_rea
 // collect_noisy_reg_aln_strs  (mirrors longcallD align.c / align.h)
 // ════════════════════════════════════════════════════════════════════════════
 
-int collect_noisy_reg_aln_strs(const Options& opts, const BamChunk& chunk,
+int collect_noisy_reg_aln_strs(const Options& opts, BamChunk& chunk,
                                 hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                                 const std::vector<int>& noisy_read_ids,
                                 const std::vector<uint8_t>& ref_seq_vec,
@@ -1320,6 +1655,13 @@ int collect_noisy_reg_aln_strs(const Options& opts, const BamChunk& chunk,
         n_cons = wfa_collect_noisy_aln_str_no_ps_hap(
             opts, info, ref_seq_vec.data(), ref_seq_len,
             clu_n_seqs, clu_read_ids, aln_strs);
+    }
+
+    if (n_cons > 0 && opts.refine_aln && !opts.output_aln.empty()) {
+        update_digars_from_aln_str(chunk, noisy_reg_beg, noisy_reg_end,
+                                   info.read_id_to_full_covers,
+                                   info.read_reg_beg, info.read_reg_end,
+                                   aln_strs, n_cons, clu_n_seqs, clu_read_ids);
     }
     return n_cons;
 }

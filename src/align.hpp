@@ -262,7 +262,7 @@ int wfa_collect_noisy_aln_str_with_ps_hap(const Options& opts, bool sampling_rea
  * Mirrors longcallD collect_noisy_reg_aln_strs (align.c / align.h).
  * Returns number of consensus sequences produced (0, 1, or 2).
  */
-int collect_noisy_reg_aln_strs(const Options& opts, const BamChunk& chunk,
+int collect_noisy_reg_aln_strs(const Options& opts, BamChunk& chunk,
                                 hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                                 const std::vector<int>& noisy_read_ids,
                                 const std::vector<uint8_t>& ref_seq,

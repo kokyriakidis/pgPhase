@@ -128,6 +128,13 @@ enum class ReadTechnology : uint8_t {
     ShortReads
 };
 
+enum class OutputAlignmentFormat : uint8_t {
+    None,
+    Sam,
+    Bam,
+    Cram
+};
+
 // ════════════════════════════════════════════════════════════════════════════
 // Options & region input
 // ════════════════════════════════════════════════════════════════════════════
@@ -182,11 +189,19 @@ struct Options {
     std::string output_tsv = "output.tsv";
     std::string output_vcf;
     std::string output_phased_vcf;
+    /** If non-empty, output phased SAM/BAM/CRAM with HP/PS tags (longcallD-style -S/-b/-C). */
+    std::string output_aln;
+    /** Output alignment format selected by -S/-b/-C (longcallD style). */
+    OutputAlignmentFormat output_aln_format = OutputAlignmentFormat::None;
+    /** If true, refine phased read alignments from per-read digars before writing output alignment. */
+    bool refine_aln = false;
     /** If non-empty, write per-read allele observations for downstream phasing. */
     std::string read_support_tsv;
     /** If non-empty, write per-read HAP / PHASE_SET after k-means phasing (per chunk). */
     std::string phase_read_tsv;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
+    /** CLI command string used for PG:CL header field in phased SAM/BAM/CRAM output. */
+    std::string command_line;
 
     /**
      * @brief First BAM path: `bam_files.front()` when multi-input, else legacy `bam_file`.

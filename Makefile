@@ -22,6 +22,7 @@ SOURCES_CXX = src/main.cpp \
 	src/collect_phase.cpp \
 	src/collect_phase_noisy.cpp \
 	src/align.cpp \
+	src/collect_bam_output.cpp \
 	src/collect_output.cpp
 SOURCES_C = src/sdust.c src/cgranges.c src/kalloc.c
 
