@@ -15,7 +15,7 @@ fi
 if [[ ! -f "$ONT_BAM" && -f "$ROOT/test_data/longCallD/HG002_chr11_ont_test.bam" ]]; then
   ONT_BAM="$ROOT/test_data/longCallD/HG002_chr11_ont_test.bam"
 fi
-EXPECTED_HIFI="${EXPECTED_HIFI:-8771}"
+EXPECTED_HIFI="${EXPECTED_HIFI:-8745}"
 TMPDIR="${TMPDIR:-/tmp}"
 
 if [[ ! -x "$PGPHASE" ]]; then

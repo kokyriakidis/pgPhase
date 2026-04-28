@@ -11,6 +11,7 @@
 
 #include "bam_digar.hpp"
 #include "collect_output.hpp"
+#include "collect_phase.hpp"
 #include "collect_var.hpp"
 
 #include <algorithm>
@@ -372,12 +373,6 @@ static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerC
                            std::make_move_iterator(reads.begin()),
                            std::make_move_iterator(reads.end()));
     }
-    std::sort(chunk.reads.begin(), chunk.reads.end(), [](const ReadRecord& lhs, const ReadRecord& rhs) {
-        if (lhs.beg != rhs.beg) return lhs.beg < rhs.beg;
-        if (lhs.end != rhs.end) return lhs.end > rhs.end;
-        if (lhs.nm != rhs.nm) return lhs.nm < rhs.nm;
-        return lhs.qname < rhs.qname;
-    });
     initialize_longcalld_chunk_state(chunk, context.bams.size());
     for (size_t input_i = 0; input_i < overlap_skip_counts.size(); ++input_i) {
         chunk.n_up_ovlp_skip_reads[input_i] = overlap_skip_counts[input_i].upstream;
@@ -387,16 +382,64 @@ static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerC
 }
 
 /**
+ * @brief Releases bulky per-chunk intermediates after k-means phasing.
+ *
+ * Exact match to longcallD `bam_chunk_mid_free` (bam_utils.c). Frees:
+ *   - per-read: digars, qual, noisy_regions  (= bam_chunk_free_digar)
+ *   - chunk: low_complexity_regions           (= cr_destroy(low_comp_cr))
+ *   - chunk: var_noisy_read_cov/err_cr, var_noisy_read_marks
+ *                                             (= bam_chunk_clear_var_noisy_read_cache)
+ *   - chunk: noisy_regions                   (= cr_destroy(chunk_noisy_regs) + noisy_reg_to_reads)
+ *   - chunk: read_var_cr
+ *
+ * Intentionally NOT freed here (matching longcallD):
+ *   - reads[].alignment  — kept for future phased-BAM output (= bam1_t** reads)
+ *   - reads[].qual is freed above; alignment (bam1_t) is kept
+ *   - ref_seq, ref_beg/end — freed in post_free; used by make_var_main equivalent
+ *   - ordered_read_ids   — kept; longcallD stitching iterates through it
+ *   - read_var_profile   — longcallD never frees it in mid or post_free
+ *   - haps, phase_sets, up/down_ovlp_read_i, candidates — needed for stitching/output
+ */
+static void mid_free_chunk(BamChunk& chunk) {
+    // mirrors bam_chunk_free_digar: per-read digar ops, base quals, noisy sub-intervals
+    for (ReadRecord& r : chunk.reads) {
+        r.digars.clear();
+        r.digars.shrink_to_fit();
+        r.qual.clear();
+        r.qual.shrink_to_fit();
+        r.noisy_regions.clear();
+        r.noisy_regions.shrink_to_fit();
+    }
+    // mirrors cr_destroy(low_comp_cr)
+    chunk.low_complexity_regions.clear();
+    chunk.low_complexity_regions.shrink_to_fit();
+    // mirrors bam_chunk_clear_var_noisy_read_cache
+    chunk.var_noisy_read_cov_cr.reset();
+    chunk.var_noisy_read_err_cr.reset();
+    chunk.var_noisy_read_marks.clear();
+    chunk.var_noisy_read_marks.shrink_to_fit();
+    chunk.var_noisy_read_mark_id = 0;
+    // mirrors cr_destroy(chunk_noisy_regs) + noisy_reg_to_reads/n_reads
+    chunk.noisy_regions.clear();
+    chunk.noisy_regions.shrink_to_fit();
+    // mirrors cr_destroy(read_var_cr)
+    chunk.read_var_cr.reset();
+}
+
+/**
  * @brief Sequentially collects variants from candidate regions.
  *
- * Loads one genomic slice from the BAM/FASTA layer, then delegates the numbered
- * longcallD-shaped candidate workflow to `collect_var_main`.
+ * Loads one genomic slice from the BAM/FASTA layer, delegates the numbered
+ * longcallD-shaped candidate workflow to `collect_var_main`, then calls
+ * `mid_free_chunk` to release heavy intermediates (digars, interval trees,
+ * noisy regions) — mirroring longcallD's `bam_chunk_mid_free` call in
+ * `collect_bam_call_var_worker_for`.
  *
  * @param region Genomic slice to process.
  * @param opts Pipeline and quality options.
  * @param context Per-thread BAM/FAI context.
  * @param read_support_out Optional buffer for read-support rows from this chunk.
- * @return `BamChunk` with filled `candidates` and related fields.
+ * @return `BamChunk` with filled `candidates` and related fields; intermediates freed.
  */
 static BamChunk process_chunk(const RegionChunk& region,
                               const Options& opts,
@@ -406,6 +449,7 @@ static BamChunk process_chunk(const RegionChunk& region,
     chunk.region = region;
     load_and_prepare_chunk(chunk, opts, context);
     collect_var_main(chunk, opts, context.primary_header(), read_support_out);
+    mid_free_chunk(chunk);
     return chunk;
 }
 
@@ -431,6 +475,23 @@ static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
                       std::make_move_iterator(table.begin()),
                       std::make_move_iterator(table.end()));
     }
+    if (merged.size() <= 1) return merged;
+
+    std::stable_sort(merged.begin(), merged.end(),
+                     [](const CandidateVariant& lhs, const CandidateVariant& rhs) {
+                         return exact_comp_var_site(&lhs.key, &rhs.key) < 0;
+                     });
+
+    size_t write_i = 1;
+    for (size_t read_i = 1; read_i < merged.size(); ++read_i) {
+        if (exact_comp_var_site(&merged[write_i - 1].key, &merged[read_i].key) == 0) {
+            // Keep the first variant for exact-key duplicates (longcallD merge walk behavior).
+            continue;
+        }
+        if (write_i != read_i) merged[write_i] = std::move(merged[read_i]);
+        ++write_i;
+    }
+    merged.resize(write_i);
     return merged;
 }
 
@@ -528,6 +589,7 @@ CandidateTable collect_chunks_parallel(
     if (chunks.empty()) return CandidateTable{};
     ChunkBatchResult result =
         collect_chunk_batch_parallel(opts, chunks, 0, chunks.size(), read_support_batches != nullptr);
+    stitch_chunk_haps(result.chunks);
     if (read_support_batches != nullptr) *read_support_batches = std::move(result.read_support_batches);
     return merge_chunk_candidates(result.chunks);
 }
@@ -600,6 +662,7 @@ void run_collect_bam_variation(const Options& opts) {
 
         ChunkBatchResult batch = collect_chunk_batch_parallel(
             opts, chunks, batch_begin, batch_end, !opts.read_support_tsv.empty());
+        stitch_chunk_haps(batch.chunks);
         CandidateTable variants = merge_chunk_candidates(batch.chunks);
         n_variants += variants.size();
         write_variants_tsv_records(variant_out, header.get(), ref, variants);

@@ -57,6 +57,25 @@ constexpr uint32_t kCandGermlineVarCate =
 uint32_t category_to_flag(VariantCategory c);
 
 /**
+ * @brief Stitch haplotype assignments across chunk boundaries.
+ *
+ * Mirrors longcallD `stitch_var_main` / `flip_variant_hap` from `collect_var.c`.
+ *
+ * For each pair of adjacent chunks on the same contig, reads that span the boundary
+ * (already catalogued in `down_ovlp_read_i` / `up_ovlp_read_i`) are matched by query
+ * name. If the majority have inconsistent haplotype labels (hap1 in one chunk → hap2
+ * in the other), the current chunk's haplotype assignments are flipped. In either case,
+ * if both chunks have a valid phase block touching the boundary, the current chunk's
+ * earliest phase-set anchor is rewritten to the previous chunk's latest anchor, merging
+ * the two blocks into one.
+ *
+ * @param chunks Ordered, adjacent `BamChunk` objects from `collect_chunk_batch_parallel`,
+ *               each already phased by `assign_hap_based_on_germline_het_vars_kmeans`.
+ *               Chunks on different contigs are silently skipped at the boundary.
+ */
+void stitch_chunk_haps(std::vector<BamChunk>& chunks);
+
+/**
  * @brief Assign haplotypes and phase sets to reads via iterative k-means clustering.
  *
  * Mirrors longcallD `assign_hap_based_on_germline_het_vars_kmeans` from `assign_hap.c`.

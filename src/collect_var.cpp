@@ -5,6 +5,7 @@
 
 #include "collect_var.hpp"
 #include "collect_phase.hpp"
+#include "collect_phase_noisy.hpp"
 
 #include "sdust.h"
 
@@ -533,21 +534,6 @@ cgranges_t* build_read_noisy_cr(const ReadRecord& read) {
 }
 
 /**
- * @brief True if any of \a read.noisy_regions intersects the 1-based inclusive \a start–\a end span.
- * @param read Read with per-read noisy intervals.
- * @param start Interval start (1-based).
- * @param end Interval end (1-based).
- */
-static bool read_has_noisy_overlap(const ReadRecord& read, hts_pos_t start, hts_pos_t end) {
-    for (const Interval& iv : read.noisy_regions) {
-        if (iv.end < start) continue;
-        if (iv.beg > end) return false;
-        return true;
-    }
-    return false;
-}
-
-/**
  * @brief Reference span for overlap tests (1-based inclusive).
  *
  * Insertions yield `var_end == key.pos - 1` (zero-length span) per longcallD.
@@ -565,9 +551,27 @@ void variant_genomic_span(const VariantKey& key, hts_pos_t& var_start, hts_pos_t
         var_end = key.pos + key.ref_len - 1;
         return;
     }
-    // Insertions have ref_len=0; longcallD uses pos..pos+ref_len-1.
+    // Insertions: longcallD uses [pos, pos] for overlap/noisy-ratio checks.
     var_start = key.pos;
-    var_end = key.pos - 1;
+    var_end = key.pos;
+}
+
+// strict longcallD-style overlap test for read/profile allele assignment
+// Mirrors longcallD `ovlp_var_site` (half-open [beg, end) semantics via end = pos + ref_len).
+static bool ovlp_var_site(const VariantKey& var1, const VariantKey& var2) {
+    const hts_pos_t beg1 = var1.pos;
+    const hts_pos_t end1 = var1.pos + var1.ref_len;
+    const hts_pos_t beg2 = var2.pos;
+    const hts_pos_t end2 = var2.pos + var2.ref_len;
+
+    // Both insertions (ref_len == 0 for INS in longcallD)
+    if (var1.ref_len == 0 && var2.ref_len == 0) return beg1 == beg2;
+    // var1 is INS vs SNP/DEL
+    if (var1.ref_len == 0) return (beg1 > beg2 && end1 < end2);
+    // var2 is INS vs SNP/DEL
+    if (var2.ref_len == 0) return (beg2 > beg1 && end2 < end1);
+    // both SNP/DEL
+    return !(beg1 >= end2 || beg2 >= end1);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -654,6 +658,13 @@ static void collect_noisy_reg_start_end_pgphase(const cgranges_t* chunk_noisy_re
                                                 const std::vector<VariantCategory>& cand_cate,
                                                 std::vector<int32_t>& start_out,
                                                 std::vector<int32_t>& end_out) {
+    const auto flank_span = [](const VariantKey& key, hts_pos_t& var_start, hts_pos_t& var_end) {
+        // Match longcallD collect_noisy_reg_start_end:
+        // var_start = var->pos; var_end = var->pos + var->ref_len - 1.
+        var_start = key.pos;
+        var_end = key.pos + key.ref_len - 1;
+    };
+
     const int n_noisy = chunk_noisy_regs->n_r;
     start_out.assign(n_noisy, 0);
     end_out.assign(n_noisy, 0);
@@ -678,7 +689,7 @@ static void collect_noisy_reg_start_end_pgphase(const cgranges_t* chunk_noisy_re
         }
         hts_pos_t var_start = 0;
         hts_pos_t var_end = 0;
-        variant_genomic_span(cand[static_cast<size_t>(var_i)].key, var_start, var_end);
+        flank_span(cand[static_cast<size_t>(var_i)].key, var_start, var_end);
         const int32_t reg_start = cr_start(chunk_noisy_regs, reg_i) + 1;
         const int32_t reg_end = cr_end(chunk_noisy_regs, reg_i);
         if (static_cast<int32_t>(var_start) > reg_end) {
@@ -710,7 +721,7 @@ static void collect_noisy_reg_start_end_pgphase(const cgranges_t* chunk_noisy_re
             if (category_skipped_for_noisy_flank(cand_cate[static_cast<size_t>(v)])) continue;
             hts_pos_t vs = 0;
             hts_pos_t ve = 0;
-            variant_genomic_span(cand[static_cast<size_t>(v)].key, vs, ve);
+            flank_span(cand[static_cast<size_t>(v)].key, vs, ve);
             if (static_cast<int32_t>(ve) < cur_start - 1) break;
             if (static_cast<int32_t>(vs) - kNoisyRegFlankLen < cur_start) {
                 cur_start = static_cast<int32_t>(vs) - kNoisyRegFlankLen;
@@ -722,7 +733,7 @@ static void collect_noisy_reg_start_end_pgphase(const cgranges_t* chunk_noisy_re
             if (category_skipped_for_noisy_flank(cand_cate[static_cast<size_t>(v)])) continue;
             hts_pos_t vs = 0;
             hts_pos_t ve = 0;
-            variant_genomic_span(cand[static_cast<size_t>(v)].key, vs, ve);
+            flank_span(cand[static_cast<size_t>(v)].key, vs, ve);
             if (static_cast<int32_t>(vs) > cur_end + 1) break;
             if (static_cast<int32_t>(ve) + kNoisyRegFlankLen > cur_end) {
                 cur_end = static_cast<int32_t>(ve) + kNoisyRegFlankLen;
@@ -786,15 +797,26 @@ void pre_process_noisy_regs_pgphase(BamChunk& chunk, const Options& opts) {
         const int64_t end = read.end;
         const int64_t ovlp_n = cr_overlap(
             noisy_regs, "cr", static_cast<int32_t>(beg - 1), static_cast<int32_t>(end), &ovlp_b, &max_b);
+        CrangesOwner read_noisy_own;
+        read_noisy_own.adopt(build_read_noisy_cr(read));
+        int64_t* read_ovlp_b = nullptr;
+        int64_t read_max_b = 0;
         for (int64_t ovlp_i = 0; ovlp_i < ovlp_n; ++ovlp_i) {
             const int r_i = static_cast<int>(ovlp_b[ovlp_i]);
             noisy_reg_to_total[static_cast<size_t>(r_i)]++;
             const int32_t noisy_reg_start = cr_start(noisy_regs, r_i) + 1;
             const int32_t noisy_reg_end = cr_end(noisy_regs, r_i);
-            if (read_has_noisy_overlap(read, noisy_reg_start, noisy_reg_end)) {
+            int64_t noisy_digar_ovlp_n = 0;
+            if (read_noisy_own.cr != nullptr) {
+                noisy_digar_ovlp_n =
+                    cr_overlap(read_noisy_own.cr, "cr", noisy_reg_start - 1, noisy_reg_end,
+                               &read_ovlp_b, &read_max_b);
+            }
+            if (noisy_digar_ovlp_n > 0) {
                 noisy_reg_to_noisy[static_cast<size_t>(r_i)]++;
             }
         }
+        std::free(read_ovlp_b);
     };
     if (read_order.empty() && !chunk.reads.empty()) {
         for (const ReadRecord& r : chunk.reads) visit_read(r);
@@ -914,6 +936,22 @@ void apply_noisy_containment_filter(BamChunk& chunk) {
     std::free(b);
 }
 
+static bool is_not_candidate_category(VariantCategory c) {
+    return c == VariantCategory::NonVariant ||
+           c == VariantCategory::LowCoverage ||
+           c == VariantCategory::StrandBias;
+}
+
+static void prune_not_candidate_variants(BamChunk& chunk) {
+    CandidateTable kept;
+    kept.reserve(chunk.candidates.size());
+    for (CandidateVariant& cv : chunk.candidates) {
+        if (is_not_candidate_category(cv.counts.category)) continue;
+        kept.push_back(std::move(cv));
+    }
+    chunk.candidates = std::move(kept);
+}
+
 /**
  * @brief Fills `chunk.low_complexity_regions` via sdust on the loaded reference slice.
  * @param chunk Must have `ref_seq` and region/ref bounds aligned with the slice.
@@ -954,10 +992,20 @@ void populate_chunk_read_indexes(BamChunk& chunk) {
         const ReadRecord& read = chunk.reads[read_i];
         chunk.ordered_read_ids.push_back(static_cast<int>(read_i));
         if (read.is_skipped) continue;
-        chunk.noisy_regions.insert(
-            chunk.noisy_regions.end(), read.noisy_regions.begin(), read.noisy_regions.end());
+        for (const Interval& iv : read.noisy_regions) {
+            if (iv.end < chunk.region.beg || iv.beg > chunk.region.end) continue;
+            chunk.noisy_regions.push_back(iv);
+        }
     }
-    merge_intervals(chunk.noisy_regions);
+    std::stable_sort(chunk.ordered_read_ids.begin(), chunk.ordered_read_ids.end(),
+                     [&](int lhs_i, int rhs_i) {
+                         const ReadRecord& lhs = chunk.reads[static_cast<size_t>(lhs_i)];
+                         const ReadRecord& rhs = chunk.reads[static_cast<size_t>(rhs_i)];
+                         if (lhs.beg != rhs.beg) return lhs.beg < rhs.beg;
+                         if (lhs.end != rhs.end) return lhs.end > rhs.end;
+                         if (lhs.nm != rhs.nm) return lhs.nm < rhs.nm;
+                         return lhs.qname < rhs.qname;
+                     });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1064,12 +1112,35 @@ static int ref_nt4_at(const std::string& ref_seq, hts_pos_t ref_beg, hts_pos_t a
 }
 
 /**
- * @brief True if a short variant sits in or beside a homopolymer run (longcallD `var_is_homopolymer`).
- * @param var SNP or small indel (length gated by \a xid).
+ * @brief True if a short indel sits inside or immediately beside a homopolymer or tandem repeat run.
+ *
+ * Only applied to indels with span ≤ `xid` (default 5 bp from `noisy_reg_max_xgaps`); larger
+ * indels return false immediately. SNPs are also gated: `ref_len` must be ≤ `xid`.
+ *
+ * **Algorithm:** Checks up to 6 bp **downstream** of the variant for a repeat run, then up to
+ * 6 bp **upstream**. For each direction, tests repeat unit lengths 1–6 bp; a unit qualifies if
+ * at least **3 consecutive copies** are present in the reference. The first matching unit in
+ * either direction makes the variant a homopolymer candidate and returns `true`.
+ *
+ * Example — homopolymer (unit = 1 bp):
+ * ```
+ * reference: ...C A A A A A A A G...
+ *                  ^ deletion of one A
+ * downstream: AAAAAA — 6 copies of "A" → homopolymer
+ * ```
+ *
+ * Example — short tandem repeat (unit = 2 bp):
+ * ```
+ * reference: ...G C A C A C A C A T...
+ *                    ^ deletion of "CA"
+ * downstream: CACACA — 3 copies of "CA" → tandem repeat
+ * ```
+ *
+ * @param var Variant to test (type must be Insertion or Deletion; SNPs are gated by xid).
  * @param ref_seq Reference substring for the chunk.
- * @param ref_beg Absolute coordinate of `ref_seq[0]`.
- * @param ref_end Unused (signature parity with longcallD); may be ignored.
- * @param xid Max indel/SNP span considered (from `noisy_reg_max_xgaps`).
+ * @param ref_beg Absolute 1-based coordinate of `ref_seq[0]`.
+ * @param ref_end Unused (signature parity with longcallD).
+ * @param xid Maximum indel span to check; variants larger than this return false.
  */
 static bool var_is_homopolymer_pg(const VariantKey& var,
                                   const std::string& ref_seq,
@@ -1134,23 +1205,37 @@ static bool var_is_homopolymer_pg(const VariantKey& var,
 }
 
 /**
- * @brief Checks if an indel resides within a short identical sequence repeat (micro-homology/STR).
+ * @brief True if the reference flanking an indel is a tandem repeat of the deleted/inserted motif.
  *
- * Direct C++ translation of `longcallD`'s `var_is_repeat_region()`.
- * Identifies if a deleted/inserted string exactly matches the flanking genomic 
- * sequence up to 3x the motif length. Bypasses aligning long blocks and checks
- * simple tandem repetitions using byte array matches `std::memcmp` safely
- * within the cached reference boundary `ref_seq`.
- * 
- * Works for `var.type == VariantType::Deletion` or `Insertion` where `ref_len`
- * or `alt_len` doesn't overshoot maximum local gap settings `xid`.
+ * Only applied to indels with span ≤ `xid` (default 5 bp); larger indels return false immediately.
+ * Complementary to `var_is_homopolymer_pg`: catches micro-homology / STR contexts where the
+ * alignment can be shifted left or right with equal edit cost, making the exact breakpoint ambiguous.
  *
- * @param var Found structural insertion or deletion.
- * @param ref_seq Current active FASTA chunk data.
- * @param ref_beg FASTA offset.
- * @param ref_end FASTA boundary.
- * @param xid Limit of max variant extent allowed (from config `noisy_reg_max_xgaps`).
- * @return True if flanking reference matches tandem copies of the variant motif (micro-STR).
+ * **Algorithm:**
+ * - **Deletion** of length L: compares the deleted sequence (fetched from `ref_seq` at `pos`)
+ *   against the `3 × L` bases immediately following the deletion endpoint. If they match the
+ *   deleted motif repeated 3 times, returns `true`.
+ * - **Insertion** of length L: constructs a 3-copy repeat of the inserted sequence and compares
+ *   it against `3 × L` bases of the reference starting at `pos`. Returns `true` on match.
+ *
+ * Example — deletion in a tandem repeat:
+ * ```
+ * delete "AT" at pos 100 (reference: ...ATATAT...)
+ * check ref[102..107] = "ATATAT" == "AT"×3 → true
+ * ```
+ *
+ * Example — insertion consistent with STR:
+ * ```
+ * insert "GC" at pos 200 (reference: ...GCGCGC...)
+ * check ref[200..205] = "GCGCGC" == "GC"×3 → true
+ * ```
+ *
+ * @param var Variant to test (must be Insertion or Deletion).
+ * @param ref_seq Reference substring for the chunk.
+ * @param ref_beg Absolute 1-based coordinate of `ref_seq[0]`.
+ * @param ref_end Last valid absolute coordinate in `ref_seq`.
+ * @param xid Maximum indel span to check; variants larger than this return false.
+ * @return True if the flanking reference matches 3 tandem copies of the indel motif.
  */
 static bool var_is_repeat_region_pg(const VariantKey& var,
                                     const std::string& ref_seq,
@@ -1469,7 +1554,7 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
         VariantCategory c = cats[i];
         if (c == VariantCategory::StrandBias) continue;
 
-        if (!opts.is_ont() && chunk_noisy->n_r > 0) {
+        if (chunk_noisy->n_r > 0) {
             int64_t n = 0;
             if (variants[i].key.type == VariantType::Insertion) {
                 n = cr_overlap(chunk_noisy, "cr",
@@ -1544,23 +1629,7 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
 }
 
 /**
- * @brief Promotes selected noisy/repeat categories to `NoisyResolved` when span ≥ `kMinSvLen`.
- * @param variants In/out candidate table after main classification.
- */
-static void resolve_simple_noisy_candidates(CandidateTable& variants) {
-    for (CandidateVariant& candidate : variants) {
-        if (candidate.counts.category != VariantCategory::NoisyCandHet &&
-            candidate.counts.category != VariantCategory::NoisyCandHom &&
-            candidate.counts.category != VariantCategory::RepeatHetIndel) continue;
-        if (candidate.key.alt.size() >= static_cast<size_t>(kMinSvLen) ||
-            candidate.key.ref_len >= kMinSvLen) {
-            candidate.counts.category = VariantCategory::NoisyResolved;
-        }
-    }
-}
-
-/**
- * @brief Classifies all chunk candidates then applies large-SV promotion (`resolve_simple_noisy_candidates`).
+ * @brief Classifies all chunk candidates (longcallD classify path).
  * @param chunk Chunk with allele counts populated.
  * @param opts Classification options.
  * @param header Reserved (unused).
@@ -1568,7 +1637,6 @@ static void resolve_simple_noisy_candidates(CandidateTable& variants) {
 void classify_chunk_candidates(BamChunk& chunk, const Options& opts, const bam_hdr_t* header) {
     (void)header;
     classify_cand_vars_pgphase(chunk, opts);
-    resolve_simple_noisy_candidates(chunk.candidates);
 }
 
 
@@ -1634,17 +1702,29 @@ static void collect_read_var_profile(const Options& opts, BamChunk& chunk) {
 
             const DigarOp& d = dig[digar_i];
             VariantKey dkey = variant_key_from_digar(read.tid, d);
-            const int ret = exact_comp_var_site_ins(
-                &variants[static_cast<size_t>(site_i)].key, &dkey, kLongcalldMinSvLen);
-            if (ret < 0) {
-                append_observation(site_i, 0, -1);
-                ++site_i;
-            } else if (ret == 0) {
-                const bool low_quality = d.low_quality || get_digar_ave_qual(d, read.qual) < opts.min_bq;
-                append_observation(site_i, low_quality ? -2 : 1, d.qi);
-                ++site_i;
+            const VariantKey& site_key = variants[static_cast<size_t>(site_i)].key;
+            const bool is_ovlp = ovlp_var_site(site_key, dkey);
+            // longcallD germline read-profile allele assignment uses strict exact_comp_var_site.
+            const int ret = exact_comp_var_site(&site_key, &dkey);
+            if (!is_ovlp) {
+                if (ret < 0) {
+                    append_observation(site_i, 0, -1);
+                    ++site_i;
+                } else if (ret > 0) {
+                    ++digar_i;
+                } else {
+                    ++site_i;
+                    ++digar_i;
+                }
             } else {
-                ++digar_i;
+                if (ret == 0) {
+                    const bool low_quality = d.low_quality || get_digar_ave_qual(d, read.qual) < opts.min_bq;
+                    append_observation(site_i, low_quality ? -2 : 1, d.qi);
+                    ++site_i;
+                } else {
+                    append_observation(site_i, -1, -1);
+                    ++site_i;
+                }
             }
         }
 
@@ -1652,6 +1732,15 @@ static void collect_read_var_profile(const Options& opts, BamChunk& chunk) {
             const int stid = variants[static_cast<size_t>(site_i)].key.tid;
             if (stid != read.tid) { if (stid < read.tid) continue; break; }
             if (variants[static_cast<size_t>(site_i)].key.pos > read.end) break;
+            const hts_pos_t pos = variants[static_cast<size_t>(site_i)].key.pos;
+            bool in_noisy = false;
+            for (const Interval& noisy : read.noisy_regions) {
+                if (pos >= noisy.beg && pos <= noisy.end) {
+                    in_noisy = true;
+                    break;
+                }
+            }
+            if (in_noisy) continue;
             append_observation(site_i, 0, -1);
         }
 
@@ -1716,8 +1805,8 @@ static void dump_all_noisy_regions(const BamChunk& chunk, const Options& opts, c
  * (longcallD `LONGCALLD_CLEAN_HET_SNP | LONGCALLD_CLEAN_HET_INDEL | LONGCALLD_CLEAN_HOM_VAR`).
  * longcallD’s comments describe additional rounds (`+ NOISY_CAND_*`, somatic); the **second**
  * germline k-means with `LONGCALLD_CAND_GERMLINE_VAR_CATE` happens **after** noisy-region MSA (step 4),
- * which collect-bam-variation does not implement. **`kCandGermlineVarCate`** remains in
- * `collect_phase.hpp` for parity with that later call when step 4 exists.
+ * which `collect_noisy_vars_step4` runs when MSA-recalled noisy candidates are merged.
+ * The separate longcallD `out_somatic` path is still outside the current pgPhase model.
  *
  * **Example — two het sites phased by shared reads, one hom site**
  * @code
@@ -1760,12 +1849,13 @@ void collect_var_main(BamChunk& chunk,
     // 2.5. post-process noisy regions using classified candidate context.
     post_process_noisy_regs_pgphase(chunk, chunk.candidates);
 
-    // 2.6. final non-ONT containment pass: candidates fully inside noisy spans become NON_VAR.
-    if (!opts.is_ont()) apply_noisy_containment_filter(chunk);
+    // 2.6. final containment pass: candidates fully inside noisy spans become NON_VAR.
+    apply_noisy_containment_filter(chunk);
+    prune_not_candidate_variants(chunk);
 
     dump_all_noisy_regions(chunk, opts, header);
-    // longcallD returns here only when no candidates and no noisy intervals; it otherwise runs
-    // noisy-region MSA (step 4) even with zero candidates — not implemented in collect-bam-variation.
+    // longcallD returns here only when no candidates and no noisy intervals; otherwise it runs
+    // noisy-region MSA (step 4) — `collect_noisy_vars_step4` — even with zero candidates.
     if (chunk.candidates.empty() && chunk.noisy_regions.empty()) return;
 
     if (!chunk.candidates.empty()) {
@@ -1775,6 +1865,9 @@ void collect_var_main(BamChunk& chunk,
         // 3.2. co-phasing using clean-region SNPs + indels + clean hom (longcallD collect_var_main).
         assign_hap_based_on_germline_het_vars_kmeans(chunk, opts, kCandGermlineClean);
     }
+
+    // 4. iteratively call variants in noisy regions via MSA and re-run k-means (longcallD step 4).
+    collect_noisy_vars_step4(chunk, opts);
 }
 
 } // namespace pgphase_collect

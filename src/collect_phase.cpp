@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <climits>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -27,6 +29,22 @@ static inline int read_visit_count(const BamChunk& chunk) {
 
 static inline int read_at_visit_ord(const BamChunk& chunk, int ord) {
     return chunk.ordered_read_ids.empty() ? ord : chunk.ordered_read_ids[static_cast<size_t>(ord)];
+}
+
+static bool parse_debug_site_pos(const std::string& site, hts_pos_t& pos_out) {
+    const size_t colon = site.find(':');
+    if (colon == std::string::npos) return false;
+    std::string pos_s = site.substr(colon + 1);
+    pos_s.erase(std::remove(pos_s.begin(), pos_s.end(), ','), pos_s.end());
+    if (pos_s.empty()) return false;
+    try {
+        const long long p = std::stoll(pos_s);
+        if (p < 1) return false;
+        pos_out = static_cast<hts_pos_t>(p);
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -59,12 +77,8 @@ static void read_init_hap_phase_set(BamChunk& chunk) {
 /** Width of `hap_to_alle_profile[1/2]` (longcallD `n_uniq_alles` with optional `alle_covs`). */
 static int variant_allele_slots(const CandidateVariant& var) {
     const VariantCounts& c = var.counts;
-    if (!c.alle_covs.empty()) {
-        if (c.n_uniq_alles > 0)
-            return std::min(c.n_uniq_alles, static_cast<int>(c.alle_covs.size()));
-        return static_cast<int>(c.alle_covs.size());
-    }
-    if (c.n_uniq_alles > 0) return std::clamp(c.n_uniq_alles, 1, 2);
+    if (c.n_uniq_alles > 0) return c.n_uniq_alles;
+    if (!c.alle_covs.empty()) return static_cast<int>(c.alle_covs.size());
     return 2;
 }
 
@@ -77,7 +91,7 @@ static int get_var_init_max_cov_allele(bool is_ont, const CandidateVariant& var)
     int max_cov_alle_i = -1;
     if (!c.alle_covs.empty()) {
         const int n = c.n_uniq_alles > 0
-                          ? std::min(c.n_uniq_alles, static_cast<int>(c.alle_covs.size()))
+                          ? c.n_uniq_alles
                           : static_cast<int>(c.alle_covs.size());
         for (int i = 0; i < n; ++i) {
             if (c.alle_covs[i] > max_cov) {
@@ -87,9 +101,9 @@ static int get_var_init_max_cov_allele(bool is_ont, const CandidateVariant& var)
         }
         return max_cov_alle_i;
     }
-    const int n = (c.n_uniq_alles > 0) ? std::clamp(c.n_uniq_alles, 1, 2) : 2;
+    const int n = (c.n_uniq_alles > 0) ? c.n_uniq_alles : 2;
     for (int i = 0; i < n; ++i) {
-        const int cov = (i == 0) ? c.ref_cov : c.alt_cov;
+        const int cov = (i == 0) ? c.ref_cov : (i == 1 ? c.alt_cov : 0);
         if (cov > max_cov) {
             max_cov = cov;
             max_cov_alle_i = i;
@@ -107,7 +121,10 @@ static void var_init_hap_profile_cons_allele(bool is_ont,
     for (int vi : valid_var_idx) {
         CandidateVariant& var = variants[vi];
         const int na = variant_allele_slots(var);
-        var.hap_to_alle_profile[0].clear();
+        const bool first_init = var.hap_to_alle_profile[1].empty() && var.hap_to_alle_profile[2].empty();
+        if (first_init) {
+            var.hap_to_alle_profile[0].assign(na, 0);
+        }
         var.hap_to_alle_profile[1].assign(na, 0);
         var.hap_to_alle_profile[2].assign(na, 0);
         var.hap_to_cons_alle[0] = get_var_init_max_cov_allele(is_ont, var);
@@ -129,7 +146,7 @@ static void var_init_hap_to_alle_profile(CandidateTable& variants,
     for (int vi : valid_var_idx) {
         CandidateVariant& v = variants[vi];
         const int na = variant_allele_slots(v);
-        v.hap_to_alle_profile[0].clear();
+        v.hap_to_alle_profile[0].assign(na, 0);
         v.hap_to_alle_profile[1].assign(na, 0);
         v.hap_to_alle_profile[2].assign(na, 0);
     }
@@ -332,7 +349,8 @@ static int check_agree_haps(const BamChunk& chunk, int read_i, int hap, int var1
 // Returns 1 if any flip occurred (changed), 0 if converged.
 // Mirrors longcallD iter_update_var_hap_cons_phase_set.
 static int iter_update_var_hap_cons_phase_set(BamChunk& chunk,
-                                               const std::vector<int>& valid_var_idx) {
+                                               const std::vector<int>& valid_var_idx,
+                                               const Options& opts) {
     const int n = (int)valid_var_idx.size();
 
     // Collect het var positions (indices into valid_var_idx).
@@ -379,6 +397,11 @@ static int iter_update_var_hap_cons_phase_set(BamChunk& chunk,
             phase_set = var.key.sort_pos();
             var.phase_set = phase_set;
             continue;
+        }
+        if (opts.verbose >= 2) {
+            std::fprintf(stderr, "%" PRIi64 " %d %d\n",
+                         static_cast<int64_t>(var.key.pos),
+                         n_agree[_vi], n_conflict[_vi]);
         }
         if (is_het[_vi]) {
             if (n_agree[_vi] < 2 && n_conflict[_vi] < 2) {
@@ -528,7 +551,7 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
 
     // Phase 2: iterative k-means (up to 10 rounds, stop on convergence).
     for (int iter = 0; iter < 10; ++iter) {
-        const int c1 = iter_update_var_hap_cons_phase_set(chunk, valid_var_idx);
+        const int c1 = iter_update_var_hap_cons_phase_set(chunk, valid_var_idx, opts);
         const int c2 = iter_update_var_hap_to_cons_alle(chunk, is_ont, valid_var_idx, flags);
         if (c1 == 0 && c2 == 0) break;
     }
@@ -538,8 +561,9 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
 
     // Phase 4: fill hap_alt / hap_ref from finalized hap_to_cons_alle.
     // Mirrors longcallD make_variants() allele-resolution logic (collect_var.c):
-    //   both -1 → fall back to hap_to_cons_alle[0] (hom_idx);
-    //   one -1  → treat as ref (0), matching LONGCALLD_REF_ALLELE.
+    //   both -1 -> fall back to hap_to_cons_alle[0] (hom_idx);
+    //   one -1  -> treat as ref (0), matching LONGCALLD_REF_ALLELE;
+    //   any non-zero allele index is treated as ALT for GT projection.
     for (auto& var : chunk.candidates) {
         int c1 = var.hap_to_cons_alle[1];
         int c2 = var.hap_to_cons_alle[2];
@@ -548,15 +572,120 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
         }
         if (c1 == -1) c1 = 0; // unknown hap → ref
         if (c2 == -1) c2 = 0;
-        if (c1 == 1 && c2 == 1) {
+        const bool h1_alt = (c1 != 0);
+        const bool h2_alt = (c2 != 0);
+        if (h1_alt && h2_alt) {
             var.hap_alt = 3; var.hap_ref = 0;
-        } else if (c1 == 1 && c2 == 0) {
+        } else if (h1_alt && !h2_alt) {
             var.hap_alt = 1; var.hap_ref = 2;
-        } else if (c1 == 0 && c2 == 1) {
+        } else if (!h1_alt && h2_alt) {
             var.hap_alt = 2; var.hap_ref = 1;
         }
-        // c1==0 && c2==0 (both ref) or hom_idx==-1: leave hap_alt=0, hap_ref=0
+        // both ref/unresolved: leave hap_alt/hap_ref as 0/0
+
+        if (opts.verbose >= 2 && !opts.debug_site.empty()) {
+            hts_pos_t dbg = 0;
+            if (parse_debug_site_pos(opts.debug_site, dbg)) {
+                hts_pos_t vcf_pos = var.key.pos;
+                if (var.key.type == VariantType::Insertion || var.key.type == VariantType::Deletion) {
+                    vcf_pos = std::max<hts_pos_t>(1, var.key.pos - 1);
+                }
+                if (vcf_pos == dbg) {
+                    const char t = (var.key.type == VariantType::Snp ? 'X'
+                                 : (var.key.type == VariantType::Insertion ? 'I' : 'D'));
+                    std::fprintf(stderr,
+                                 "DebugPhase\tpos=%" PRId64 "\tkey_pos=%" PRId64 "\ttype=%c\talt=%s\tc1=%d\tc2=%d\thap_alt=%d\thap_ref=%d\thp=%d\n",
+                                 static_cast<int64_t>(vcf_pos),
+                                 static_cast<int64_t>(var.key.pos),
+                                 t,
+                                 var.key.alt.c_str(),
+                                 var.hap_to_cons_alle[1],
+                                 var.hap_to_cons_alle[2],
+                                 var.hap_alt,
+                                 var.hap_ref,
+                                 var.is_homopolymer_indel ? 1 : 0);
+                }
+            }
+        }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Chunk-boundary stitching (mirrors longcallD flip_variant_hap / stitch_var_main)
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * @brief Stitch one pair of adjacent chunks (strict longcallD flip_variant_hap).
+ *
+ * Mirrors longcallD `flip_variant_hap` + `update_chunk_var_hap_phase_set1`
+ * + `update_chunk_read_hap_phase_set1` from collect_var.c lines 1593–1695.
+ */
+static void flip_chunk_hap(BamChunk& pre, BamChunk& cur) {
+    if (pre.region.tid != cur.region.tid) return;
+    int n_cur_ovlp_reads = 0;
+    int n_pre_ovlp_reads = 0;
+    const size_t n_bams = cur.up_ovlp_read_i.size();
+    for (size_t bi = 0; bi < n_bams; ++bi) {
+        n_cur_ovlp_reads += static_cast<int>(cur.up_ovlp_read_i[bi].size());
+        if (bi < pre.down_ovlp_read_i.size()) {
+            n_pre_ovlp_reads += static_cast<int>(pre.down_ovlp_read_i[bi].size());
+        }
+    }
+    if (n_cur_ovlp_reads != n_pre_ovlp_reads) {
+        throw std::runtime_error("overlap read count mismatch between adjacent chunks");
+    }
+    if (n_cur_ovlp_reads <= 0) return;
+    if (pre.candidates.empty() || cur.candidates.empty()) return;
+
+    int flip_score = 0;
+    hts_pos_t max_pre_ps = -1;
+    hts_pos_t min_cur_ps = INT64_MAX;
+    for (size_t bi = 0; bi < n_bams; ++bi) {
+        const std::vector<int>& cur_list = cur.up_ovlp_read_i[bi];
+        const std::vector<int>& pre_list = pre.down_ovlp_read_i[bi];
+        for (size_t j = 0; j < cur_list.size(); ++j) {
+            if (j >= pre_list.size()) {
+                throw std::runtime_error("overlap read pairing mismatch between adjacent chunks");
+            }
+            const int cur_read_i = cur_list[j];
+            const int pre_read_i = pre_list[j];
+            if (pre_read_i < 0 || static_cast<size_t>(pre_read_i) >= pre.reads.size() ||
+                cur_read_i < 0 || static_cast<size_t>(cur_read_i) >= cur.reads.size()) {
+                throw std::runtime_error("overlap read index out of bounds during chunk stitching");
+            }
+            if (pre.reads[static_cast<size_t>(pre_read_i)].is_skipped || pre.haps[static_cast<size_t>(pre_read_i)] == 0 ||
+                cur.reads[static_cast<size_t>(cur_read_i)].is_skipped || cur.haps[static_cast<size_t>(cur_read_i)] == 0) continue;
+            const int pre_hap = pre.haps[static_cast<size_t>(pre_read_i)];
+            const hts_pos_t pre_ps = pre.phase_sets[static_cast<size_t>(pre_read_i)];
+            const int cur_hap = cur.haps[static_cast<size_t>(cur_read_i)];
+            const hts_pos_t cur_ps = cur.phase_sets[static_cast<size_t>(cur_read_i)];
+            if (pre_hap == cur_hap) --flip_score;
+            else ++flip_score;
+            if (max_pre_ps < pre_ps) max_pre_ps = pre_ps;
+            if (min_cur_ps > cur_ps) min_cur_ps = cur_ps;
+        }
+    }
+    if (flip_score == 0) return;
+
+    const bool do_flip = (flip_score > 0);
+
+    if (do_flip && min_cur_ps != -1) {
+        for (CandidateVariant& v : cur.candidates) {
+            if (v.phase_set != min_cur_ps) continue;
+            std::swap(v.hap_to_cons_alle[1], v.hap_to_cons_alle[2]);
+        }
+    }
+    if (max_pre_ps != -1 && min_cur_ps != INT64_MAX) {
+        for (CandidateVariant& v : cur.candidates) {
+            if (v.phase_set == -1) continue;
+            if (v.phase_set == min_cur_ps) v.phase_set = max_pre_ps;
+        }
+    }
+}
+
+void stitch_chunk_haps(std::vector<BamChunk>& chunks) {
+    for (size_t ii = 1; ii < chunks.size(); ++ii)
+        flip_chunk_hap(chunks[ii - 1], chunks[ii]);
 }
 
 } // namespace pgphase_collect

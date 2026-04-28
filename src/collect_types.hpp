@@ -14,6 +14,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <htslib/faidx.h>
@@ -153,6 +154,22 @@ struct Options {
     double strand_bias_pval = kDefaultStrandBiasPvalOnt;
     int noisy_reg_max_xgaps = kDefaultNoisyRegMaxXgaps;
     int min_noisy_reg_total_depth = kDefaultMinNoisyRegTotalDepth;
+    // Step 4: noisy-region MSA options (mirrors longcallD call_var_opt_t fields).
+    int max_noisy_reg_len = 50000; ///< Skip regions longer than this bp (LONGCALLD_MAX_NOISY_REG_LEN).
+    int max_noisy_reg_cov = 1000;  ///< Skip regions with more overlapping reads than this (LONGCALLD_MAX_NOISY_REG_COV).
+    int min_hap_full_reads = 1;    ///< Min full-cover reads per hap for hap-aware MSA (LONGCALLD_MIN_HAP_FULL_READS).
+    int min_hap_reads = 2;         ///< Min reads per hap total (LONGCALLD_MIN_HAP_READS).
+    int min_noisy_reg_size_to_sample_reads = 10000; ///< Sample reads for re-alignment in regions >= this (LONGCALLD_MIN_NOISY_REG_SIZE_TO_SAMPLE_READS).
+    int noisy_reg_flank_len = kNoisyRegFlankLen; ///< Flank used when scoring boundary deletions (LONGCALLD_NOISY_REG_FLANK_LEN).
+    // Alignment scoring (mirrors longcallD call_var_opt_t / align.h defaults).
+    int match      = 2;   ///< Match score (LONGCALLD_MATCH_SCORE).
+    int mismatch   = 6;   ///< Mismatch penalty (LONGCALLD_MISMATCH_SCORE).
+    int gap_open1  = 6;   ///< Gap-open penalty 1 (LONGCALLD_GAP_OPEN1_SCORE).
+    int gap_ext1   = 2;   ///< Gap-extend penalty 1 (LONGCALLD_GAP_EXT1_SCORE).
+    int gap_open2  = 24;  ///< Gap-open penalty 2 (LONGCALLD_GAP_OPEN2_SCORE).
+    int gap_ext2   = 1;   ///< Gap-extend penalty 2 (LONGCALLD_GAP_EXT2_SCORE).
+    int gap_aln    = 1;   ///< Gap alignment direction: 1=left-most (LONGCALLD_GAP_LEFT_ALN).
+    double partial_aln_ratio = 1.1; ///< Max longer/shorter ratio for partial alignment (LONGCALLD_PARTIAL_ALN_RATIO).
     int verbose = 0;
     bool include_filtered = false;
     bool autosome = false;
@@ -443,6 +460,12 @@ struct BamChunk {
     int chunk_median_qual = 0;
     int chunk_third_quar_qual = 0;
     int chunk_max_qual = 0;
+    /**
+     * When `erase_non_variant_candidates_fully_in_noisy_spans` removes a contained `NON_VAR` row
+     * that had a clean first-pass category, we stash `candvarcate_initial` here so step-4 MSA
+     * merges can restore INIT_CAT (longcallD first `CandVarCate` block) on the replacement row.
+     */
+    std::vector<std::pair<VariantKey, VariantCategory>> erased_clean_signal_initial;
 };
 
 // ════════════════════════════════════════════════════════════════════════════

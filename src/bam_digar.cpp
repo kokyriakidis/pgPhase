@@ -169,13 +169,14 @@ struct NoisyRegionBuilder {
     bool suppress_right_clip = false;
 
     void add_end_clip_region(int cigar_idx, int n_cigar, hts_pos_t ref_pos, hts_pos_t tlen, int clip_len) {
-        if (clip_len < kLongClipLength) return;
+        // longcallD: mark end-clip noisy region only when len > end_clip_reg.
+        if (clip_len <= kLongClipLength) return;
         if (cigar_idx == 0 && ref_pos > 10) { // left end clip
             if (!suppress_left_clip)
-                noisy_out.push_back(Interval{ref_pos, std::min<hts_pos_t>(tlen, ref_pos + kClipFlank), clip_len});
+                noisy_out.push_back(Interval{ref_pos, std::min<hts_pos_t>(tlen, ref_pos + kClipFlank), 0});
         } else if (cigar_idx == n_cigar - 1 && ref_pos < tlen - 10) { // right end clip
             if (!suppress_right_clip)
-                noisy_out.push_back(Interval{std::max<hts_pos_t>(1, ref_pos - kClipFlank), ref_pos, clip_len});
+                noisy_out.push_back(Interval{std::max<hts_pos_t>(1, ref_pos - kClipFlank), ref_pos, 0});
         }
     }
 
@@ -351,17 +352,18 @@ int aux_int_or_default(const bam1_t* aln, const char tag[2], int default_value) 
 }
 
 /**
- * @brief Statistical gate enforcing insertion quality.
- * 
- * Direct mapping of `longcallD`'s semantic quality check for insertions.
- * An insertion event only flags as "low quality" if every base in its 
- * sequence payload registers beneath the configured Phred threshold.
- * 
+ * @brief Returns true only when every inserted base is below the quality floor.
+ *
+ * A single high-quality base anywhere in the insertion sequence is enough to
+ * keep the event. This asymmetry with `deletion_is_low_quality` (which checks
+ * anchor bases, not the deleted sequence) reflects the fact that the inserted
+ * bases are present in the read and individually measurable.
+ *
  * @param aln Parent alignment.
- * @param qi Starting payload index.
- * @param len Size dimension.
- * @param min_bq Quality floor parameter.
- * @return True if strictly uncallable, false if valid.
+ * @param qi Query index of the first inserted base.
+ * @param len Number of inserted bases.
+ * @param min_bq Phred quality floor (default `kDefaultMinBaseq` = 10).
+ * @return True if all inserted bases are below `min_bq`; false if any base passes.
  */
 bool insertion_is_low_quality(const bam1_t* aln, int qi, int len, int min_bq) {
     for (int i = 0; i < len; ++i) {
@@ -371,17 +373,18 @@ bool insertion_is_low_quality(const bam1_t* aln, int qi, int len, int min_bq) {
 }
 
 /**
- * @brief Statistical gate enforcing deletion reliability.
- * 
- * Maps directly to `longcallD`'s semantic bounding constraints.
- * Since a deletion carries entirely missing genetic payload, we must evaluate 
- * the confidence of its anchor sequence (the directly preceding and following bases).
- * The variant is only penalized if both flanking bases fall beneath threshold.
- * 
+ * @brief Returns true only when both bases flanking the deletion gap are below the quality floor.
+ *
+ * Because a deletion has no bases to measure directly, quality is inferred from the
+ * anchor bases immediately before (`qi-1`) and after (`qi`) the gap. The deletion is
+ * considered high-quality if at least one anchor passes — both anchors must fail to
+ * mark it low-quality. This is intentionally lenient: a well-supported anchor on
+ * either side is sufficient evidence.
+ *
  * @param aln Parent alignment.
- * @param qi Starting query index of deletion offset.
- * @param min_bq Target phred filter wall.
- * @return True if anchoring confidence is compromised.
+ * @param qi Query index of the first base after the deletion (right anchor).
+ * @param min_bq Phred quality floor (default `kDefaultMinBaseq` = 10).
+ * @return True if both flanking bases are below `min_bq`; false if either anchor passes.
  */
 bool deletion_is_low_quality(const bam1_t* aln, int qi, int min_bq) {
     const bool left_ok = qi == 0 || base_quality(aln, qi - 1) >= min_bq;
@@ -497,13 +500,6 @@ static bool cigar_has_eqx_without_m(const bam1_t* aln) {
     return saw_eqx;
 }
 
-/** 
- * @brief Dissolves disjoint/overlapping soft-clipped noisy markers into contiguous blocks. 
- */
-static void digar_merge_noisy(ReadRecord& read) {
-    merge_intervals(read.noisy_regions);
-}
-
 /**
  * @brief Build sequential variants by performing base-by-base comparisons against the reference.
  *
@@ -593,7 +589,7 @@ static void build_digars_ref_cigar(const bam1_t* aln,
             noisy_builder.add_end_clip_region(static_cast<int>(i), aln->core.n_cigar, ref_pos, tlen, len);
             if (op == BAM_CSOFT_CLIP) query_pos += len;
         } else if (op == BAM_CREF_SKIP) {
-            append_digar(read.digars, DigarOp{ref_pos, DigarType::RefSkip, len, query_pos, false, ""});
+            // longcallD collect_digar_*: skip N op without adding a digar entry.
             ref_pos += len;
         }
     }
@@ -674,7 +670,7 @@ static void build_digars_eqx_cigar(const bam1_t* aln,
             noisy_builder.add_end_clip_region(static_cast<int>(i), aln->core.n_cigar, ref_pos, tlen, len);
             if (op == BAM_CSOFT_CLIP) query_pos += len;
         } else if (op == BAM_CREF_SKIP) {
-            append_digar(read.digars, DigarOp{ref_pos, DigarType::RefSkip, len, query_pos, false, ""});
+            // longcallD collect_digar_*: skip N op without adding a digar entry.
             ref_pos += len;
         }
     }
@@ -783,16 +779,8 @@ static bool build_digars_md_cigar(const bam1_t* aln,
             record_variant_event(read, aln->core.tid, digar);
             if (!digar.low_quality) noisy_builder.observe_variant(ref_pos, len, len);
             ref_pos += len;
-            // MD deletion format is: ^<deleted bases>. Advance past exactly `len` deleted bases.
-            if (*md == '^') {
-                ++md;
-                for (int k = 0; k < len; ++k) {
-                    if (*md == '\0' || !std::isalpha(static_cast<unsigned char>(*md))) return false;
-                    ++md;
-                }
-            } else if (*md != '\0') {
-                // Be lenient if MD does not contain '^' (some aligners omit/reshape MD); consume
-                // one token to avoid infinite loops, but do not overrun.
+            // longcallD MD pointer advance after deletion: skip one token and consume letters.
+            if (*md != '\0') {
                 ++md;
                 while (*md != '\0' && std::isalpha(static_cast<unsigned char>(*md))) ++md;
             }
@@ -983,6 +971,32 @@ static bool build_digars_cs_tag(const bam1_t* aln,
     return true;
 }
 
+/**
+ * @brief Entry point for per-read digar construction: selects the best available encoding strategy.
+ *
+ * Tries four strategies in order and falls back when a strategy is unavailable or malformed:
+ *
+ * 1. **EQX CIGAR** (`=`/`X` operators, no `M`): explicit match/mismatch; no reference lookup
+ *    needed. Most accurate and fastest. Used when `cigar_has_eqx_without_m`.
+ * 2. **`cs:Z:` tag** (minimap2 format): `:` matches, `*xy` mismatches, `+seq` insertions,
+ *    `-seq` deletions. Falls back to ref-comparison if the tag is missing or malformed.
+ * 3. **`MD:Z:` tag** + CIGAR: reconstructs SNPs from the `MD` string; insertions from CIGAR.
+ *    Falls back to ref-comparison if the tag is missing or malformed.
+ * 4. **Reference comparison** (fallback): walks `M` CIGAR operations and compares read bases
+ *    against the FASTA via `ReferenceCache`. Always succeeds.
+ *
+ * All strategies extract SNPs, insertions, and deletions of **any length** — there is no minimum
+ * indel size filter here. Insertion ALT sequences are captured from the read; deletion ref_len is
+ * recorded (deleted sequence is fetched from FASTA only at output time). Quality flags are set by
+ * `insertion_is_low_quality` and `deletion_is_low_quality`. After digar building, per-read noisy
+ * intervals are merged with `digar_merge_noisy`.
+ *
+ * @param aln BAM record to process.
+ * @param header BAM header (for contig name lookup).
+ * @param ref Reference sequence cache (used by fallback strategy).
+ * @param opts Options (min_bq, noisy window size, etc.).
+ * @param read Output: digars, noisy_regions, total_cand_events are populated.
+ */
 void build_digars_and_events(const bam1_t* aln,
                              const bam_hdr_t* header,
                              ReferenceCache& ref,
@@ -1011,7 +1025,6 @@ void build_digars_and_events(const bam1_t* aln,
         build_digars_ref_cigar(aln, header, ref, opts, read);
     }
 
-    digar_merge_noisy(read);
 }
 
 // ════════════════════════════════════════════════════════════════════════════

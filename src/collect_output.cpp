@@ -253,11 +253,11 @@ void write_variants_vcf_header(std::ostream& out, const Options& opts, const bam
     }
     out << "##source=pgphase collect-bam-variation\n";
     out << "##FILTER=<ID=PASS,Description=\"All filters passed\">\n";
-    out << "##FILTER=<ID=LowQual,Description=\"Low quality candidate\">\n";
+    out << "##FILTER=<ID=LowQual,Description=\"Low quality variant\">\n";
     out << "##FILTER=<ID=RefCall,Description=\"Reference call candidate\">\n";
     out << "##FILTER=<ID=NoCall,Description=\"Site has depth=0 resulting in no call\">\n";
     out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the variant described in this record\">\n";
-    out << "##INFO=<ID=CLEAN,Number=0,Type=Flag,Description=\"Clean-region candidate variant\">\n";
+    out << "##INFO=<ID=CLEAN,Number=0,Type=Flag,Description=\"Clean-region variant (SNP or simple indel in non-repetitive region)\">\n";
     out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">\n";
     out << "##INFO=<ID=SVLEN,Number=A,Type=Integer,Description=\"Difference in length between REF and ALT alleles\">\n";
     out << "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Total depth\">\n";
@@ -285,11 +285,11 @@ void write_phased_variants_vcf_header(std::ostream& out, const Options& opts, co
     }
     out << "##source=pgphase collect-bam-variation\n";
     out << "##FILTER=<ID=PASS,Description=\"All filters passed\">\n";
-    out << "##FILTER=<ID=LowQual,Description=\"Low quality candidate\">\n";
+    out << "##FILTER=<ID=LowQual,Description=\"Low quality variant\">\n";
     out << "##FILTER=<ID=RefCall,Description=\"Reference call candidate\">\n";
     out << "##FILTER=<ID=NoCall,Description=\"Site has depth=0 resulting in no call\">\n";
     out << "##INFO=<ID=END,Number=1,Type=Integer,Description=\"End position of the variant described in this record\">\n";
-    out << "##INFO=<ID=CLEAN,Number=0,Type=Flag,Description=\"Clean-region candidate variant\">\n";
+    out << "##INFO=<ID=CLEAN,Number=0,Type=Flag,Description=\"Clean-region variant (SNP or simple indel in non-repetitive region)\">\n";
     out << "##INFO=<ID=SVTYPE,Number=1,Type=String,Description=\"Type of structural variant\">\n";
     out << "##INFO=<ID=SVLEN,Number=A,Type=Integer,Description=\"Difference in length between REF and ALT alleles\">\n";
     out << "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Total depth\">\n";
@@ -315,6 +315,65 @@ struct VcfRecordCore {
     std::string info;
 };
 
+static char nt4_to_base(uint8_t b) {
+    static const char kNt4[] = {'A', 'C', 'G', 'T', 'N'};
+    return b < 4 ? kNt4[b] : 'N';
+}
+
+static bool is_longcalld_germline_output_category(VariantCategory category) {
+    switch (category) {
+        case VariantCategory::CleanHetSnp:
+        case VariantCategory::CleanHetIndel:
+        case VariantCategory::CleanHom:
+        case VariantCategory::NoisyCandHet:
+        case VariantCategory::NoisyCandHom:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool passes_longcalld_vcf_depth_gates(const CandidateVariant& candidate, const Options& opts) {
+    return candidate.counts.total_cov >= opts.min_depth && candidate.counts.alt_cov >= opts.min_alt_depth;
+}
+
+static std::pair<int, int> derive_hap_alt_ref_from_consensus(const CandidateVariant& candidate) {
+    int c1 = candidate.hap_to_cons_alle[1];
+    int c2 = candidate.hap_to_cons_alle[2];
+    if (c1 == -1 && c2 == -1) {
+        c1 = c2 = candidate.hap_to_cons_alle[0];
+    }
+    if (c1 == -1) c1 = 0;
+    if (c2 == -1) c2 = 0;
+    const bool h1_alt = (c1 != 0);
+    const bool h2_alt = (c2 != 0);
+    if (h1_alt && h2_alt) return {3, 0};
+    if (h1_alt && !h2_alt) return {1, 2};
+    if (!h1_alt && h2_alt) return {2, 1};
+    return {0, 0};
+}
+
+static bool is_alt_genotype(const CandidateVariant& candidate) {
+    const auto [hap_alt, hap_ref] = derive_hap_alt_ref_from_consensus(candidate);
+    (void)hap_ref;
+    return hap_alt == 1 || hap_alt == 2 || hap_alt == 3;
+}
+
+static std::vector<const CandidateVariant*> project_longcalld_like_vcf_candidates(
+    const CandidateTable& variants,
+    const Options& opts,
+    bool require_alt_genotype) {
+    std::vector<const CandidateVariant*> projected;
+    projected.reserve(variants.size());
+    for (const CandidateVariant& candidate : variants) {
+        if (!is_longcalld_germline_output_category(candidate.counts.category)) continue;
+        if (!passes_longcalld_vcf_depth_gates(candidate, opts)) continue;
+        if (require_alt_genotype && !is_alt_genotype(candidate)) continue;
+        projected.push_back(&candidate);
+    }
+    return projected;
+}
+
 static VcfRecordCore build_vcf_record_core(const CandidateVariant& candidate,
                                            const Options& opts,
                                            const bam_hdr_t* header,
@@ -332,15 +391,19 @@ static VcfRecordCore build_vcf_record_core(const CandidateVariant& candidate,
         const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
         core.pos = anchor_pos;
         const char anchor_base = ref.base(key.tid, anchor_pos, header);
+        const char alt_anchor_base =
+            candidate.alt_ref_base < 4 ? nt4_to_base(candidate.alt_ref_base) : anchor_base;
         core.ref_seq = std::string(1, anchor_base);
-        core.alt_seq = core.ref_seq + key.alt;
+        core.alt_seq = std::string(1, alt_anchor_base) + key.alt;
     } else { // Deletion
         const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
         core.pos = anchor_pos;
         const char anchor_base = ref.base(key.tid, anchor_pos, header);
+        const char alt_anchor_base =
+            candidate.alt_ref_base < 4 ? nt4_to_base(candidate.alt_ref_base) : anchor_base;
         const std::string del_seq = ref.subseq(key.tid, key.pos, key.ref_len, header);
         core.ref_seq = std::string(1, anchor_base) + del_seq;
-        core.alt_seq = std::string(1, anchor_base);
+        core.alt_seq = std::string(1, alt_anchor_base);
     }
 
     core.filter = "PASS";
@@ -348,9 +411,10 @@ static VcfRecordCore build_vcf_record_core(const CandidateVariant& candidate,
         core.filter = "NoCall";
     } else if (counts.category == VariantCategory::NonVariant) {
         core.filter = "RefCall";
-    } else if (counts.category != VariantCategory::CleanHetSnp &&
-               counts.category != VariantCategory::CleanHetIndel &&
-               counts.category != VariantCategory::CleanHom) {
+    } else if (counts.category == VariantCategory::LowCoverage ||
+               counts.category == VariantCategory::LowAlleleFraction ||
+               counts.category == VariantCategory::StrandBias) {
+        // Keep obvious pre-call failures in LowQual; clean/noisy called candidates remain PASS.
         core.filter = "LowQual";
     }
 
@@ -380,9 +444,10 @@ static VcfRecordCore build_vcf_record_core(const CandidateVariant& candidate,
  * @brief Writes VCF body records for candidate variants.
  *
  * Produces left-normalized records: SNP at `key.pos`; insertions and deletions use the
- * anchor base at POS-1 per VCF convention. FILTER is PASS for clean categories, RefCall
- * for non-variants, NoCall when depth is zero, and LowQual otherwise. INFO includes END,
- * optional CLEAN, depth and allele fields, AF, CAT, and SVTYPE/SVLEN when |SVLEN| >=
+ * anchor base at POS-1 per VCF convention. FILTER is PASS for called candidate categories,
+ * RefCall for non-variants, NoCall when depth is zero, and LowQual for obvious pre-call
+ * failures (LOW_COV / LOW_AF / STRAND_BIAS). INFO includes END, optional CLEAN (clean-region
+ * categories only), depth and allele fields, AF, CAT, and SVTYPE/SVLEN when |SVLEN| >=
  * `opts.min_sv_len`.
  *
  * @param out Output stream for the `.vcf` body.
@@ -396,7 +461,10 @@ void write_variants_vcf_records(std::ostream& out,
                                 const bam_hdr_t* header,
                                 ReferenceCache& ref,
                                 const CandidateTable& variants) {
-    for (const CandidateVariant& candidate : variants) {
+    const std::vector<const CandidateVariant*> projected =
+        project_longcalld_like_vcf_candidates(variants, opts, false);
+    for (const CandidateVariant* candidate_ptr : projected) {
+        const CandidateVariant& candidate = *candidate_ptr;
         const VariantKey& key = candidate.key;
         const std::string chrom = header->target_name[key.tid];
         const VcfRecordCore core = build_vcf_record_core(candidate, opts, header, ref);
@@ -410,15 +478,19 @@ void write_phased_variants_vcf_records(std::ostream& out,
                                        const bam_hdr_t* header,
                                        ReferenceCache& ref,
                                        const CandidateTable& variants) {
-    for (const CandidateVariant& candidate : variants) {
+    const std::vector<const CandidateVariant*> projected =
+        project_longcalld_like_vcf_candidates(variants, opts, true);
+    for (const CandidateVariant* candidate_ptr : projected) {
+        const CandidateVariant& candidate = *candidate_ptr;
         const VariantKey& key = candidate.key;
         const std::string chrom = header->target_name[key.tid];
         const VcfRecordCore core = build_vcf_record_core(candidate, opts, header, ref);
 
+        const auto [hap_alt, hap_ref] = derive_hap_alt_ref_from_consensus(candidate);
         std::string gt = "./.";
-        if (candidate.hap_alt == 1 && candidate.hap_ref == 2) gt = "1|0";
-        else if (candidate.hap_alt == 2 && candidate.hap_ref == 1) gt = "0|1";
-        else if (candidate.hap_alt == 3) gt = "1|1";
+        if (hap_alt == 1 && hap_ref == 2) gt = "1|0";
+        else if (hap_alt == 2 && hap_ref == 1) gt = "0|1";
+        else if (hap_alt == 3) gt = "1|1";
         else if (candidate.counts.category == VariantCategory::NonVariant) gt = "0/0";
 
         std::string ps = ".";

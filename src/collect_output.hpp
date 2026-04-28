@@ -17,11 +17,12 @@ namespace pgphase_collect {
 /**
  * @brief Declarations for TSV/VCF/read-support serialization of collect-bam-variation results.
  *
- * @details Contract: outputs describe **pre-phasing candidates**, not final diploid genotypes. TSV includes
- * CATEGORY (final, post-containment) and INIT_CAT (longcallD first `classify_var_cate` only, for parity
- * checks). VCF uses FILTER from final category; INFO.CAT matches final labels. Candidate TSV includes
- * `PHASE_SET` / `HAP_ALT` / `HAP_REF` from k-means. Optional `--phase-read-tsv` lists per-read scaffold
- * fields (`HAP`, `PHASE_SET`) for debugging phasing.
+ * @details Contract: TSV/read-support outputs remain **candidate-space** diagnostics. VCF outputs use a
+ * longcallD-like final-call projection (germline/noisy called categories that pass depth/alt-depth gates)
+ * rather than dumping all candidate rows. TSV includes CATEGORY (final, post-containment) and INIT_CAT
+ * (longcallD first `classify_var_cate` only, for parity checks). Candidate TSV includes `PHASE_SET` /
+ * `HAP_ALT` / `HAP_REF` from k-means. Optional `--phase-read-tsv` lists per-read scaffold fields
+ * (`HAP`, `PHASE_SET`) for debugging phasing.
  */
 
 /**
