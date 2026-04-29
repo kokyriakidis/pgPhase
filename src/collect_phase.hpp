@@ -73,7 +73,9 @@ uint32_t category_to_flag(VariantCategory c);
  *               each already phased by `assign_hap_based_on_germline_het_vars_kmeans`.
  *               Chunks on different contigs are silently skipped at the boundary.
  */
-void stitch_chunk_haps(std::vector<BamChunk>& chunks);
+void stitch_chunk_haps(std::vector<BamChunk>& chunks,
+                       const Options* opts = nullptr,
+                       const PgbamSidecarData* pgbam_sidecar = nullptr);
 
 /**
  * @brief Assign haplotypes and phase sets to reads via iterative k-means clustering.

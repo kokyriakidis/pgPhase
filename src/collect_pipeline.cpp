@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
@@ -33,6 +34,75 @@
 #include <htslib/sam.h>
 
 namespace pgphase_collect {
+
+static uint32_t read_u32_le_or_throw(std::istream& in, const char* what) {
+    uint8_t b[4] = {0, 0, 0, 0};
+    in.read(reinterpret_cast<char*>(b), 4);
+    if (!in) throw std::runtime_error(std::string("failed reading ") + what);
+    return static_cast<uint32_t>(b[0]) |
+           (static_cast<uint32_t>(b[1]) << 8) |
+           (static_cast<uint32_t>(b[2]) << 16) |
+           (static_cast<uint32_t>(b[3]) << 24);
+}
+
+static uint64_t read_u64_le_or_throw(std::istream& in, const char* what) {
+    uint8_t b[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    in.read(reinterpret_cast<char*>(b), 8);
+    if (!in) throw std::runtime_error(std::string("failed reading ") + what);
+    return static_cast<uint64_t>(b[0]) |
+           (static_cast<uint64_t>(b[1]) << 8) |
+           (static_cast<uint64_t>(b[2]) << 16) |
+           (static_cast<uint64_t>(b[3]) << 24) |
+           (static_cast<uint64_t>(b[4]) << 32) |
+           (static_cast<uint64_t>(b[5]) << 40) |
+           (static_cast<uint64_t>(b[6]) << 48) |
+           (static_cast<uint64_t>(b[7]) << 56);
+}
+
+static std::string read_sized_string_or_throw(std::istream& in, const char* what) {
+    const uint32_t n = read_u32_le_or_throw(in, what);
+    std::string s(static_cast<size_t>(n), '\0');
+    if (n > 0) {
+        in.read(&s[0], static_cast<std::streamsize>(n));
+        if (!in) throw std::runtime_error(std::string("failed reading ") + what);
+    }
+    return s;
+}
+
+static PgbamSidecarData load_pgbam_sidecar(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open pgbam sidecar: " + path);
+    char magic[4] = {0, 0, 0, 0};
+    in.read(magic, 4);
+    if (!in || !(magic[0] == 'P' && magic[1] == 'G' && magic[2] == 'S' && magic[3] == '1')) {
+        throw std::runtime_error("invalid pgbam sidecar magic in: " + path);
+    }
+    const uint32_t version = read_u32_le_or_throw(in, "pgbam sidecar version");
+    if (version != 1) {
+        throw std::runtime_error("unsupported pgbam sidecar version in: " + path);
+    }
+    uint8_t used_r_index = 0;
+    in.read(reinterpret_cast<char*>(&used_r_index), 1);
+    if (!in) throw std::runtime_error("failed reading pgbam sidecar r-index flag");
+    (void)used_r_index;
+    (void)read_sized_string_or_throw(in, "pgbam sidecar fingerprint");
+
+    PgbamSidecarData data;
+    while (in.peek() != std::char_traits<char>::eof()) {
+        const uint32_t set_id = read_u32_le_or_throw(in, "pgbam set_id");
+        const uint32_t n_threads = read_u32_le_or_throw(in, "pgbam set thread count");
+        std::vector<uint64_t> threads;
+        threads.reserve(static_cast<size_t>(n_threads));
+        for (uint32_t i = 0; i < n_threads; ++i) {
+            threads.push_back(read_u64_le_or_throw(in, "pgbam thread_id"));
+        }
+        const auto inserted = data.set_to_threads.emplace(set_id, std::move(threads));
+        if (!inserted.second) {
+            throw std::runtime_error("duplicate set_id in pgbam sidecar: " + std::to_string(set_id));
+        }
+    }
+    return data;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Region chunking
@@ -595,7 +665,7 @@ CandidateTable collect_chunks_parallel(
     if (chunks.empty()) return CandidateTable{};
     ChunkBatchResult result =
         collect_chunk_batch_parallel(opts, chunks, 0, chunks.size(), read_support_batches != nullptr);
-    stitch_chunk_haps(result.chunks);
+    stitch_chunk_haps(result.chunks, &opts, nullptr);
     if (read_support_batches != nullptr) *read_support_batches = std::move(result.read_support_batches);
     return merge_chunk_candidates(result.chunks);
 }
@@ -610,6 +680,11 @@ CandidateTable collect_chunks_parallel(
  * @param opts Output paths, reference, BAM list, and threading configuration.
  */
 void run_collect_bam_variation(const Options& opts) {
+    std::unique_ptr<PgbamSidecarData> pgbam_sidecar;
+    if (!opts.pgbam_file.empty()) {
+        pgbam_sidecar = std::make_unique<PgbamSidecarData>(load_pgbam_sidecar(opts.pgbam_file));
+    }
+
     std::unique_ptr<faidx_t, FaiDeleter> fai(load_reference_index(opts.ref_fasta));
 
     const std::vector<RegionChunk> chunks = load_region_chunks(opts);
@@ -673,7 +748,7 @@ void run_collect_bam_variation(const Options& opts) {
 
         ChunkBatchResult batch = collect_chunk_batch_parallel(
             opts, chunks, batch_begin, batch_end, !opts.read_support_tsv.empty());
-        stitch_chunk_haps(batch.chunks);
+        stitch_chunk_haps(batch.chunks, &opts, pgbam_sidecar.get());
         CandidateTable variants = merge_chunk_candidates(batch.chunks);
         n_variants += variants.size();
         write_variants_tsv_records(variant_out, header.get(), ref, variants);
@@ -773,7 +848,8 @@ enum LongOption {
     kInputIsListOption,
     kRefineAlnOption,
     kPhaseReadTsvOption,
-    kPhasedVcfOutputOption
+    kPhasedVcfOutputOption,
+    kPgbamFileOption
 };
 
 /**
@@ -832,6 +908,7 @@ static void print_collect_help() {
         << "                                note: output SAM/BAM/CRAM may be unsorted when --refine-aln is set\n"
         << "      --read-support FILE       Per-read ref/alt observations at candidates (for phasing)\n"
         << "      --phase-read-tsv FILE     Per-read HAP / PHASE_SET after k-means phasing\n"
+        << "      --pgbam-file FILE         Optional .pgbam sidecar for fallback chunk stitching when common-read signal is absent\n"
         << "      --chunk-size INT          Region chunk size in bp [500000]\n"
         << "      --noisy-merge-dis INT     Max distance (bp) to merge noisy/SV windows [500]\n"
         << "      --min-sv-len INT          min_sv_len for noisy-region cgranges merge [30]\n"
@@ -898,6 +975,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"refine-aln",                no_argument,       nullptr, kRefineAlnOption},
         {"read-support",              required_argument, nullptr, kReadSupportOption},
         {"phase-read-tsv",            required_argument, nullptr, kPhaseReadTsvOption},
+        {"pgbam-file",                required_argument, nullptr, kPgbamFileOption},
         {"chunk-size",                required_argument, nullptr, kChunkSizeOption},
         {"noisy-merge-dis",           required_argument, nullptr, kNoisyRegMergeDisOption},
         {"min-sv-len",                required_argument, nullptr, kMinSvLenOption},
@@ -963,6 +1041,7 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kRefineAlnOption:      opts.refine_aln = true; break;
             case kReadSupportOption:    opts.read_support_tsv = optarg; break;
             case kPhaseReadTsvOption:   opts.phase_read_tsv = optarg; break;
+            case kPgbamFileOption:      opts.pgbam_file = optarg; break;
             case kChunkSizeOption:      opts.chunk_size = std::stoll(optarg); break;
             case kNoisyRegMergeDisOption: opts.noisy_reg_merge_dis = std::stoi(optarg); break;
             case kMinSvLenOption:       opts.min_sv_len = std::stoi(optarg); break;

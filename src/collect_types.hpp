@@ -14,6 +14,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -199,6 +200,8 @@ struct Options {
     std::string read_support_tsv;
     /** If non-empty, write per-read HAP / PHASE_SET after k-means phasing (per chunk). */
     std::string phase_read_tsv;
+    /** Optional pgbam sidecar file used for fallback chunk stitching when overlap reads have no signal. */
+    std::string pgbam_file;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
     /** CLI command string used for PG:CL header field in phased SAM/BAM/CRAM output. */
     std::string command_line;
@@ -361,6 +364,13 @@ struct ReadRecord {
 struct OverlapSkipCounts {
     int upstream = 0;
     int downstream = 0;
+};
+
+/**
+ * @brief Parsed pgbam sidecar map: set_id -> graph thread IDs.
+ */
+struct PgbamSidecarData {
+    std::unordered_map<uint32_t, std::vector<uint64_t>> set_to_threads;
 };
 
 // ════════════════════════════════════════════════════════════════════════════

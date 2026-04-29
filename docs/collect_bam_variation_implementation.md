@@ -8,8 +8,8 @@ The implementation is organized as a **staged pipeline** so that memory stays bo
 - **`collect_var.cpp`** — The “biology core” ported from longcallD: gather candidate keys from digars, sweep reads for allele depths, then merge and filter chunk-level noisy regions (`cgranges`, `pre_process_noisy_regs` timing), run Fisher strand bias in ONT mode, run the two-pass `classify_cand_vars`-shaped classification, build read-level allele profiles (`collect_read_var_profile`), and co-phase clean germline het markers iteratively (`assign_hap_based_on_germline_het_vars_kmeans`).
 - **`bam_digar.cpp`** — The “alignment plane”: stream BAM/CRAM into `ReadRecord` rows, apply read filters, build digars from EQX / MD / `cs` / reference comparison, and detect **per-read** noisy intervals using the same sliding-window rule as longcallD (see §8).
 - **`collect_output.cpp`** — Serializers only: TSV header/body, optional projected VCF and projected phased VCF (longcallD-style FILTER/INFO/category gates), and optional read×site read-support TSV. No classification logic lives here.
-- **`collect_phase.cpp` / `collect_phase.hpp`** — K-means read–haplotype clustering (`assign_hap_based_on_germline_het_vars_kmeans`), ported from longcallD `assign_hap.c`; category bitmask flags (`kCandCleanHetSnp`, …) for selecting which `VariantCategory` values participate in phasing.
-- **`collect_types.hpp`** — Shared structs (`Options`, `BamChunk`, `ReadRecord`, `CandidateVariant`, `ReadVariantProfile`, per-read `haps` / `phase_sets`, …) and small RAII helpers (`SamFile`, `ReferenceCache`, HTS deleters).
+- **`collect_phase.cpp` / `collect_phase.hpp`** — K-means read–haplotype clustering (`assign_hap_based_on_germline_het_vars_kmeans`), ported from longcallD `assign_hap.c`; category bitmask flags (`kCandCleanHetSnp`, …) for selecting which `VariantCategory` values participate in phasing; chunk-boundary stitching (`stitch_chunk_haps` / `flip_chunk_hap`) with common-read voting as primary path and pangenome-graph thread intersection as fallback (§19.7) when `--pgbam-file` is supplied.
+- **`collect_types.hpp`** — Shared structs (`Options`, `BamChunk`, `ReadRecord`, `CandidateVariant`, `ReadVariantProfile`, per-read `haps` / `phase_sets`, `PgbamSidecarData`, …) and small RAII helpers (`SamFile`, `ReferenceCache`, HTS deleters).
 
 Together, these files implement “longcallD-shaped” candidate collection in C++17 with explicit streaming and multi-BAM pooling.
 
@@ -62,11 +62,13 @@ collect_var.cpp        candidate sites, allele counts, noisy-region prep/post-pr
 bam_digar.cpp          BAM/CRAM iteration, filters, EQX/MD/cs/ref digars, per-read noisy windows
 collect_output.cpp     TSV, optional VCF, optional read-support TSV
 collect_phase.cpp      assign_hap_based_on_germline_het_vars_kmeans (longcallD assign_hap.c),
-                       stitch_chunk_haps / flip_chunk_hap (longcallD stitch_var_main / flip_variant_hap)
+                       stitch_chunk_haps / flip_chunk_hap (longcallD stitch_var_main / flip_variant_hap),
+                       pgbam fallback stitching (extract_hs_set_ids, collect_thread_set_for_group,
+                       unique hap-thread concordance, apply_chunk_flip_and_merge)
 collect_phase.hpp      kCand* flags (incl. kCandGermlineClean, kCandGermlineVarCate), assign_hap decl.,
-                       stitch_chunk_haps decl.
-collect_types.hpp      Options, BamChunk, ReadRecord, candidates, ReadVariantProfile,
-                       hap_to_alle_profile, alle_covs / n_uniq_alles, ReferenceCache, …
+                       stitch_chunk_haps decl. (opts + pgbam_sidecar optional params)
+collect_types.hpp      Options (incl. pgbam_file), BamChunk, ReadRecord, candidates, ReadVariantProfile,
+                       hap_to_alle_profile, alle_covs / n_uniq_alles, PgbamSidecarData, ReferenceCache, …
 main.cpp               dispatches `pgphase collect-bam-variation` to collect_bam_variation()
 ```
 
@@ -136,6 +138,12 @@ Two option semantics require explicit clarification:
   the Fisher strand test.
 
 Only one of --hifi, --ont, and --short-reads may be supplied.
+
+--pgbam-file FILE
+  Optional path to a pgbam sidecar (.pgbam). When supplied, chunk-boundary
+  stitching falls back to pangenome-graph thread intersection (§19.7) for
+  boundaries where common-read voting has no signal (flip_score == 0). Has
+  no effect on the common-read path; when absent the fallback is disabled.
 ```
 
 The command supports explicit region restriction:
@@ -1322,7 +1330,7 @@ Fields intentionally **not** freed (matching longcallD `bam_chunk_mid_free`):
 
 | Kept field | Reason |
 |---|---|
-| `r.alignment` (BAM record) | Future phased-BAM output; longcallD keeps `bam_read->bam_record` |
+| `r.alignment` (BAM record) | Phased-BAM output and pgbam fallback stitching (`bam_aux_get("hs")`); longcallD keeps `bam_read->bam_record` |
 | `chunk.ref_seq` | Freed later in post-free equivalent; longcallD defers to `bam_chunk_post_free` |
 | `chunk.ordered_read_ids` | longcallD iterates it in `update_chunk_read_hap_phase_set1` |
 | `chunk.read_var_profile` | longcallD never frees in mid or post_free (only in full `bam_chunk_free`) |
@@ -1367,16 +1375,13 @@ For every `CandidateVariant v` in `cur`:
 - If `do_flip` and `v.phase_set == min_cur_ps`: swap `hap_to_cons_alle[1] ↔ [2]`.
 - If `v.phase_set == min_cur_ps` and both anchors are valid: rewrite `v.phase_set = max_pre_ps`.
 
-Current implementation note: this stitching function updates candidate-level phase state only
-(`hap_to_cons_alle` and `phase_set`). Read-level `haps` / `phase_sets` are not rewritten here.
-Projected phased VCF output derives GT orientation from `hap_to_cons_alle`.
+`apply_chunk_flip_and_merge` (extracted helper) applies both parts: if `do_flip`, it swaps `hap_to_cons_alle[1] ↔ [2]` and flips read `haps` (`3 - hap`) for all reads whose `phase_sets` entry equals `min_cur_ps`; then, if both anchors are valid, it rewrites candidate and read `phase_sets` from `min_cur_ps` to `max_pre_ps`. Both candidate-level and read-level phase state are updated. Projected phased VCF output derives GT orientation from `hap_to_cons_alle`.
 
 **`stitch_chunk_haps`** iterates pairs `(chunks[0], chunks[1])`, `(chunks[1], chunks[2])`, … left to right, calling `flip_chunk_hap` for each.
 
 ### 19.2 Phase-Set Anchor Semantics
 
-`min_cur_ps` is the earliest phase-set anchor among boundary-spanning reads in the current chunk; `max_pre_ps` is the latest anchor among the matching reads in the previous chunk. After stitching, all variants and reads that carried `min_cur_ps` now carry `max_pre_ps`, effectively **extending the previous chunk's phase block** into the current one and merging them into a single continuous block.
-`min_cur_ps` is the earliest phase-set anchor among boundary-spanning reads in the current chunk; `max_pre_ps` is the latest anchor among matching reads in the previous chunk. After stitching, candidate rows in the current chunk carrying `min_cur_ps` are rewritten to `max_pre_ps`, effectively extending the previous chunk’s phase block into the current chunk when boundary evidence supports it.
+`min_cur_ps` is the earliest phase-set anchor among boundary-spanning reads in the current chunk; `max_pre_ps` is the latest anchor among the matching reads in the previous chunk. After stitching, all variants and reads that carried `min_cur_ps` now carry `max_pre_ps`, effectively **extending the previous chunk’s phase block** into the current one and merging them into a single continuous block.
 
 ### 19.3 Worked Example — No Flip Needed
 
@@ -1430,18 +1435,231 @@ The implementation uses longcallD-style j-th index pairing between `pre.down_ovl
 These guards make stitching failures explicit instead of silently continuing with inconsistent
 boundary read pairing.
 
-### 19.6 Integration in the Batch Loop
+### 19.6 Pipeline Architecture and Threading Model
 
-`stitch_chunk_haps` is called once per contig batch, after all workers have finished `mid_free_chunk` (§18.1), before candidate-table concatenation and TSV/VCF output:
+#### Per-contig batch loop
+
+The outer loop in `run_collect_bam_variation` groups chunks by `reg_chunk_i` — a monotonically increasing counter that resets at each contig boundary. All chunks with the same `reg_chunk_i` value belong to the same contig and form one batch:
 
 ```text
-collect_chunk_batch_parallel(batch, ...)     # parallel k-means + mid_free_chunk per chunk
-stitch_chunk_haps(batch.chunks)              # sequential boundary flip, left to right
-merge_chunk_candidates(batch)               # concat candidate tables
-append write_variants_tsv_records(...)       # TSV + optional VCF / read-support
+while batch_begin < chunks.size():
+    batch_end = first index where reg_chunk_i changes   ← one contig
+    batch = collect_chunk_batch_parallel(batch_begin, batch_end)   ← PARALLEL
+    stitch_chunk_haps(batch.chunks, &opts, sidecar.get())          ← SEQUENTIAL
+    merge_chunk_candidates(batch)                                   ← concat
+    write output (TSV / VCF / read-support / phased BAM)
+    batch_begin = batch_end
 ```
 
-This matches longcallD's `kt_pipeline` pipeline-2 stage where `stitch_var_main` runs sequentially after the parallel phase-3 workers. Both tools hold all chunks of one contig in memory during this sequential pass; `mid_free_chunk` makes that feasible by releasing large per-chunk intermediates beforehand.
+Each contig is fully processed and written before the next contig begins. The tool never holds more than one contig's worth of `BamChunk` objects in memory simultaneously.
+
+#### Parallel phase (per-chunk, embarrassingly parallel)
+
+`collect_chunk_batch_parallel` dispatches a `std::thread` pool over all chunks in the batch. Each worker independently runs BAM ingestion, variant classification, and k-means haplotype assignment for its assigned chunks. No shared state is accessed during this phase. Because haplotype assignment is local, each chunk independently picks an arbitrary orientation for its hap-1 and hap-2 labels — they are meaningless relative to adjacent chunks until stitching resolves them.
+
+#### Sequential stitch (single thread, left to right)
+
+After all workers join, `stitch_chunk_haps` runs on the main thread. It performs two left-to-right passes over the batch:
+
+```text
+pass 1 — within-chunk:
+    for each chunk in left-to-right order:
+        stitch_phase_blocks_within_chunk(chunk, sidecar)  ← §19.7
+
+pass 2 — cross-chunk:
+    for each adjacent pair (chunk[i-1], chunk[i]):
+        flip_chunk_hap(chunk[i-1], chunk[i], opts, sidecar)  ← §19.5 / §19.8
+```
+
+Within-chunk stitching runs first so that by the time the cross-chunk pass reaches a boundary, each chunk already has its internal phase blocks oriented consistently. The cross-chunk pass then draws thread signal from the full merged read population of the boundary-adjacent phase block rather than from a single small block.
+
+For the pgbam path, "full merged read population" is represented by live hap-thread state, not by carrying forward old pairwise vote totals. When phase blocks A and B merge, the implementation unions B's oriented hap-thread sets into A's cached state. The next comparison, AB versus C, recomputes a fresh 2x2 concordance matrix from AB's current hap-thread evidence and C's hap-thread evidence. The previous A-versus-B score is deliberately discarded because it answered a different question and would bias the next boundary.
+
+#### Why stitching must be sequential
+
+Each stitching step can rename `phase_sets` values, which changes the inputs to the next step. Step `i+1`'s left anchor (`max_pre_ps` for cross-chunk, or `left_ps` from `psets[i]` for within-chunk) depends on whether step `i` succeeded and updated those values. Parallelising the stitch would require synchronisation over the shared `haps[]` and `phase_sets[]` arrays with no meaningful speedup, since the total read count across all chunks of one contig is the bottleneck and the stitching scan is linear in that count.
+
+This matches longcallD's `stitch_var_main`, which is also a sequential left-to-right sweep after the parallel chunk-processing workers join.
+
+#### Memory: why `mid_free_chunk` is required before stitching
+
+Stitching holds every `BamChunk` of the contig in memory simultaneously. `mid_free_chunk` (called inside each parallel worker, §18.1) releases the heavy per-chunk intermediates — read variant profiles, noisy region interval trees, candidate depth tallies — beforehand, keeping only what stitching and output require: `reads[].alignment` (needed by `bam_aux_get("hs")` in the pgbam path and by phased-BAM output), `haps[]`, `phase_sets[]`, and `candidates[]`.
+
+### 19.7 pgbam Fallback Stitching
+
+When common-read scoring yields `flip_score == 0` (no boundary-spanning reads with haplotype signal) and a pgbam sidecar is loaded, `flip_chunk_hap` attempts a **pangenome-graph thread intersection** to resolve orientation. This is the "pgbam fallback" path.
+
+#### Why common-read stitching can fail
+
+The common-read path requires at least one read that is phased in both the previous chunk and the current chunk. Such reads exist when coverage is continuous across the chunk boundary and reads are long enough to span it. This assumption breaks in several realistic scenarios:
+
+- **Structural variants at the boundary.** A deletion, inversion, or large insertion can displace reads so that no read aligns across the breakpoint.
+- **Assembly or reference gaps.** Hard-masked or absent reference sequence creates coverage voids that reads cannot span.
+- **Extreme coverage drops.** Even without a structural event, low-coverage regions can leave a boundary with zero spanning reads by chance.
+
+In all these cases `flip_score == 0` not because the chunks are in phase but because the evidence channel is simply absent. The correct response is to use a different evidence channel rather than leave orientation unresolved.
+
+#### Why pangenome-graph threads provide orientation evidence
+
+A pgbam-annotated BAM (produced by a pangenome aligner such as GraphAligner or vg) annotates each read with the **graph set IDs** of the pangenome paths it aligns to (stored in the `hs` BAM tag). The pgbam sidecar maps those set IDs to **graph thread IDs** — the individual haplotype sequences in the pangenome reference graph.
+
+The key insight is that thread membership is a haplotype-level property of the graph, not a read-overlap property: reads on the same physical haplotype tend to align to the same graph threads even when they come from genomic positions too far apart to share alignment. A read from haplotype 1 in chunk A and a read from haplotype 1 in chunk B will share thread IDs if the underlying physical haplotype is continuous — regardless of whether those two reads overlap at the sequence level.
+
+This provides **orientation evidence across gaps** that the common-read path cannot see.
+
+#### Design rationale and benefits
+
+| Property | Design decision | Benefit |
+|---|---|---|
+| Fallback-only | pgbam path runs only when `flip_score == 0` | Common-read evidence always takes precedence; pgbam cannot override an existing vote |
+| Unweighted intersection | Support = raw thread-ID intersection count, not coverage-weighted | Thread IDs are already haplotype-resolved; weighting by coverage would conflate depth with haplotype identity |
+| 2x2 hap concordance | Adjacent blocks are compared as hap1/hap2 thread-set intersections (`s11`, `s12`, `s21`, `s22`) | The signal is block-local orientation evidence, not accumulated historical vote totals |
+| Hap-unique support | Threads present on both hap sides within the same block are removed before scoring | Ambiguous graph threads do not make a block look artificially concordant with both orientations |
+| Live merged state | A successful within-chunk merge carries forward oriented hap-thread sets, not old pairwise scores | Large merged blocks contribute their accumulated hap identity without letting previous merge decisions inflate later scores |
+| Read-thread cache | Within-chunk stitching resolves each read's `hs` tag once before the sweep | Many small short-read phase blocks do not repeatedly parse the same BAM aux tags |
+| Cached hap-unique sets | `hap_unique_threads[1/2]` are stored in `PhaseBlockThreadState` and refreshed only on state creation/merge | Comparisons against a large merged block do not repeatedly recompute `hap1 - hap2` and `hap2 - hap1` |
+| Temporary stitch memory | Cached read-thread and phase-block states live only inside `stitch_phase_blocks_within_chunk` | RAM increases during the within-chunk pgbam sweep, but the cache is released before moving to the next chunk |
+| Min winner support ≥ 2 | Orientation call requires the winning side to have at least 2 shared hap-unique threads | Screens out single-thread noise without coverage-weighting by read depth |
+| Graceful degradation | Tied score or fewer than 2 winner intersections → return false, boundary left unstitched | No worse than baseline; incorrect orientation is actively avoided |
+| Read-skip on unresolved `hs` | Reads with no `hs` tag or unmapped set IDs are skipped, not counted | Partial sidecar coverage is tolerated; only positively resolved reads contribute signal |
+
+#### Algorithm
+
+**Entry condition.** The pgbam path is reached in three cases: (a) `n_cur_ovlp_reads == 0` — there are no boundary-spanning reads at all (the primary use case); (b) `n_cur_ovlp_reads > 0` but all overlap reads are unphased (`hap == 0`) or skipped, so `flip_score` is never updated from zero; or (c) `n_cur_ovlp_reads > 0` and the reads are phased but their votes cancel exactly (equal numbers agree and disagree). In all three cases the common-read path provides no orientation signal. The common-read computation is gated on `n_cur_ovlp_reads > 0` so that zero-overlap boundaries skip straight to the pgbam check without triggering the overlap-count mismatch guard.
+
+**Anchor computation (fallback).** Because boundary-spanning reads are absent or uninformative, `max_pre_ps` and `min_cur_ps` are recomputed from all phased reads in each chunk rather than from the overlap lists: `max_pre_ps` = largest `phase_sets` value among non-skipped, hap-assigned reads in `pre`; `min_cur_ps` = smallest such value in `cur`. If either chunk has no phased reads, the fallback returns false.
+
+**Within-chunk anchors.** `stitch_phase_blocks_within_chunk` first collects all non-negative `phase_sets` from hap-assigned, non-skipped reads, sorts them by anchor position, deduplicates them, and sweeps the resulting anchor list left to right. The anchor list is fixed, but entries are rewritten after successful merges (`psets[i] = left_ps`) so the next iteration uses the surviving merged identity.
+
+**Read-thread cache.** Within a chunk, `build_read_thread_cache` resolves each read's `hs` tag once:
+
+```text
+read_i -> sorted unique graph thread IDs
+```
+
+This cache is then reused to initialize the phase-block states. It avoids the previous behavior where each adjacent-block comparison repeatedly scanned the whole chunk and reparsed the same `hs` aux tags.
+
+The read-thread cache is temporary. It is allocated inside the within-chunk stitch call for one chunk, used to seed the starting `PhaseBlockThreadState` objects, and then released when the function returns. It is not stored on `BamChunk` and does not persist into output emission.
+
+**Thread-set collection — `collect_thread_set_for_group`.** For each of the four boundary haplotype groups (A.h1, A.h2, B.h1, B.h2), the function scans the relevant chunk for reads matching the specified hap index and phase_set anchor:
+
+1. `extract_hs_set_ids` parses the BAM `hs` auxiliary array tag (type `B`, subtypes `I`/`i` 4-byte, `S`/`s` 2-byte, `C`/`c` 1-byte) and returns a `uint32_t` vector of set IDs.
+2. Each set ID is looked up in `PgbamSidecarData::set_to_threads`. All resolved thread IDs are appended to a `std::vector<uint64_t>` for that group.
+3. Reads with no `hs` tag, an empty tag, or set IDs absent from the sidecar are skipped. The function returns `true` only if at least one read contributed threads.
+4. After all reads are scanned the vector is sorted and deduplicated (`std::sort` + `std::unique`) so that `intersection_size` can use a linear merge.
+
+**Phase block state.** Each block carries a compact live state:
+
+```cpp
+struct PhaseBlockThreadState {
+    hts_pos_t anchor;
+    std::array<std::vector<uint64_t>, 3> hap_threads;
+    std::array<std::vector<uint64_t>, 3> hap_unique_threads;
+};
+```
+
+Only indexes 1 and 2 are used. For a starting phase block, `hap_threads[1]` and `hap_threads[2]` are the sorted unique union of all graph threads from reads assigned to that hap and phase-set anchor. For a merged phase block, they are the union of all already-oriented child blocks. `hap_unique_threads[1]` and `hap_unique_threads[2]` cache the hap-specific set differences used by the next concordance test, so the same large merged block does not recompute hap-unique sets on every comparison.
+
+The two families of vectors have different roles:
+
+```text
+hap_threads         = full evidence carried forward for future merges
+hap_unique_threads  = comparison-ready evidence used directly by the 2x2 scorer
+```
+
+Keeping both costs extra temporary memory, but avoids repeatedly deriving unique sets from a growing merged block. This is useful for short-read data, where many small initial phase blocks can merge into a large left block and then be compared to many subsequent neighbors.
+
+**Reference thread sets.** The two blocks being compared are called A and B below. Their hap thread sets are built unconditionally. Whenever a block state is built or merged, `refresh_phase_block_unique_threads` computes the hap-unique evidence:
+
+```text
+A1_unique = A.h1_threads - A.h2_threads
+A2_unique = A.h2_threads - A.h1_threads
+B1_unique = B.h1_threads - B.h2_threads
+B2_unique = B.h2_threads - B.h1_threads
+```
+
+**2x2 hap concordance.** Orientation is scored by intersecting the adjacent blocks' hap-unique thread sets:
+
+```text
+s11 = |A1_unique ∩ B1_unique|
+s12 = |A1_unique ∩ B2_unique|
+s21 = |A2_unique ∩ B1_unique|
+s22 = |A2_unique ∩ B2_unique|
+
+score_nonflip = s11 + s22
+score_flip    = s12 + s21
+```
+
+Within a chunk, `stitch_phase_blocks_within_chunk` caches each read's resolved thread IDs once, builds one `PhaseBlockThreadState` per starting phase-set anchor, and then sweeps anchors left to right. On a successful merge, the right block's state is first oriented according to the flip decision and then unioned into the left block's hap-thread state. The next comparison therefore uses all hap-thread evidence from the merged phase block, while old pairwise scores are discarded.
+
+**Merge-state update.** The cached state update mirrors the real read/candidate update performed by `apply_chunk_flip_and_merge`:
+
+```text
+if do_flip:
+    oriented_B.h1_threads = B.h2_threads
+    oriented_B.h2_threads = B.h1_threads
+else:
+    oriented_B.h1_threads = B.h1_threads
+    oriented_B.h2_threads = B.h2_threads
+
+AB.h1_threads = union(A.h1_threads, oriented_B.h1_threads)
+AB.h2_threads = union(A.h2_threads, oriented_B.h2_threads)
+AB.h1_unique_threads = AB.h1_threads - AB.h2_threads
+AB.h2_unique_threads = AB.h2_threads - AB.h1_threads
+AB.anchor = A.anchor
+```
+
+This means a large merged block carries all of its hap-thread support into the next comparison. It does **not** carry the old `score_nonflip` / `score_flip` values. Those old scores describe whether A should merge with B; they are not evidence for whether AB should merge with C.
+
+**Orientation decision:**
+
+```text
+if score_nonflip == score_flip          → leave unstitched (tied)
+if max(score_nonflip, score_flip) < 2  → leave unstitched (insufficient signal)
+if score_flip > score_nonflip           → do_flip = true
+else                                    → do_flip = false
+```
+
+The minimum winner support of 2 is the only threshold. A single shared hap-unique thread with no opposition could be noise; two or more shared hap-unique threads with fewer opposing intersections constitute a call.
+
+**Apply.** `apply_chunk_flip_and_merge` is called with the fallback-derived `do_flip`, `max_pre_ps`, and `min_cur_ps` — identical to the common-read path from that point on.
+
+**Within-chunk application.** For within-chunk stitching, `apply_chunk_flip_and_merge(chunk, do_flip, left_ps, right_ps)` flips and/or renames only reads and candidates currently carrying the right block's anchor. After that mutation, the cached state at the current sweep position is replaced with the merged AB state and `psets[i]` is rewritten to `left_ps`. If a later block C merges, `left_ps` is already the surviving anchor and the cached left state already contains A and B.
+
+**Cross-chunk application.** For cross-chunk fallback, the same `decide_phase_block_concordance` scorer is used, but the state is collected on demand for the boundary-adjacent phase blocks: `max_pre_ps` in the previous chunk and `min_cur_ps` in the current chunk. Cross-chunk stitching still mutates only the current chunk, rewriting `min_cur_ps` to `max_pre_ps` and optionally flipping its haps.
+
+**Complexity and memory.** Within a chunk, `hs` parsing is `O(reads)` once. Initial block construction appends each cached thread set to one block/hap bucket and sorts/deduplicates each bucket. Hap-unique vectors are computed only when a block state is created or after a successful merge. Each stitch comparison then intersects four already-prepared sorted hap-unique vectors by linear merge. Successful merges union two sorted hap-thread vectors and refresh the two hap-unique vectors. This avoids the previous repeated full-chunk read scans and repeated hap-unique recomputation for every adjacent phase-block boundary, which is important when short reads create many small phase blocks.
+
+The RAM cost is an intentional temporary cache: during one within-chunk pgbam sweep, the implementation holds per-read resolved thread vectors, per-block full hap-thread vectors, and per-block hap-unique vectors. In the worst case, `hap_unique_threads` can approach another copy of the full hap-thread vectors. The cache is scoped to one chunk's within-chunk stitch pass and is released before the next chunk is processed, so it does not change the long-lived `BamChunk` memory model.
+
+**Data model.** `PgbamSidecarData` (declared in `collect_types.hpp`) holds the sidecar map:
+
+```cpp
+struct PgbamSidecarData {
+    std::unordered_map<uint32_t, std::vector<uint64_t>> set_to_threads;
+};
+```
+
+`Options::pgbam_file` (added to `Options` in `collect_types.hpp`) stores the path; an empty string means the fallback is disabled. The sidecar is loaded once in `run_collect_bam_variation` via `load_pgbam_sidecar` and passed as a `const PgbamSidecarData*` to every `stitch_chunk_haps` call.
+
+### 19.8 pgbam Sidecar Format
+
+The sidecar is a little-endian binary file loaded by `load_pgbam_sidecar` (`collect_pipeline.cpp`). Its layout:
+
+```text
+Offset  Size  Description
+------  ----  -----------
+0       4     Magic: ASCII "PGS1"
+4       4     Version: uint32_le — must be 1
+8       1     R-index flag: uint8 (read, not used by pgphase)
+9       4+N   Fingerprint: uint32_le length N, then N bytes (read, not validated)
+13+N    …     Records, repeating until EOF:
+              set_id:    uint32_le
+              n_threads: uint32_le
+              thread_ids[n_threads]: uint64_le each
+```
+
+Duplicate `set_id` values within one file are rejected with `std::runtime_error`. All reads are done with `std::istream` and each field checked for EOF, so a truncated file produces a diagnostic error rather than undefined behaviour.
 
 ## 20. Merging Candidate Tables Across Chunks
 
@@ -2036,8 +2254,9 @@ from CLI entry to final outputs.
 **Code path:** `collect_phase.cpp::stitch_chunk_haps` / `flip_chunk_hap`.
 
 45. After all chunks in a contig batch finish, `stitch_chunk_haps` runs sequentially left-to-right.
-46. Boundary-spanning reads vote for flip/no-flip orientation between adjacent chunks.
-47. When flipped, candidate-level `hap_to_cons_alle[1/2]` is swapped for `phase_set == min_cur_ps`, and matching candidate phase-set anchors are merged to `max_pre_ps`.
+46. **Common-read path (primary):** boundary-spanning reads vote for flip/no-flip orientation. If `flip_score != 0`, orientation is resolved and `apply_chunk_flip_and_merge` is called immediately.
+47. **pgbam fallback (secondary):** when `flip_score == 0` and `--pgbam-file` is set, the boundary phase blocks are compared with a 2x2 hap concordance matrix over hap-unique graph thread sets. Orientation is resolved if the winning side has ≥ 2 shared hap-unique threads and neither side ties; otherwise the boundary is left unstitched.
+48. `apply_chunk_flip_and_merge` updates both candidate-level state (`hap_to_cons_alle[1/2]` swap for `phase_set == min_cur_ps`) and read-level state (`haps` flipped via `3 - hap`; `phase_sets` rewritten from `min_cur_ps` to `max_pre_ps`).
 
 ### 26.15 Ordered Emission
 
