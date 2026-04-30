@@ -1,15 +1,24 @@
 #include "collect_bam_output.hpp"
 
 #include <algorithm>
-#include <cinttypes>
 #include <cctype>
+#include <cerrno>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <spawn.h>
+#include <stdexcept>
+#include <string>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <vector>
 
 #include <htslib/kstring.h>
+
+extern "C" char** environ;
 
 namespace pgphase_collect {
 
@@ -440,6 +449,77 @@ int PhasedAlignmentWriter::write_chunks(const std::vector<BamChunk>& chunks) {
         }
     }
     return n_out_reads;
+}
+
+void coordinate_sort_refined_alignment_file_or_throw(const Options& opts) {
+    if (!opts.refine_aln || opts.output_aln.empty()) return;
+    if (opts.output_aln_format != OutputAlignmentFormat::Bam &&
+        opts.output_aln_format != OutputAlignmentFormat::Cram &&
+        opts.output_aln_format != OutputAlignmentFormat::Sam) {
+        return;
+    }
+
+    const std::string presorted = opts.output_aln + ".pgphase.presorted.tmp";
+    if (std::rename(opts.output_aln.c_str(), presorted.c_str()) != 0) {
+        throw std::runtime_error("failed to rename alignment output before coordinate-sort (--refine-aln): " +
+                                 opts.output_aln + " (" + std::strerror(errno) + ")");
+    }
+
+    const int threads = std::max(1, opts.threads);
+    std::vector<std::string> storage;
+    storage.reserve(20);
+    storage.push_back("samtools");
+    storage.push_back("sort");
+    storage.push_back("-@");
+    storage.push_back(std::to_string(threads));
+    storage.push_back("-T");
+    storage.push_back(opts.output_aln + ".sortwork");
+    if (opts.output_aln_format == OutputAlignmentFormat::Cram) {
+        storage.push_back("--reference");
+        storage.push_back(opts.ref_fasta);
+        storage.push_back("-O");
+        storage.push_back("CRAM");
+    } else if (opts.output_aln_format == OutputAlignmentFormat::Sam) {
+        storage.push_back("-O");
+        storage.push_back("SAM");
+    }
+    storage.push_back("-o");
+    storage.push_back(opts.output_aln);
+    storage.push_back(presorted);
+
+    std::vector<char*> argv;
+    argv.reserve(storage.size() + 1);
+    for (std::string& s : storage) argv.push_back(s.data());
+    argv.push_back(nullptr);
+
+    pid_t pid = 0;
+    const int spawn_rc = posix_spawnp(&pid, "samtools", nullptr, nullptr, argv.data(), ::environ);
+    if (spawn_rc != 0) {
+        if (std::rename(presorted.c_str(), opts.output_aln.c_str()) != 0) {
+            std::cerr << "warning: could not restore alignment file after samtools spawn failure\n";
+        }
+        throw std::runtime_error(std::string("posix_spawnp(samtools sort) failed: ") + std::strerror(spawn_rc));
+    }
+
+    int wstatus = 0;
+    if (waitpid(pid, &wstatus, 0) != pid) {
+        std::remove(opts.output_aln.c_str());
+        if (std::rename(presorted.c_str(), opts.output_aln.c_str()) != 0) {
+            std::cerr << "warning: could not restore alignment file after waitpid failure\n";
+        }
+        throw std::runtime_error("waitpid(samtools sort) failed");
+    }
+    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
+        std::remove(opts.output_aln.c_str());
+        if (std::rename(presorted.c_str(), opts.output_aln.c_str()) != 0) {
+            std::cerr << "warning: could not restore unsorted alignment after samtools sort failure\n";
+        }
+        const int code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
+        throw std::runtime_error(
+            "samtools sort failed (exit " + std::to_string(code) +
+            "). Install samtools and ensure it is on PATH when using --refine-aln with alignment output.");
+    }
+    std::remove(presorted.c_str());
 }
 
 } // namespace pgphase_collect

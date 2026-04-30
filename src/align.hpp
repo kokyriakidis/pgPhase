@@ -237,6 +237,7 @@ int abpoa_partial_aln_msa_cons(const Options& opts, int sampling_reads,
  */
 int wfa_collect_noisy_aln_str_no_ps_hap(const Options& opts, NoisyReadInfo& info,
                                          const uint8_t* ref_seq, int ref_seq_len,
+                                         bool collect_ref_read_aln_str,
                                          std::array<int, 2>& clu_n_seqs,
                                          std::array<std::vector<int>, 2>& clu_read_ids,
                                          std::array<std::vector<AlnStr>, 2>& aln_strs);
@@ -252,6 +253,7 @@ int wfa_collect_noisy_aln_str_with_ps_hap(const Options& opts, bool sampling_rea
                                            hts_pos_t ps,
                                            int min_hap_full_reads, int min_hap_all_reads,
                                            const uint8_t* ref_seq, int ref_seq_len,
+                                           bool collect_ref_read_aln_str,
                                            std::array<int, 2>& clu_n_seqs,
                                            std::array<std::vector<int>, 2>& clu_read_ids,
                                            std::array<std::vector<AlnStr>, 2>& aln_strs);

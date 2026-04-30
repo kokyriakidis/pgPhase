@@ -800,8 +800,15 @@ void run_collect_bam_variation(const Options& opts) {
         phased_aln_writer.reset();
         if (opts.output_aln_format == OutputAlignmentFormat::Cram) {
             std::cerr << "Output " << n_out_aln_reads << " reads to CRAM\n";
+        } else if (opts.output_aln_format == OutputAlignmentFormat::Sam) {
+            std::cerr << "Output " << n_out_aln_reads << " reads to SAM\n";
         } else {
             std::cerr << "Output " << n_out_aln_reads << " reads to BAM\n";
+        }
+        if (opts.refine_aln) {
+            std::cerr << "Coordinate-sorting refined alignment (samtools sort -@"
+                      << std::max(1, opts.threads) << ")...\n";
+            coordinate_sort_refined_alignment_file_or_throw(opts);
         }
         if (opts.output_aln_format == OutputAlignmentFormat::Bam ||
             opts.output_aln_format == OutputAlignmentFormat::Cram) {
@@ -904,8 +911,8 @@ static void print_collect_help() {
         << "  -S/b/C --out-sam/bam/cram FILE\n"
         << "                                output phased SAM/BAM/CRAM file []\n"
         << "                                note: multiple input BAM/CRAM files will be merged in SAM/BAM/CRAM output\n"
-        << "      --refine-aln              refine alignment in SAM/BAM/CRAM output\n"
-        << "                                note: output SAM/BAM/CRAM may be unsorted when --refine-aln is set\n"
+        << "      --refine-aln              refine alignment in SAM/BAM/CRAM output;\n"
+        << "                                coordinate-sorts with samtools sort before BAM/CRAM indexing (samtools on PATH)\n"
         << "      --read-support FILE       Per-read ref/alt observations at candidates (for phasing)\n"
         << "      --phase-read-tsv FILE     Per-read HAP / PHASE_SET after k-means phasing\n"
         << "      --pgbam-file FILE         Optional .pgbam sidecar for fallback chunk stitching when common-read signal is absent\n"

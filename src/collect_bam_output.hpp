@@ -8,6 +8,9 @@
 
 namespace pgphase_collect {
 
+/** Called after closing phased/refined alignment output when `--refine-aln` is set (BAM/CRAM/SAM). */
+void coordinate_sort_refined_alignment_file_or_throw(const Options& opts);
+
 class PhasedAlignmentWriter {
 public:
     PhasedAlignmentWriter(const Options& opts, const bam_hdr_t* header);

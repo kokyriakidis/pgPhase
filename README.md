@@ -60,3 +60,4 @@ Notes:
 - Linux bundle portability depends on compatible CPU/kernel/glibc ABI.
 - macOS bundle portability depends on compatible CPU architecture/runtime ABI.
 - Build separate bundles for `arm64` and `x86_64` macOS targets when needed.
+- When `samtools` is on `PATH` during `make portable-bundle` / `make release`, its binary (and shared libs) are copied into `bin/` so `--refine-aln` coordinate-sort works without a separate install. Override with `SAMTOOLS=/path/to/samtools` if needed.
