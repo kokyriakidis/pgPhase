@@ -22,6 +22,152 @@
 
 namespace pgphase_collect {
 
+namespace {
+
+// longcallD `seq.c` `nst_nt4_table` — encodes SNP/INS `alt_seq` bytes used in `memcmp` by
+// `exact_comp_var_site` / `exact_comp_var_site_ins` (`collect_var.c`).
+alignas(64) static constexpr uint8_t kLcdNstNt4Table[256] = {
+    0, 1, 2, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 0, 4, 1, 4, 4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 0, 4, 1, 4, 4, 4, 2, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4};
+
+/** `memcmp(var1->alt_seq, var2->alt_seq, len)` on longcallD-encoded ALT bytes (LCD table per char). */
+int cmp_alt_seq_lcd_nt4(const std::string& a, const std::string& b, int len) {
+    for (int i = 0; i < len; ++i) {
+        const uint8_t ca = kLcdNstNt4Table[static_cast<unsigned char>(a[static_cast<size_t>(i)])];
+        const uint8_t cb = kLcdNstNt4Table[static_cast<unsigned char>(b[static_cast<size_t>(i)])];
+        if (ca != cb) return (ca < cb) ? -1 : 1;
+    }
+    return 0;
+}
+
+static int cmp_alt_bytes_lcd_nt4(const uint8_t* a, const uint8_t* b, int len) {
+    for (int i = 0; i < len; ++i) {
+        const uint8_t ca = kLcdNstNt4Table[static_cast<unsigned char>(a[i])];
+        const uint8_t cb = kLcdNstNt4Table[static_cast<unsigned char>(b[i])];
+        if (ca != cb) return (ca < cb) ? -1 : 1;
+    }
+    return 0;
+}
+
+/** Shape of longcallD `var_site_t` for `update_cand_vars_from_digar` merge only (`collect_var.c`). */
+struct LcdVarSiteMerge {
+    hts_pos_t pos = 0;
+    int var_type = 0;
+    int ref_len = 0;
+    int alt_len = 0;
+    const uint8_t* alt_seq = nullptr;
+};
+
+static LcdVarSiteMerge lcd_merge_site_from_candidate_key(const VariantKey& k) {
+    LcdVarSiteMerge s{};
+    s.pos = k.pos;
+    if (k.type == VariantType::Snp) {
+        s.var_type = BAM_CDIFF;
+        s.ref_len = 1;
+        s.alt_len = static_cast<int>(k.alt.size());
+        s.alt_seq = reinterpret_cast<const uint8_t*>(k.alt.data());
+    } else if (k.type == VariantType::Insertion) {
+        s.var_type = BAM_CINS;
+        s.ref_len = 0;
+        s.alt_len = static_cast<int>(k.alt.size());
+        s.alt_seq = reinterpret_cast<const uint8_t*>(k.alt.data());
+    } else {
+        s.var_type = BAM_CDEL;
+        s.ref_len = k.ref_len;
+        s.alt_len = 0;
+        s.alt_seq = nullptr;
+    }
+    return s;
+}
+
+static int digar_to_bam_var_type(DigarType t) {
+    switch (t) {
+        case DigarType::Snp:
+            return BAM_CDIFF;
+        case DigarType::Insertion:
+            return BAM_CINS;
+        case DigarType::Deletion:
+            return BAM_CDEL;
+        case DigarType::SoftClip:
+            return BAM_CSOFT_CLIP;
+        case DigarType::HardClip:
+            return BAM_CHARD_CLIP;
+        case DigarType::RefSkip:
+            return BAM_CREF_SKIP;
+        default:
+            return BAM_CEQUAL;
+    }
+}
+
+/** longcallD `make_var_site_from_digar` (`collect_var.c`) for merge-site fields only. */
+static LcdVarSiteMerge lcd_merge_site_from_digar_op(const DigarOp& op) {
+    LcdVarSiteMerge s{};
+    s.pos = op.pos;
+    switch (op.type) {
+        case DigarType::Snp:
+            s.var_type = BAM_CDIFF;
+            s.ref_len = 1;
+            s.alt_len = static_cast<int>(op.alt.size());
+            s.alt_seq = reinterpret_cast<const uint8_t*>(op.alt.data());
+            return s;
+        case DigarType::Insertion:
+            s.var_type = BAM_CINS;
+            s.ref_len = 0;
+            s.alt_len = static_cast<int>(op.alt.size());
+            s.alt_seq = reinterpret_cast<const uint8_t*>(op.alt.data());
+            return s;
+        case DigarType::Deletion:
+            s.var_type = BAM_CDEL;
+            s.ref_len = op.len;
+            s.alt_len = 0;
+            s.alt_seq = nullptr;
+            return s;
+        default:
+            s.var_type = digar_to_bam_var_type(op.type);
+            s.ref_len = 1;
+            s.alt_len = op.len;
+            s.alt_seq = nullptr;
+            return s;
+    }
+}
+
+/** longcallD `exact_comp_var_site_ins(opt, …)` (`collect_var.c`) on merge-shaped sites (no `tid`). */
+static int lcd_exact_comp_var_site_ins_merge(const LcdVarSiteMerge* var1, const LcdVarSiteMerge* var2, int min_sv_len) {
+    const hts_pos_t var1_pos = var1->var_type == BAM_CDIFF ? var1->pos : var1->pos - 1;
+    const hts_pos_t var2_pos = var2->var_type == BAM_CDIFF ? var2->pos : var2->pos - 1;
+    if (var1_pos < var2_pos) return -1;
+    if (var1_pos > var2_pos) return 1;
+    if (var1->var_type < var2->var_type) return -1;
+    if (var1->var_type > var2->var_type) return 1;
+    if (var1->ref_len < var2->ref_len) return -1;
+    if (var1->ref_len > var2->ref_len) return 1;
+    if (var1->var_type == BAM_CDIFF) {
+        if (var1->alt_len < var2->alt_len) return -1;
+        if (var1->alt_len > var2->alt_len) return 1;
+        return cmp_alt_bytes_lcd_nt4(var1->alt_seq, var2->alt_seq, var1->alt_len);
+    }
+    if (var1->var_type == BAM_CINS) {
+        if (var1->alt_len < min_sv_len) {
+            if (var1->alt_len < var2->alt_len) return -1;
+            if (var1->alt_len > var2->alt_len) return 1;
+            return cmp_alt_bytes_lcd_nt4(var1->alt_seq, var2->alt_seq, var1->alt_len);
+        }
+        const int min_len = var1->alt_len < var2->alt_len ? var1->alt_len : var2->alt_len;
+        const int max_len = var1->alt_len > var2->alt_len ? var1->alt_len : var2->alt_len;
+        if (static_cast<double>(min_len) >= static_cast<double>(max_len) * 0.8) return 0;
+        return var1->alt_len - var2->alt_len;
+    }
+    return 0;
+}
+
+} // namespace
+
 // ════════════════════════════════════════════════════════════════════════════
 // Variant site comparison
 // ════════════════════════════════════════════════════════════════════════════
@@ -65,9 +211,13 @@ int exact_comp_var_site(const VariantKey* var1, const VariantKey* var2) {
     if (a1 < a2) return -1;
     if (a1 > a2) return 1;
     if (var1->type == VariantType::Snp || var1->type == VariantType::Insertion) {
-        return std::memcmp(var1->alt.data(), var2->alt.data(), static_cast<size_t>(a1));
+        return cmp_alt_seq_lcd_nt4(var1->alt, var2->alt, a1);
     }
     return 0;
+}
+
+int exact_comp_cand_var(const CandidateVariant* var1, const CandidateVariant* var2) {
+    return exact_comp_var_site(&var1->key, &var2->key);
 }
 
 /**
@@ -99,7 +249,7 @@ int exact_comp_var_site_ins(const VariantKey* var1, const VariantKey* var2, int 
         const int a2 = var_site_alt_len(*var2);
         if (a1 < a2) return -1;
         if (a1 > a2) return 1;
-        return std::memcmp(var1->alt.data(), var2->alt.data(), static_cast<size_t>(a1));
+        return cmp_alt_seq_lcd_nt4(var1->alt, var2->alt, a1);
     }
     if (var1->type == VariantType::Insertion) {
         const int a1 = var_site_alt_len(*var1);
@@ -107,7 +257,7 @@ int exact_comp_var_site_ins(const VariantKey* var1, const VariantKey* var2, int 
         if (a1 < min_sv_len) {
             if (a1 < a2) return -1;
             if (a1 > a2) return 1;
-            return std::memcmp(var1->alt.data(), var2->alt.data(), static_cast<size_t>(a1));
+            return cmp_alt_seq_lcd_nt4(var1->alt, var2->alt, a1);
         }
         const int min_len = a1 < a2 ? a1 : a2;
         const int max_len = a1 > a2 ? a1 : a2;
@@ -168,14 +318,6 @@ static bool is_collectible_var_digar(const DigarOp& digar, hts_pos_t reg_beg, ht
 }
 
 /**
- * @brief True if the digar op is SNP, insertion, or deletion (allele-counting sweep only).
- * @param d Digar to classify.
- */
-static bool is_variant_digar_for_cand_sweep(const DigarOp& d) {
-    return d.type == DigarType::Snp || d.type == DigarType::Insertion || d.type == DigarType::Deletion;
-}
-
-/**
  * @brief Lower-bound index into sorted candidates for a read span (longcallD `get_var_site_start`).
  * @param v Sorted candidates by `sort_pos` / `pos`.
  * @param start Read start (1-based).
@@ -209,7 +351,7 @@ static int get_var_site_start(const CandidateTable& v, hts_pos_t start, int n_to
  *
  * @param variants In/out table; replaced with unique keys in sort order.
  */
-void collapse_fuzzy_large_insertions(CandidateTable& variants) {
+void collapse_fuzzy_large_insertions(CandidateTable& variants, int min_sv_len) {
     std::sort(variants.begin(), variants.end(), [](const CandidateVariant& a, const CandidateVariant& b) {
         return exact_comp_var_site(&a.key, &b.key) < 0;
     });
@@ -217,7 +359,24 @@ void collapse_fuzzy_large_insertions(CandidateTable& variants) {
     size_t write_i = 1;
     for (size_t read_i = 1; read_i < variants.size(); ++read_i) {
         if (exact_comp_var_site_ins(
-                &variants[write_i - 1].key, &variants[read_i].key, kLongcalldMinSvLen) == 0) {
+                &variants[write_i - 1].key, &variants[read_i].key, min_sv_len) == 0) {
+            continue;
+        }
+        if (write_i != read_i) variants[write_i] = std::move(variants[read_i]);
+        ++write_i;
+    }
+    variants.resize(write_i);
+}
+
+void collapse_exact_duplicate_variants(CandidateTable& variants) {
+    std::sort(variants.begin(), variants.end(), [](const CandidateVariant& a, const CandidateVariant& b) {
+        return exact_comp_var_site(&a.key, &b.key) < 0;
+    });
+    if (variants.empty()) return;
+    size_t write_i = 1;
+    for (size_t read_i = 1; read_i < variants.size(); ++read_i) {
+        if (exact_comp_var_site(&variants[write_i - 1].key, &variants[read_i].key) == 0) {
+            variants[write_i - 1].lcd_make_variants_region_pass |= variants[read_i].lcd_make_variants_region_pass;
             continue;
         }
         if (write_i != read_i) variants[write_i] = std::move(variants[read_i]);
@@ -239,7 +398,8 @@ void collapse_fuzzy_large_insertions(CandidateTable& variants) {
  */
 void collect_candidate_sites_from_records(const RegionChunk& chunk,
                                           const std::vector<ReadRecord>& reads,
-                                          CandidateTable& variants) {
+                                          CandidateTable& variants,
+                                          int min_sv_len) {
     variants.clear();
     size_t max_var_sites = 0;
     for (const ReadRecord& read : reads) {
@@ -259,7 +419,7 @@ void collect_candidate_sites_from_records(const RegionChunk& chunk,
             variants.push_back(CandidateVariant{variant_key_from_digar(read.tid, digar), VariantCounts{}});
         }
     }
-    collapse_fuzzy_large_insertions(variants);
+    collapse_fuzzy_large_insertions(variants, min_sv_len);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -328,9 +488,10 @@ static void add_coverage(VariantCounts& counts, bool reverse, bool alt, bool low
 /**
  * @brief Sweeps reads against sorted candidates to fill allele and strand counts.
  *
- * Implements longcallD `init_cand_vars_based_on_sites` + `update_cand_vars_from_digar` /
- * `update_read_vs_all_var_profile_from_digar`: merge walk using `exact_comp_var_site_ins`,
- * low-quality alt when `digar.low_quality` or mean BQ \< \a min_bq, implicit ref for trailing
+ * Implements longcallD `init_cand_vars_based_on_sites` + `update_cand_vars_from_digar`
+ * (`bam_utils.c`): merge walk skipping only `BAM_CEQUAL` digars, comparing candidate vs digar
+ * with `exact_comp_var_site_ins` on merge-shaped `var_site_t` (clips participate in ordering).
+ * Low-quality alt when `digar.low_quality` or mean BQ \< \a min_bq; implicit ref for trailing
  * sites before `read.end`. Optionally appends `ReadSupportRow` rows when both
  * \a read_support_out and \a chunk_region are non-null.
  *
@@ -344,7 +505,8 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         CandidateTable& variants,
                                         const RegionChunk* chunk_region,
                                         std::vector<ReadSupportRow>* read_support_out,
-                                        int min_bq) {
+                                        int min_bq,
+                                        int min_sv_len) {
     const int n = static_cast<int>(variants.size());
     if (n == 0) return;
 
@@ -366,15 +528,15 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                 }
                 continue;
             }
-            if (!is_variant_digar_for_cand_sweep(dig[digar_i])) {
+            if (dig[digar_i].type == DigarType::Equal) {
                 ++digar_i;
                 continue;
             }
             const DigarOp& d = dig[digar_i];
-            VariantKey dkey = variant_key_from_digar(read.tid, d);
             const int ave = get_digar_ave_qual(d, read.qual);
-            const int ret = exact_comp_var_site_ins(
-                &variants[static_cast<size_t>(site_i)].key, &dkey, kLongcalldMinSvLen);
+            const LcdVarSiteMerge cand_site = lcd_merge_site_from_candidate_key(variants[static_cast<size_t>(site_i)].key);
+            const LcdVarSiteMerge dig_site = lcd_merge_site_from_digar_op(d);
+            const int ret = lcd_exact_comp_var_site_ins_merge(&cand_site, &dig_site, min_sv_len);
             if (ret < 0) {
                 VariantCounts& c = variants[static_cast<size_t>(site_i)].counts;
                 add_coverage(c, read.reverse, false, false, read.is_ont_palindrome);
@@ -521,6 +683,43 @@ void intervals_from_cr(const cgranges_t* cr, std::vector<Interval>& out) {
     }
 }
 
+// longcallD `post_process_noisy_regs`: final `cr_add(noisy_regs, "cr", noisy_reg_start[reg_i],
+// noisy_reg_end[reg_i], ...)` stores `st == noisy_reg_start` (1-based genomic start), not `start-1`.
+// Use these when converting that tree to/from `Interval` so `sort_noisy_regs` lens match
+// `cr_end - cr_start` and step-4 bounds match `collect_noisy_vars1`.
+
+static void intervals_from_cr_lcd_chunk_noisy_post_merge(const cgranges_t* cr, std::vector<Interval>& out) {
+    out.clear();
+    if (cr == nullptr || cr->n_r == 0) return;
+    const int32_t ctg = cr_get_ctg(cr, "cr");
+    if (ctg < 0) return;
+    const cr_ctg_t* c = &cr->ctg[ctg];
+    for (int64_t i = c->off; i < c->off + c->n; ++i) {
+        const hts_pos_t beg = static_cast<hts_pos_t>(cr_start(cr, i));
+        const hts_pos_t end = static_cast<hts_pos_t>(cr_end(cr, i));
+        out.push_back(Interval{beg, end, cr_label(cr, i)});
+    }
+}
+
+static cgranges_t* intervals_to_cr_lcd_chunk_noisy_post_merge(const std::vector<Interval>& intervals) {
+    if (intervals.empty()) return nullptr;
+    cgranges_t* cr = cr_init();
+    int added = 0;
+    for (const Interval& iv : intervals) {
+        if (iv.beg > iv.end) continue;
+        const int32_t st = static_cast<int32_t>(iv.beg);
+        const int32_t en = static_cast<int32_t>(iv.end);
+        const int32_t label = iv.label > 0 ? iv.label : 1;
+        cr_add(cr, "cr", st, en, label);
+        ++added;
+    }
+    if (added == 0) {
+        cr_destroy(cr);
+        return nullptr;
+    }
+    return cr;
+}
+
 /**
  * @brief Indexed `cgranges_t` for one read's `noisy_regions` (overlap tests in noisy preprocessing).
  * @param read Read whose `noisy_regions` may be empty.
@@ -554,24 +753,6 @@ void variant_genomic_span(const VariantKey& key, hts_pos_t& var_start, hts_pos_t
     // Insertions: longcallD uses [pos, pos] for overlap/noisy-ratio checks.
     var_start = key.pos;
     var_end = key.pos;
-}
-
-// strict longcallD-style overlap test for read/profile allele assignment
-// Mirrors longcallD `ovlp_var_site` (half-open [beg, end) semantics via end = pos + ref_len).
-static bool ovlp_var_site(const VariantKey& var1, const VariantKey& var2) {
-    const hts_pos_t beg1 = var1.pos;
-    const hts_pos_t end1 = var1.pos + var1.ref_len;
-    const hts_pos_t beg2 = var2.pos;
-    const hts_pos_t end2 = var2.pos + var2.ref_len;
-
-    // Both insertions (ref_len == 0 for INS in longcallD)
-    if (var1.ref_len == 0 && var2.ref_len == 0) return beg1 == beg2;
-    // var1 is INS vs SNP/DEL
-    if (var1.ref_len == 0) return (beg1 > beg2 && end1 < end2);
-    // var2 is INS vs SNP/DEL
-    if (var2.ref_len == 0) return (beg2 > beg1 && end2 < end1);
-    // both SNP/DEL
-    return !(beg1 >= end2 || beg2 >= end1);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -893,16 +1074,17 @@ void post_process_noisy_regs_pgphase(BamChunk& chunk, const CandidateTable& cand
     cr_destroy(chunk_noisy_regs);
     cgranges_t* merged = cr_merge(noisy_regs, 0, -1, -1);
     noisy_own.adopt(merged);
-    intervals_from_cr(noisy_own.cr, chunk.noisy_regions);
+    intervals_from_cr_lcd_chunk_noisy_post_merge(noisy_own.cr, chunk.noisy_regions);
 }
 
 /**
  * @brief Traverses surviving variants and drops those entirely swallowed by a noisy block.
  *
  * Implements `longcallD`'s final masking pass equivalent (`cr_is_contained`).
- * Once complex overlapping noise profiles are merged and bounds checked via
- * `post_process_noisy_regs_pgphase()`, this effectively zeroes out cleanly-called
- * variant candidates that mistakenly fell inside those black-boxed `NOISY` extents.
+ * Like classify compaction, skips sites whose bitmask intersects
+ * `kLongcalldNotCandVarCate` (`LONGCALLD_NOT_CAND_VAR_CATE`).
+ * Once noisy intervals are merged and widened via `post_process_noisy_regs_pgphase()`, this
+ * marks surviving germline candidates fully contained in noisy spans as `NON_VAR`.
  *
  * This ensures that a single structural variance window gets reported cleanly
  * instead of hundreds of raw SNVs generated through misalignment.
@@ -913,13 +1095,13 @@ void post_process_noisy_regs_pgphase(BamChunk& chunk, const CandidateTable& cand
 void apply_noisy_containment_filter(BamChunk& chunk) {
     if (chunk.noisy_regions.empty()) return;
     CrangesOwner own;
-    own.adopt(intervals_to_cr(chunk.noisy_regions));
+    own.adopt(intervals_to_cr_lcd_chunk_noisy_post_merge(chunk.noisy_regions));
     if (own.cr == nullptr || own.cr->n_r == 0) return;
     cr_index(own.cr);
     int64_t* b = nullptr;
     int64_t m = 0;
     for (auto& cv : chunk.candidates) {
-        if (cv.counts.category == VariantCategory::NonVariant) continue;
+        if ((cv.lcd_var_i_to_cate & kLongcalldNotCandVarCate) != 0) continue;
         const VariantKey& k = cv.key;
         int64_t n = 0;
         if (k.type == VariantType::Insertion) {
@@ -931,7 +1113,10 @@ void apply_noisy_containment_filter(BamChunk& chunk) {
                                 static_cast<int32_t>(k.pos + k.ref_len),
                                 &b, &m);
         }
-        if (n > 0) cv.counts.category = VariantCategory::NonVariant;
+        if (n > 0) {
+            cv.counts.category = VariantCategory::NonVariant;
+            cv.lcd_var_i_to_cate = category_to_flag(VariantCategory::NonVariant);
+        }
     }
     std::free(b);
 }
@@ -997,15 +1182,17 @@ void populate_chunk_read_indexes(BamChunk& chunk) {
             chunk.noisy_regions.push_back(iv);
         }
     }
-    std::stable_sort(chunk.ordered_read_ids.begin(), chunk.ordered_read_ids.end(),
-                     [&](int lhs_i, int rhs_i) {
-                         const ReadRecord& lhs = chunk.reads[static_cast<size_t>(lhs_i)];
-                         const ReadRecord& rhs = chunk.reads[static_cast<size_t>(rhs_i)];
-                         if (lhs.beg != rhs.beg) return lhs.beg < rhs.beg;
-                         if (lhs.end != rhs.end) return lhs.end > rhs.end;
-                         if (lhs.nm != rhs.nm) return lhs.nm < rhs.nm;
-                         return lhs.qname < rhs.qname;
-                     });
+    // longcallD uses qsort(comp_bam_read_sort): pos asc, end desc, NM asc, qname asc.
+    // Use std::sort (non-stable) to mirror qsort tie behavior as closely as possible.
+    std::sort(chunk.ordered_read_ids.begin(), chunk.ordered_read_ids.end(),
+              [&](int lhs_i, int rhs_i) {
+                  const ReadRecord& lhs = chunk.reads[static_cast<size_t>(lhs_i)];
+                  const ReadRecord& rhs = chunk.reads[static_cast<size_t>(rhs_i)];
+                  if (lhs.beg != rhs.beg) return lhs.beg < rhs.beg;
+                  if (lhs.end != rhs.end) return lhs.end > rhs.end;
+                  if (lhs.nm != rhs.nm) return lhs.nm < rhs.nm;
+                  return lhs.qname < rhs.qname;
+              });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1500,13 +1687,12 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
     cgranges_t* low_comp = low_own.cr;
     if (low_comp != nullptr) cr_index(low_comp);
 
-    // Populate ref_base (SNPs) and alt_ref_base (INS/DEL) from reference sequence.
+    // longcallD `classify_cand_vars` does not modify cand.alt_ref_base (only init_cand_vars_based_on_sites
+    // sets 4 and noisy `make_cand_vars_from_baln0` sets consensus column bytes). SNP ref_base is filled
+    // here for classifier parity with existing pgphase paths.
     for (auto& cv : variants) {
         if (cv.key.type == VariantType::Snp) {
             cv.ref_base = static_cast<uint8_t>(ref_nt4_at(chunk.ref_seq, chunk.ref_beg, cv.key.pos));
-        } else {
-            cv.alt_ref_base =
-                static_cast<uint8_t>(ref_nt4_at(chunk.ref_seq, chunk.ref_beg, cv.key.pos - 1));
         }
     }
 
@@ -1552,7 +1738,8 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
     // Pass 2: noisy mask, dense overlaps via var_pos_cr, noisy_var_cr merge, LOW_AF→LOW_COV.
     for (size_t i = 0; i < variants.size(); ++i) {
         VariantCategory c = cats[i];
-        if (c == VariantCategory::StrandBias) continue;
+        // longcallD `classify_cand_vars` pass 2: skip `NON_VAR` and `STRAND_BIAS` before overlap checks.
+        if (c == VariantCategory::NonVariant || c == VariantCategory::StrandBias) continue;
 
         if (chunk_noisy->n_r > 0) {
             int64_t n = 0;
@@ -1623,8 +1810,7 @@ static void classify_cand_vars_pgphase(BamChunk& chunk, const Options& opts) {
 
     for (size_t i = 0; i < variants.size(); ++i) {
         variants[i].counts.category = cats[i];
-        variants[i].is_homopolymer_indel =
-            (variants[i].counts.candvarcate_initial == VariantCategory::RepeatHetIndel);
+        variants[i].lcd_var_i_to_cate = category_to_flag(cats[i]);
     }
 }
 
@@ -1643,6 +1829,105 @@ void classify_chunk_candidates(BamChunk& chunk, const Options& opts, const bam_h
 static inline int read_order_visit_count(const BamChunk& chunk) {
     return chunk.ordered_read_ids.empty() ? static_cast<int>(chunk.reads.size())
                                          : static_cast<int>(chunk.ordered_read_ids.size());
+}
+
+/** Shape of longcallD `var_site_t` for `update_read_vs_all_var_profile_from_digar` only. */
+struct LcdProfileSite {
+    hts_pos_t pos = 0;
+    int var_type = 0;
+    int ref_len = 0;
+    int alt_len = 0;
+    const uint8_t* alt_seq = nullptr;
+};
+
+static void lcd_make_profile_site_from_cand(const CandidateVariant& cv, LcdProfileSite* out) {
+    out->pos = cv.key.pos;
+    out->alt_seq = reinterpret_cast<const uint8_t*>(cv.key.alt.data());
+    if (cv.key.type == VariantType::Snp) {
+        out->var_type = BAM_CDIFF;
+        out->ref_len = 1;
+        out->alt_len = static_cast<int>(cv.key.alt.size());
+    } else if (cv.key.type == VariantType::Insertion) {
+        out->var_type = BAM_CINS;
+        out->ref_len = 0;
+        out->alt_len = static_cast<int>(cv.key.alt.size());
+    } else {
+        out->var_type = BAM_CDEL;
+        out->ref_len = cv.key.ref_len;
+        out->alt_len = 0;
+    }
+}
+
+/** longcallD `make_var_site_from_digar` (`collect_var.c`), including clip rows. */
+static void lcd_make_profile_site_from_digar(const DigarOp& op, LcdProfileSite* out) {
+    out->pos = op.pos;
+    out->var_type = BAM_CEQUAL;
+    out->ref_len = 1;
+    out->alt_len = op.len;
+    out->alt_seq = nullptr;
+    switch (op.type) {
+        case DigarType::Snp:
+            out->var_type = BAM_CDIFF;
+            out->ref_len = 1;
+            out->alt_len = static_cast<int>(op.alt.size());
+            out->alt_seq = reinterpret_cast<const uint8_t*>(op.alt.data());
+            return;
+        case DigarType::Insertion:
+            out->var_type = BAM_CINS;
+            out->ref_len = 0;
+            out->alt_len = static_cast<int>(op.alt.size());
+            out->alt_seq = reinterpret_cast<const uint8_t*>(op.alt.data());
+            return;
+        case DigarType::Deletion:
+            out->var_type = BAM_CDEL;
+            out->ref_len = op.len;
+            out->alt_len = 0;
+            return;
+        case DigarType::SoftClip:
+            out->var_type = BAM_CSOFT_CLIP;
+            return;
+        case DigarType::HardClip:
+            out->var_type = BAM_CHARD_CLIP;
+            return;
+        case DigarType::Equal:
+        default:
+            out->var_type = BAM_CEQUAL;
+            return;
+    }
+}
+
+static int lcd_profile_ovlp_var_site(const LcdProfileSite* var1, const LcdProfileSite* var2) {
+    const int beg1 = static_cast<int>(var1->pos);
+    const int end1 = static_cast<int>(var1->pos + var1->ref_len);
+    const int beg2 = static_cast<int>(var2->pos);
+    const int end2 = static_cast<int>(var2->pos + var2->ref_len);
+    if (var1->ref_len == 0 && var2->ref_len == 0) return (beg1 == beg2) ? 1 : 0;
+    if (var1->ref_len == 0) return (beg1 > beg2 && end1 < end2) ? 1 : 0;
+    if (var2->ref_len == 0) return (beg2 > beg1 && end2 < end1) ? 1 : 0;
+    if (beg1 >= end2 || beg2 >= end1) return 0;
+    return 1;
+}
+
+static int lcd_profile_exact_comp_var_site(const LcdProfileSite* var1, const LcdProfileSite* var2) {
+    hts_pos_t var1_pos = (var1->var_type == BAM_CDIFF) ? var1->pos : var1->pos - 1;
+    hts_pos_t var2_pos = (var2->var_type == BAM_CDIFF) ? var2->pos : var2->pos - 1;
+    if (var1_pos < var2_pos) return -1;
+    if (var1_pos > var2_pos) return 1;
+    if (var1->var_type < var2->var_type) return -1;
+    if (var1->var_type > var2->var_type) return 1;
+    if (var1->ref_len < var2->ref_len) return -1;
+    if (var1->ref_len > var2->ref_len) return 1;
+    if (var1->alt_len < var2->alt_len) return -1;
+    if (var1->alt_len > var2->alt_len) return 1;
+    if (var1->var_type == BAM_CDIFF || var1->var_type == BAM_CINS) {
+        return std::memcmp(var1->alt_seq, var2->alt_seq, static_cast<size_t>(var1->alt_len));
+    }
+    return 0;
+}
+
+static int lcd_profile_comp_ovlp_var_site(const LcdProfileSite* var1, const LcdProfileSite* var2, int* is_ovlp) {
+    *is_ovlp = lcd_profile_ovlp_var_site(var1, var2);
+    return lcd_profile_exact_comp_var_site(var1, var2);
 }
 
 /**
@@ -1676,9 +1961,24 @@ static void collect_read_var_profile(const Options& opts, BamChunk& chunk) {
 
         ReadVariantProfile cur;
         cur.read_id = static_cast<int>(read_i);
-        int site_i = get_var_site_start(variants, read.beg, n);
+        const hts_pos_t pos_start = read.beg;
+        const hts_pos_t pos_end = read.end;
+        int site_i = get_var_site_start(variants, pos_start, n);
         size_t digar_i = 0;
         const std::vector<DigarOp>& dig = read.digars;
+
+        cgranges_t* noisy_cr = intervals_to_cr(read.noisy_regions);
+        if (noisy_cr != nullptr) cr_index(noisy_cr);
+        // longcallD `bam_utils.h` `is_in_noisy_reg(pos, noisy_regs)`: cr_overlap(..., pos, pos+1).
+        const auto is_in_noisy_reg = [&](hts_pos_t pos) -> bool {
+            if (noisy_cr == nullptr) return false;
+            int64_t* ovlp_b = nullptr;
+            int64_t max_b = 0;
+            const int64_t ovlp_n =
+                cr_overlap(noisy_cr, "cr", static_cast<int32_t>(pos), static_cast<int32_t>(pos + 1), &ovlp_b, &max_b);
+            free(ovlp_b);
+            return ovlp_n > 0;
+        };
 
         const auto append_observation = [&](int idx, int allele, int alt_qi) {
             if (cur.start_var_idx < 0) cur.start_var_idx = idx;
@@ -1691,22 +1991,29 @@ static void collect_read_var_profile(const Options& opts, BamChunk& chunk) {
             cur.alt_qi.push_back(alt_qi);
         };
 
+        // longcallD `update_read_vs_all_var_profile_from_digar` (`bam_utils.c`): skip NON_VAR by bitmask.
         while (site_i < n && digar_i < dig.size()) {
-            const int stid = variants[static_cast<size_t>(site_i)].key.tid;
-            if (stid != read.tid) {
-                if (stid < read.tid) { ++site_i; } else { break; }
+            if (variants[static_cast<size_t>(site_i)].lcd_var_i_to_cate == kLongcalldNonVar) {
+                ++site_i;
                 continue;
             }
-            if (variants[static_cast<size_t>(site_i)].key.pos > read.end) break;
-            if (!is_variant_digar_for_cand_sweep(dig[digar_i])) { ++digar_i; continue; }
+            if (dig[digar_i].type == DigarType::Equal) {
+                ++digar_i;
+                continue;
+            }
+            LcdProfileSite var_site0{};
+            lcd_make_profile_site_from_cand(variants[static_cast<size_t>(site_i)], &var_site0);
+            LcdProfileSite digar_site{};
+            lcd_make_profile_site_from_digar(dig[digar_i], &digar_site);
 
             const DigarOp& d = dig[digar_i];
-            VariantKey dkey = variant_key_from_digar(read.tid, d);
-            const VariantKey& site_key = variants[static_cast<size_t>(site_i)].key;
-            const bool is_ovlp = ovlp_var_site(site_key, dkey);
-            // longcallD germline read-profile allele assignment uses strict exact_comp_var_site.
-            const int ret = exact_comp_var_site(&site_key, &dkey);
-            if (!is_ovlp) {
+            const int ave_qual = get_digar_ave_qual(d, read.qual);
+            const int var_read_pos = d.qi;
+
+            int is_ovlp = 0;
+            const int ret = lcd_profile_comp_ovlp_var_site(&var_site0, &digar_site, &is_ovlp);
+
+            if (is_ovlp == 0) {
                 if (ret < 0) {
                     append_observation(site_i, 0, -1);
                     ++site_i;
@@ -1718,8 +2025,9 @@ static void collect_read_var_profile(const Options& opts, BamChunk& chunk) {
                 }
             } else {
                 if (ret == 0) {
-                    const bool low_quality = d.low_quality || get_digar_ave_qual(d, read.qual) < opts.min_bq;
-                    append_observation(site_i, low_quality ? -2 : 1, d.qi);
+                    int allele_i = 1;
+                    if (ave_qual < opts.min_bq) allele_i = -2;
+                    append_observation(site_i, allele_i, var_read_pos);
                     ++site_i;
                 } else {
                     append_observation(site_i, -1, -1);
@@ -1728,21 +2036,14 @@ static void collect_read_var_profile(const Options& opts, BamChunk& chunk) {
             }
         }
 
+        // Tail loop mirrors lcd trailing `for (; var_i < n_cand_vars; ++var_i)` including `is_in_noisy_reg`.
         for (; site_i < n; ++site_i) {
-            const int stid = variants[static_cast<size_t>(site_i)].key.tid;
-            if (stid != read.tid) { if (stid < read.tid) continue; break; }
-            if (variants[static_cast<size_t>(site_i)].key.pos > read.end) break;
-            const hts_pos_t pos = variants[static_cast<size_t>(site_i)].key.pos;
-            bool in_noisy = false;
-            for (const Interval& noisy : read.noisy_regions) {
-                if (pos >= noisy.beg && pos <= noisy.end) {
-                    in_noisy = true;
-                    break;
-                }
-            }
-            if (in_noisy) continue;
+            if (variants[static_cast<size_t>(site_i)].key.pos > pos_end) break;
+            if (is_in_noisy_reg(variants[static_cast<size_t>(site_i)].key.pos)) continue;
             append_observation(site_i, 0, -1);
         }
+
+        if (noisy_cr != nullptr) cr_destroy(noisy_cr);
 
         if (cur.start_var_idx >= 0) {
             cr_add(cr, "cr", cur.start_var_idx, cur.end_var_idx + 1,
@@ -1827,16 +2128,31 @@ static void dump_all_noisy_regions(const BamChunk& chunk, const Options& opts, c
  * @param header BAM header for contig names used in verbose logging.
  * @param read_support_out If non-null, per-read allele observations are appended here.
  */
+/** longcallD `collect_var.c` `make_variants` lines 1481–1488 (`active_reg_beg` / `active_reg_end`). */
+static bool lcd_make_variants_active_region_contains(hts_pos_t active_reg_beg,
+                                                     hts_pos_t active_reg_end,
+                                                     const VariantKey& key) {
+    const hts_pos_t vcf_pos = (key.type == VariantType::Deletion || key.type == VariantType::Insertion)
+                                  ? key.pos - 1
+                                  : key.pos;
+    return !(vcf_pos < active_reg_beg || vcf_pos > active_reg_end);
+}
+
 void collect_var_main(BamChunk& chunk,
                       const Options& opts,
                       const bam_hdr_t* header,
                       std::vector<ReadSupportRow>* read_support_out) {
     // 1.1. collect X/I/D candidate sites from parsed read digars.
-    collect_candidate_sites_from_records(chunk.region, chunk.reads, chunk.candidates);
+    collect_candidate_sites_from_records(
+        chunk.region, chunk.reads, chunk.candidates, opts.min_sv_len);
 
     // 1.2. collect reference and alternate allele support for every candidate site.
-    collect_allele_counts_from_records(
-        chunk.reads, chunk.candidates, &chunk.region, read_support_out, opts.min_bq);
+    collect_allele_counts_from_records(chunk.reads,
+                                       chunk.candidates,
+                                       &chunk.region,
+                                       read_support_out,
+                                       opts.min_bq,
+                                       opts.min_sv_len);
 
     // 2.1. pre-process read-level noisy regions before classification.
     pre_process_noisy_regs_pgphase(chunk, opts);
@@ -1844,6 +2160,18 @@ void collect_var_main(BamChunk& chunk,
     // 2.2. identify clean, repeat/noisy, low-AF, strand-biased, and low-coverage candidates.
     // 2.3. add repeat/dense candidate spans back into the noisy-region model.
     // 2.4. reserve somatic/mosaic classification for the longcallD-compatible somatic branch.
+    if (opts.verbose >= 2) {
+        std::fprintf(stderr,
+                     "PRE_CLASSIFY noisy_regions (%zu intervals):\n",
+                     chunk.noisy_regions.size());
+        for (const Interval& iv : chunk.noisy_regions) {
+            std::fprintf(stderr,
+                         "  %" PRId64 "-%" PRId64 " (label=%d)\n",
+                         static_cast<int64_t>(iv.beg),
+                         static_cast<int64_t>(iv.end),
+                         iv.label);
+        }
+    }
     classify_chunk_candidates(chunk, opts, header);
 
     // 2.5. post-process noisy regions using classified candidate context.
@@ -1868,6 +2196,13 @@ void collect_var_main(BamChunk& chunk,
 
     // 4. iteratively call variants in noisy regions via MSA and re-run k-means (longcallD step 4).
     collect_noisy_vars_step4(chunk, opts);
+
+    const hts_pos_t active_reg_beg = chunk.region.beg;
+    const hts_pos_t active_reg_end = chunk.region.end;
+    for (CandidateVariant& cand : chunk.candidates) {
+        cand.lcd_make_variants_region_pass =
+            lcd_make_variants_active_region_contains(active_reg_beg, active_reg_end, cand.key);
+    }
 }
 
 } // namespace pgphase_collect

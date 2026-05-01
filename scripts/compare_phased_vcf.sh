@@ -5,13 +5,13 @@
 #   ./scripts/compare_phased_vcf.sh [REGION] [--hifi|--ont]
 #
 # Defaults:
-#   REGION  chr11:1230000-1260000
+#   REGION  CHM13#0#chr20:15000001-15500000 (HG002 HiFi chr20 slice)
 #   mode    --hifi  (HiFi BAM)
 #
 # Environment overrides:
 #   PGPHASE     path to pgphase binary    (default: ./pgphase)
 #   LONGCALLD   path to longcallD binary  (default: ../longcallD/bin/longcallD)
-#   FA          path to reference FASTA   (default: test_data/chr11_2M.fa)
+#   FA          path to reference FASTA   (HiFi: test_data/chr20_quick/CHM13_chr20_only.fa; ONT: chr11_2M.fa)
 #   BAM         path to BAM               (default: derived from mode)
 #   KEEP_TMP    set to 1 to keep temp dir for inspection
 #
@@ -28,16 +28,23 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PGPHASE="${PGPHASE:-$ROOT/pgphase}"
 LONGCALLD_BIN="${LONGCALLD:-$ROOT/../longcallD/bin/longcallD}"
-FA="${FA:-$ROOT/test_data/chr11_2M.fa}"
-REGION="${1:-chr11:1230000-1260000}"
+REGION="${1:-CHM13#0#chr20:15000001-15500000}"
 MODE="${2:---hifi}"
+
+if [[ -z "${FA:-}" ]]; then
+    if [[ "$MODE" == "--ont" ]]; then
+        FA="$ROOT/test_data/chr11_2M.fa"
+    else
+        FA="$ROOT/test_data/chr20_quick/CHM13_chr20_only.fa"
+    fi
+fi
 
 # Derive BAM from mode if not set explicitly
 if [[ -z "${BAM:-}" ]]; then
     if [[ "$MODE" == "--ont" ]]; then
         BAM="$ROOT/test_data/HG002_chr11_ont_test.bam"
     else
-        BAM="$ROOT/test_data/HG002_chr11_hifi_test.bam"
+        BAM="$ROOT/test_data/chr20_quick/HG002_CHM13_chr20_15000001_15500000.bam"
     fi
 fi
 

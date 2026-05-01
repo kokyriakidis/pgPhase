@@ -105,6 +105,13 @@ inline char nt_char_lower(char b) {
     return static_cast<char>(std::tolower(static_cast<unsigned char>(u)));
 }
 
+// longcallD `get_cs_from_digar`: MSA digar alt is 0–4; BAM-built digars use ASCII (see `bam_digar.cpp`).
+inline char cs_alt_base_from_digar_char(char stored) {
+    const auto u = static_cast<unsigned char>(stored);
+    if (u < 5) return "acgtn"[u];
+    return nt_char_lower(stored);
+}
+
 inline kstring_t* get_md_from_digar(const std::vector<DigarOp>& digars,
                                     const std::string& ref_seq,
                                     hts_pos_t ref_beg,
@@ -161,14 +168,16 @@ inline kstring_t* get_cs_from_digar(const std::vector<DigarOp>& digars,
                 }
                 kputc(ref_base, cs);
                 char alt_base = 'n';
-                if (!d.alt.empty() && j < static_cast<int>(d.alt.size())) alt_base = nt_char_lower(d.alt[static_cast<size_t>(j)]);
+                if (!d.alt.empty() && j < static_cast<int>(d.alt.size()))
+                    alt_base = cs_alt_base_from_digar_char(d.alt[static_cast<size_t>(j)]);
                 kputc(alt_base, cs);
             }
         } else if (d.type == DigarType::Insertion) {
             kputc('+', cs);
             for (int j = 0; j < len; ++j) {
                 char ins_base = 'n';
-                if (!d.alt.empty() && j < static_cast<int>(d.alt.size())) ins_base = nt_char_lower(d.alt[static_cast<size_t>(j)]);
+                if (!d.alt.empty() && j < static_cast<int>(d.alt.size()))
+                    ins_base = cs_alt_base_from_digar_char(d.alt[static_cast<size_t>(j)]);
                 kputc(ins_base, cs);
             }
         } else if (d.type == DigarType::Deletion) {

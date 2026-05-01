@@ -9,7 +9,7 @@
 #   ./scripts/verify_refine_bam_parity.sh [REGION] [--hifi|--ont]
 #
 # Defaults:
-#   REGION  chr11:1255000-1260000
+#   REGION  CHM13#0#chr20:15200000-15205000 (HG002 HiFi chr20 slice; FA+BAM under test_data/chr20_quick/)
 #   mode    --hifi
 #
 # Environment overrides:
@@ -29,10 +29,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PGPHASE="${PGPHASE:-$ROOT/pgphase}"
 LONGCALLD="${LONGCALLD:-}"
-FA="${FA:-$ROOT/test_data/chr11_2M.fa}"
-REGION="${1:-chr11:1255000-1260000}"
+REGION="${1:-CHM13#0#chr20:15200000-15205000}"
 MODE="${2:---hifi}"
 OUTDIR="${OUTDIR:-$ROOT/test_data/parity_compare/verify_refine}"
+
+if [[ -z "${FA:-}" ]]; then
+    if [[ "$MODE" == "--ont" ]]; then
+        FA="$ROOT/test_data/chr11_2M.fa"
+    else
+        FA="$ROOT/test_data/chr20_quick/CHM13_chr20_only.fa"
+    fi
+fi
 
 if [[ -z "$LONGCALLD" ]]; then
     if [[ -x "/tmp/longcalld/longcallD-v0.0.11_x64-linux/longcallD" ]]; then
@@ -46,7 +53,7 @@ if [[ -z "${BAM:-}" ]]; then
     if [[ "$MODE" == "--ont" ]]; then
         BAM="$ROOT/test_data/HG002_chr11_ont_test.bam"
     else
-        BAM="$ROOT/test_data/HG002_chr11_hifi_test.bam"
+        BAM="$ROOT/test_data/chr20_quick/HG002_CHM13_chr20_15000001_15500000.bam"
     fi
 fi
 

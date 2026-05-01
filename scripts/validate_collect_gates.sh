@@ -3,8 +3,9 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PGPHASE="${PGPHASE:-$ROOT/pgphase}"
-HIFI_FA="${HIFI_FA:-$ROOT/test_data/chr11_2M.fa}"
-HIFI_BAM="${HIFI_BAM:-$ROOT/test_data/HG002_chr11_hifi_test.bam}"
+# Defaults: HG002 HiFi chr20 slice vs CHM13#0#chr20 (see test_data/chr20_quick/).
+HIFI_FA="${HIFI_FA:-$ROOT/test_data/chr20_quick/CHM13_chr20_only.fa}"
+HIFI_BAM="${HIFI_BAM:-$ROOT/test_data/chr20_quick/HG002_CHM13_chr20_15000001_15500000.bam}"
 ONT_FA="${ONT_FA:-$ROOT/test_data/chr11_2M.fa}"
 ONT_BAM="${ONT_BAM:-$ROOT/test_data/HG002_chr11_ont_test.bam}"
 HIFI_EXPECTED_TSV="${HIFI_EXPECTED_TSV:-$ROOT/test_data/expected/hifi_collect_expected.tsv}"
@@ -51,6 +52,19 @@ hash_file() {
   fi
 }
 
+# Phased VCF headers include ##fileDate=YYYYMMDD from run day; strip for stable golden compares.
+hash_vcf_stable() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    grep -v '^##fileDate=' "$f" | sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    grep -v '^##fileDate=' "$f" | shasum -a 256 | awk '{print $1}'
+  else
+    echo "error: no sha256 tool found (need sha256sum or shasum)" >&2
+    exit 1
+  fi
+}
+
 run_collect() {
   local threads="$1"
   local out_tsv="$2"
@@ -84,9 +98,9 @@ count_t4="$(run_collect 4 "$t4_tsv" "$t4_vcf" "$HIFI_FA" "$HIFI_BAM" --hifi)"
 hash_exp_hifi_tsv="$(hash_file "$HIFI_EXPECTED_TSV")"
 hash_t1_tsv="$(hash_file "$t1_tsv")"
 hash_t4_tsv="$(hash_file "$t4_tsv")"
-hash_exp_hifi_vcf="$(hash_file "$HIFI_EXPECTED_VCF")"
-hash_t1_vcf="$(hash_file "$t1_vcf")"
-hash_t4_vcf="$(hash_file "$t4_vcf")"
+hash_exp_hifi_vcf="$(hash_vcf_stable "$HIFI_EXPECTED_VCF")"
+hash_t1_vcf="$(hash_vcf_stable "$t1_vcf")"
+hash_t4_vcf="$(hash_vcf_stable "$t4_vcf")"
 
 if [[ "$hash_t1_tsv" != "$hash_exp_hifi_tsv" ]]; then
   echo "error: HiFi TSV golden mismatch (t1 sha256 $hash_t1_tsv expected $hash_exp_hifi_tsv)" >&2
@@ -132,8 +146,8 @@ if [[ -f "$ONT_FA" && -f "$ONT_BAM" ]]; then
     echo "warn: ONT expected TSV not found: $ONT_EXPECTED_TSV (golden check skipped)"
   fi
   if [[ -f "$ONT_EXPECTED_VCF" ]]; then
-    hash_exp_ont_vcf="$(hash_file "$ONT_EXPECTED_VCF")"
-    hash_ont_vcf="$(hash_file "$ont_vcf")"
+    hash_exp_ont_vcf="$(hash_vcf_stable "$ONT_EXPECTED_VCF")"
+    hash_ont_vcf="$(hash_vcf_stable "$ont_vcf")"
     if [[ "$hash_ont_vcf" != "$hash_exp_ont_vcf" ]]; then
       echo "error: ONT phased VCF golden mismatch (sha256 $hash_ont_vcf expected $hash_exp_ont_vcf)" >&2
       echo "       expected: $ONT_EXPECTED_VCF" >&2

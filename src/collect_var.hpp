@@ -49,6 +49,12 @@ struct CrangesOwner {
 int exact_comp_var_site(const VariantKey* var1, const VariantKey* var2);
 
 /**
+ * @brief Total order on candidates (longcallD `exact_comp_cand_var` → `make_var_site_from_cand_var` +
+ *        `exact_comp_var_site`). Same chunk uses canonical `VariantKey` encoding as lcd `cand_var_t`.
+ */
+int exact_comp_cand_var(const CandidateVariant* var1, const CandidateVariant* var2);
+
+/**
  * @brief Same ordering with large-insertion fuzzy collapse (longcallD `exact_comp_var_site_ins`).
  * @param min_sv_len Length threshold for insertion fuzzy merge rule.
  * @return Negative / zero / positive as `exact_comp_var_site`.
@@ -71,19 +77,33 @@ VariantKey variant_key_from_digar(int tid, const DigarOp& op);
 
 /**
  * @brief Sorts and deduplicates candidates using fuzzy large-insertion equivalence.
+ * longcallD uses `exact_comp_var_site_ins` with `opt->min_sv_len` after sorting by locus.
+ * SNP/INS ALT tie-break uses `nst_nt4_table`-encoded bytes (`memcmp` on `var_site_t.alt_seq`), not raw ASCII order (`seq.c`).
  * @param variants In/out table.
+ * @param min_sv_len Minimum SV length threshold for fuzzy INS dedupe (LCD `opt->min_sv_len`).
  */
-void collapse_fuzzy_large_insertions(CandidateTable& variants);
+void collapse_fuzzy_large_insertions(CandidateTable& variants, int min_sv_len);
+
+/**
+ * @brief Sort and drop rows whose `VariantKey` compares equal under `exact_comp_var_site` (memcmp-grade).
+ *
+ * Used when concatenating per-window candidate tables: longcallD emits one VCF stream per BAM chunk
+ * (`call_var_main.c` step 2) and never applies `exact_comp_var_site_ins` across chunks — only per-chunk
+ * `collect_all_cand_var_sites`. Cross-chunk dedupe must not fuzzy-merge large insertions.
+ */
+void collapse_exact_duplicate_variants(CandidateTable& variants);
 
 /**
  * @brief Gathers candidate keys from digars overlapping `chunk`, then collapses fuzzy INS.
  * @param chunk 1-based inclusive region bounds.
  * @param reads Parsed reads for the chunk.
  * @param variants Output candidate rows (counts still zero).
+ * @param min_sv_len Passed to fuzzy INS collapse (`exact_comp_var_site_ins` threshold).
  */
 void collect_candidate_sites_from_records(const RegionChunk& chunk,
                                           const std::vector<ReadRecord>& reads,
-                                          CandidateTable& variants);
+                                          CandidateTable& variants,
+                                          int min_sv_len);
 
 /**
  * @brief Fills allele/strand depth from digars vs sorted candidates; optional read-support log.
@@ -92,12 +112,14 @@ void collect_candidate_sites_from_records(const RegionChunk& chunk,
  * @param chunk_region If non-null with `read_support_out`, stamped into support rows.
  * @param read_support_out Optional observation list.
  * @param min_bq Minimum base quality for high-quality alt tally.
+ * @param min_sv_len Passed to `exact_comp_var_site_ins` (LCD `opt->min_sv_len`).
  */
 void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         CandidateTable& variants,
                                         const RegionChunk* chunk_region,
                                         std::vector<ReadSupportRow>* read_support_out,
-                                        int min_bq);
+                                        int min_bq,
+                                        int min_sv_len);
 
 /**
  * @brief Sorts and merges overlapping/adjacent intervals; merged label is max of inputs.

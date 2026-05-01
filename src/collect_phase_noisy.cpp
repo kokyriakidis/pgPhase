@@ -13,7 +13,7 @@
 
 #include "collect_phase_noisy.hpp"
 #include "collect_phase.hpp" // assign_hap_based_on_germline_het_vars_kmeans, kCandGermlineVarCate
-#include "collect_var.hpp"   // exact_comp_var_site
+#include "collect_var.hpp"   // exact_comp_cand_var, exact_comp_var_site
 
 #include <algorithm>
 #include <cassert>
@@ -100,6 +100,7 @@ void update_variant_depth_fields(CandidateVariant& var) {
 
 void set_noisy_category(CandidateVariant& var, VariantCategory category) {
     var.counts.category = category;
+    var.lcd_var_i_to_cate = category_to_flag(category);
 }
 
 static void restore_stashed_initial_if_any(BamChunk& chunk, CandidateVariant& var) {
@@ -149,49 +150,35 @@ std::vector<ReadVariantProfile> init_read_profiles(size_t n_reads) {
     return profiles;
 }
 
-uint8_t ref_base_nt4(const BamChunk& chunk, hts_pos_t pos) {
-    if (pos < chunk.ref_beg || pos > chunk.ref_end || chunk.ref_seq.empty()) return 4;
-    return base_to_nt4(chunk.ref_seq[static_cast<size_t>(pos - chunk.ref_beg)]);
-}
-
 bool var_is_homopolymer_indel(const BamChunk& chunk,
                               hts_pos_t ref_pos,
                               VariantType type,
                               int ref_len,
                               const std::string& alt) {
     // Literal port of longcallD collect_var.c:1720 `var_is_homopolymer_indel`.
+    // INS: ref loop compares raw FASTA bytes to nt4 alt (same as LCD); DEL: raw bytes throughout.
     if (type == VariantType::Snp) return false;
-    if (chunk.ref_seq.empty()) return false;
-    if (ref_pos < chunk.ref_beg || ref_pos > chunk.ref_end) return false;
     if (type == VariantType::Insertion) {
-        // longcallD uses a VCF-style anchor (POS-1) in downstream representation; in practice
-        // its homopolymer veto behaves as if anchored at ref_pos-1 for insertions.
-        const hts_pos_t anchor = std::max<hts_pos_t>(chunk.ref_beg, ref_pos - 1);
-        const int64_t idx0 = static_cast<int64_t>(anchor - chunk.ref_beg);
         if (alt.empty()) return false;
         const uint8_t ins_base0 = base_to_nt4(alt[0]);
         for (size_t i = 1; i < alt.size(); ++i) {
             if (base_to_nt4(alt[i]) != ins_base0) return false;
         }
         for (int i = 0; i < 5; ++i) {
-            const int64_t idx = idx0 + i;
-            if (idx < 0 || idx >= static_cast<int64_t>(chunk.ref_seq.size())) return false;
-            if (base_to_nt4(chunk.ref_seq[static_cast<size_t>(idx)]) != ins_base0) return false;
+            const size_t idx = static_cast<size_t>(ref_pos - chunk.ref_beg + static_cast<hts_pos_t>(i));
+            if (static_cast<uint8_t>(static_cast<unsigned char>(chunk.ref_seq[idx])) != ins_base0) return false;
         }
         return true;
     }
-
-    const int64_t idx0 = static_cast<int64_t>(ref_pos - chunk.ref_beg);
-    const uint8_t ref_base0 = base_to_nt4(chunk.ref_seq[static_cast<size_t>(idx0)]);
+    const size_t idx0 = static_cast<size_t>(ref_pos - chunk.ref_beg);
+    const uint8_t ref_base0 = static_cast<uint8_t>(static_cast<unsigned char>(chunk.ref_seq[idx0]));
     for (int i = 1; i < ref_len; ++i) {
-        const int64_t idx = idx0 + i;
-        if (idx < 0 || idx >= static_cast<int64_t>(chunk.ref_seq.size())) return false;
-        if (base_to_nt4(chunk.ref_seq[static_cast<size_t>(idx)]) != ref_base0) return false;
+        const size_t idx = idx0 + static_cast<size_t>(i);
+        if (static_cast<uint8_t>(static_cast<unsigned char>(chunk.ref_seq[idx])) != ref_base0) return false;
     }
     for (int i = 0; i < 5; ++i) {
-        const int64_t idx = idx0 + i;
-        if (idx < 0 || idx >= static_cast<int64_t>(chunk.ref_seq.size())) return false;
-        if (base_to_nt4(chunk.ref_seq[static_cast<size_t>(idx)]) != ref_base0) return false;
+        const size_t idx = idx0 + static_cast<size_t>(i);
+        if (static_cast<uint8_t>(static_cast<unsigned char>(chunk.ref_seq[idx])) != ref_base0) return false;
     }
     return true;
 }
@@ -211,11 +198,14 @@ CandidateVariant make_noisy_candidate(const BamChunk& chunk,
     var.key.ref_len = ref_len;
     var.key.alt = std::move(alt);
     var.ref_base = type == VariantType::Snp && ref_base < 4 ? ref_base : 4;
-    var.alt_ref_base = type == VariantType::Snp || alt_ref_base >= 4 ? 4 : alt_ref_base;
+    // INS/DEL: keep consensus anchor encoding (e.g. abPOA gap == 5) for longcallD VCF parity;
+    // SNP path does not use alt_ref_base (longcallD fills separately).
+    var.alt_ref_base = type == VariantType::Snp ? static_cast<uint8_t>(4) : alt_ref_base;
     var.is_homopolymer_indel = is_homopolymer_indel;
     var.counts.n_uniq_alles = 2;
     var.counts.alle_covs.assign(2, 0);
     var.counts.category = VariantCategory::NoisyCandHom;
+    var.lcd_var_i_to_cate = category_to_flag(VariantCategory::NoisyCandHom);
     return var;
 }
 
@@ -359,7 +349,7 @@ int is_match_aln_str(const AlnStr& aln_str,
     }
     *full_cover = cover_start && cover_end;
     if (len >= 10) {
-        if (n_eq >= static_cast<int>(len * cons_sim_thres)) return 1;
+        if (n_eq >= len * cons_sim_thres) return 1;
         return *full_cover ? 0 : -1;
     }
     if (n_eq == len && n_xid == 0) return 1;
@@ -472,7 +462,6 @@ int get_full_cover_from_ref_cons_aln_str(const AlnStr& cons_aln_str,
             break;
         }
     }
-    if (beg_in_cons < 0 || end_in_cons < beg_in_cons) return 0;
     return is_cover_aln_str(cons_aln_str, beg_in_cons, end_in_cons - beg_in_cons + 1);
 }
 
@@ -843,7 +832,7 @@ int make_vars_from_msa_cons_aln(
     const Options& opts, BamChunk& chunk,
     int /*n_noisy_reads*/, const std::vector<int>& /*read_ids*/,
     hts_pos_t noisy_reg_beg,
-    int /*n_cons*/,
+    int n_cons,
     const std::array<int, 2>& clu_n_seqs,
     const std::array<std::vector<int>, 2>& clu_read_ids,
     const std::array<std::vector<AlnStr>, 2>& aln_strs,
@@ -854,7 +843,8 @@ int make_vars_from_msa_cons_aln(
     noisy_var_cate.clear();
     noisy_rvp.clear();
 
-    const int n_cons = (!aln_strs[1].empty()) ? 2 : (!aln_strs[0].empty() ? 1 : 0);
+    // longcallD `make_vars_from_msa_cons_aln` (`collect_var.c`): branch on the `n_cons`
+    // returned by `collect_noisy_reg_aln_strs`, not on whether auxiliary vectors are empty.
     if (n_cons == 0) return 0;
 
     if (n_cons == 1) {
@@ -922,7 +912,7 @@ void merge_var_profile(BamChunk& chunk,
     std::vector<size_t> order(new_vars.size());
     std::iota(order.begin(), order.end(), 0);
     std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
-        return exact_comp_var_site(&new_vars[a].key, &new_vars[b].key) < 0;
+        return exact_comp_cand_var(&new_vars[a], &new_vars[b]) < 0;
     });
     std::vector<CandidateVariant> sorted_new;
     std::vector<VariantCategory> sorted_cats;
@@ -1024,9 +1014,10 @@ void merge_var_profile(BamChunk& chunk,
 
 int collect_noisy_vars1(BamChunk& chunk, const Options& opts, int noisy_reg_i) {
     const Interval& reg = chunk.noisy_regions[static_cast<size_t>(noisy_reg_i)];
-    // chunk.noisy_regions are stored as 1-based inclusive intervals via intervals_from_cr()
-    // (beg = cr_start + 1), while longcallD step 4 uses cr_start(...) directly.
-    hts_pos_t noisy_reg_beg = reg.beg - 1;
+    // longcallD `collect_noisy_vars1` enters with `noisy_reg_beg = cr_start(chunk_noisy_regs, i)`.
+    // The stored `Interval::beg` here is the printed left edge (`NoisyRegion: beg-1`) plus one,
+    // so step 4 must add one to match longcallD's `cr_start` coordinate exactly.
+    hts_pos_t noisy_reg_beg = reg.beg + 1;
     hts_pos_t noisy_reg_end = reg.end;
 
     // mirrors longcallD: skip regions longer than max_noisy_reg_len (return 0 = done, no vars).

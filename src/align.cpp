@@ -74,38 +74,49 @@ static bool is_homopolymer(const uint8_t* seq, int seq_len, int flank_len,
     return false;
 }
 
-// Build alignment strings from WFA cigar — mirrors longcallD wfa_collect_pretty_alignment.
+// longcallD align.c wfa_collect_pretty_alignment (verbatim control flow; vectors vs malloc).
 static int wfa_collect_pretty_alignment(cigar_t* cigar,
                                         const uint8_t* pattern, int plen,
                                         const uint8_t* text, int tlen,
                                         std::vector<uint8_t>& pat_alg,
                                         std::vector<uint8_t>& txt_alg) {
-    const int max_buf = plen + tlen + 1;
-    pat_alg.assign(static_cast<size_t>(max_buf), 0);
-    txt_alg.assign(static_cast<size_t>(max_buf), 0);
+    char* const operations = cigar->operations;
+    const int begin_offset = cigar->begin_offset;
+    const int end_offset = cigar->end_offset;
+    const int max_buffer_length = tlen + plen + 1;
+    pat_alg.assign(static_cast<size_t>(max_buffer_length), 0);
+    txt_alg.assign(static_cast<size_t>(max_buffer_length), 0);
 
-    const char* ops   = cigar->operations;
-    const int beg_off = cigar->begin_offset;
-    const int end_off = cigar->end_offset;
-
-    int alg_pos = 0, pp = 0, tp = 0;
-    for (int i = beg_off; i < end_off; ++i) {
-        switch (ops[i]) {
+    int alg_pos = 0, pattern_pos = 0, text_pos = 0;
+    for (int i = begin_offset; i < end_offset; ++i) {
+        switch (operations[i]) {
             case 'M':
+                if (pattern[pattern_pos] != text[text_pos]) {
+                    pat_alg[static_cast<size_t>(alg_pos)] = pattern[pattern_pos];
+                    txt_alg[static_cast<size_t>(alg_pos++)] = text[text_pos];
+                } else {
+                    pat_alg[static_cast<size_t>(alg_pos)] = pattern[pattern_pos];
+                    txt_alg[static_cast<size_t>(alg_pos++)] = text[text_pos];
+                }
+                pattern_pos++;
+                text_pos++;
+                break;
             case 'X':
-                pat_alg[static_cast<size_t>(alg_pos)] = pattern[pp++];
-                txt_alg[static_cast<size_t>(alg_pos)] = text[tp++];
-                ++alg_pos;
+                if (pattern[pattern_pos] != text[text_pos]) {
+                    pat_alg[static_cast<size_t>(alg_pos)] = pattern[pattern_pos++];
+                    txt_alg[static_cast<size_t>(alg_pos++)] = text[text_pos++];
+                } else {
+                    pat_alg[static_cast<size_t>(alg_pos)] = pattern[pattern_pos++];
+                    txt_alg[static_cast<size_t>(alg_pos++)] = text[text_pos++];
+                }
                 break;
             case 'I':
-                pat_alg[static_cast<size_t>(alg_pos)] = 5; // gap
-                txt_alg[static_cast<size_t>(alg_pos)] = text[tp++];
-                ++alg_pos;
+                pat_alg[static_cast<size_t>(alg_pos)] = 5;
+                txt_alg[static_cast<size_t>(alg_pos++)] = text[text_pos++];
                 break;
             case 'D':
-                pat_alg[static_cast<size_t>(alg_pos)] = pattern[pp++];
-                txt_alg[static_cast<size_t>(alg_pos)] = 5; // gap
-                ++alg_pos;
+                pat_alg[static_cast<size_t>(alg_pos)] = pattern[pattern_pos++];
+                txt_alg[static_cast<size_t>(alg_pos++)] = 5;
                 break;
             default:
                 break;
@@ -139,6 +150,43 @@ int full_cover_cmp(int c1, int c2) {
     if (noisyIsLeftCover(c1) && noisyIsLeftCover(c2)) return 0;
     if (noisyIsRightCover(c1) && noisyIsRightCover(c2)) return 0;
     return c1 - c2;
+}
+
+static inline int digar_type_to_bam_op(DigarType t) {
+    switch (t) {
+        case DigarType::Equal: return BAM_CEQUAL;
+        case DigarType::Snp: return BAM_CDIFF;
+        case DigarType::Insertion: return BAM_CINS;
+        case DigarType::Deletion: return BAM_CDEL;
+        case DigarType::SoftClip: return BAM_CSOFT_CLIP;
+        case DigarType::HardClip: return BAM_CHARD_CLIP;
+        case DigarType::RefSkip: return BAM_CREF_SKIP;
+    }
+    return BAM_CEQUAL;
+}
+
+/** longcallD `bam_utils.h` `digar2qlen` on the pre-MSA digar stream (uses last op only). */
+// longcallD `collect_*_msa_digars`: `d.alt_seq[0] = read_str[i]` (0–4), not ASCII letters.
+static inline std::string msa_digar_alt1(uint8_t qb) {
+    return std::string(1, static_cast<char>(qb < 5 ? qb : 4));
+}
+
+static inline int digar2qlen_lcd(const std::vector<DigarOp>& digars) {
+    if (digars.empty()) return 0;
+    const DigarOp& last = digars.back();
+    const int op = digar_type_to_bam_op(last.type);
+    int qlen = last.qi;
+    if (op == BAM_CEQUAL || op == BAM_CMATCH || op == BAM_CDIFF || op == BAM_CINS ||
+        op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
+        qlen += last.len;
+    }
+    return qlen;
+}
+
+/** longcallD `digar_t.qlen` after `longcalld_copy_digar_read_buffers`: packed `l_qseq`, not recomputed from digars. */
+static inline int read_packed_qlen_lcd(const ReadRecord& read) {
+    if (read.alignment) return static_cast<int>(read.alignment->core.l_qseq);
+    return digar2qlen_lcd(read.digars);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -176,22 +224,9 @@ NoisyReadInfo collect_noisy_read_info(const Options& opts, const BamChunk& chunk
         info.phase_sets[static_cast<size_t>(i)] = chunk.phase_sets[static_cast<size_t>(read_id)];
 
         // Match longcallD collect_noisy_read_info exactly:
-        // reg_read_end starts from digar2qlen(read_digars)-1, then hard-clips adjust both ends.
+        // reg_read_end = digar2qlen(read_digars)-1, then hard-clips adjust both ends.
         int reg_read_beg = 0;
-        int reg_read_end = 0;
-        {
-            int qlen = 0;
-            if (n_digar > 0) {
-                const DigarOp& last = digars[static_cast<size_t>(n_digar - 1)];
-                qlen = last.qi;
-                if (last.type == DigarType::Equal || last.type == DigarType::Snp ||
-                    last.type == DigarType::Insertion || last.type == DigarType::SoftClip ||
-                    last.type == DigarType::HardClip) {
-                    qlen += last.len;
-                }
-            }
-            reg_read_end = qlen - 1;
-        }
+        int reg_read_end = digar2qlen_lcd(digars) - 1;
         if (n_digar > 0 && digars[0].type == DigarType::HardClip) {
             reg_read_beg = digars[0].len;
         }
@@ -252,8 +287,6 @@ NoisyReadInfo collect_noisy_read_info(const Options& opts, const BamChunk& chunk
             cover = end_is_del ? kNoisyRightGap : kNoisyRightCover;
         }
 
-        if (reg_read_end < reg_read_beg) { reg_read_end = reg_read_beg; }
-
         const int rlen = reg_read_end - reg_read_beg + 1;
         info.lens[static_cast<size_t>(i)] = rlen;
         info.seqs [static_cast<size_t>(i)].resize(static_cast<size_t>(rlen));
@@ -293,19 +326,6 @@ NoisyReadInfo collect_noisy_read_info(const Options& opts, const BamChunk& chunk
         }
     }
     return info;
-}
-
-static inline int digar_type_to_bam_op(DigarType t) {
-    switch (t) {
-        case DigarType::Equal: return BAM_CEQUAL;
-        case DigarType::Snp: return BAM_CDIFF;
-        case DigarType::Insertion: return BAM_CINS;
-        case DigarType::Deletion: return BAM_CDEL;
-        case DigarType::SoftClip: return BAM_CSOFT_CLIP;
-        case DigarType::HardClip: return BAM_CHARD_CLIP;
-        case DigarType::RefSkip: return BAM_CREF_SKIP;
-    }
-    return BAM_CEQUAL;
 }
 
 static inline DigarType bam_op_to_digar_type(int op) {
@@ -366,19 +386,6 @@ static inline int double_check_digar(const std::vector<DigarOp>& digars) {
         if (qi != digars[static_cast<size_t>(i)].qi) return 1;
     }
     return 0;
-}
-
-/** longcallD `bam_utils.h` `digar2qlen` on the pre-MSA digar stream (uses last op only). */
-static inline int digar2qlen_lcd(const std::vector<DigarOp>& digars) {
-    if (digars.empty()) return 0;
-    const DigarOp& last = digars.back();
-    const int op = digar_type_to_bam_op(last.type);
-    int qlen = last.qi;
-    if (op == BAM_CEQUAL || op == BAM_CMATCH || op == BAM_CDIFF || op == BAM_CINS ||
-        op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
-        qlen += last.len;
-    }
-    return qlen;
 }
 
 static inline int digar_q_end(const DigarOp& d) {
@@ -491,8 +498,7 @@ static std::vector<DigarOp> collect_full_msa_digars(int read_beg, int /*read_end
                 if (qb == rb) {
                     push_digar0(out, DigarOp{ref_pos, DigarType::Equal, 1, read_pos, false, ""});
                 } else {
-                    DigarOp d{ref_pos, DigarType::Snp, 1, read_pos, false,
-                              std::string(1, "ACGTN"[qb < 5 ? qb : 4])};
+                    DigarOp d{ref_pos, DigarType::Snp, 1, read_pos, false, msa_digar_alt1(qb)};
                     push_digar0(out, d);
                 }
             }
@@ -501,7 +507,7 @@ static std::vector<DigarOp> collect_full_msa_digars(int read_beg, int /*read_end
         } else if (qb != 5) {
             if (i >= left_read_start && i <= right_read_end) {
                 push_digar0(out, DigarOp{ref_pos, DigarType::Insertion, 1, read_pos, false,
-                                         std::string(1, "ACGTN"[qb < 5 ? qb : 4])});
+                                         msa_digar_alt1(qb)});
             }
             ++read_pos;
         } else {
@@ -549,8 +555,7 @@ static std::vector<DigarOp> collect_left_msa_digars(int read_beg, int /*read_end
                 if (qb == rb) {
                     push_digar0(out, DigarOp{ref_pos, DigarType::Equal, 1, read_pos, false, ""});
                 } else {
-                    DigarOp d{ref_pos, DigarType::Snp, 1, read_pos, false,
-                              std::string(1, "ACGTN"[qb < 5 ? qb : 4])};
+                    DigarOp d{ref_pos, DigarType::Snp, 1, read_pos, false, msa_digar_alt1(qb)};
                     push_digar0(out, d);
                 }
             }
@@ -559,7 +564,7 @@ static std::vector<DigarOp> collect_left_msa_digars(int read_beg, int /*read_end
         } else if (qb != 5) {
             if (i >= left_read_start && i <= right_read_end) {
                 push_digar0(out, DigarOp{ref_pos, DigarType::Insertion, 1, read_pos, false,
-                                         std::string(1, "ACGTN"[qb < 5 ? qb : 4])});
+                                         msa_digar_alt1(qb)});
             }
             ++read_pos;
         } else {
@@ -620,15 +625,14 @@ static std::vector<DigarOp> collect_right_msa_digars(int /*read_beg*/, int read_
             if (qb == rb) {
                 push_digar0(out, DigarOp{ref_pos, DigarType::Equal, 1, read_pos, false, ""});
             } else {
-                DigarOp d{ref_pos, DigarType::Snp, 1, read_pos, false,
-                          std::string(1, "ACGTN"[qb < 5 ? qb : 4])};
+                DigarOp d{ref_pos, DigarType::Snp, 1, read_pos, false, msa_digar_alt1(qb)};
                 push_digar0(out, d);
             }
             ++read_pos;
             ++ref_pos;
         } else if (qb != 5) {
             push_digar0(out, DigarOp{ref_pos, DigarType::Insertion, 1, read_pos, false,
-                                     std::string(1, "ACGTN"[qb < 5 ? qb : 4])});
+                                     msa_digar_alt1(qb)});
             ++read_pos;
         } else {
             push_digar0(out, DigarOp{ref_pos, DigarType::Deletion, 1, read_pos, false, ""});
@@ -654,7 +658,9 @@ static void update_digars_from_msa1(ReadRecord& read, const AlnStr& ref_read_aln
         for (const DigarOp& d : right) push_digar_alt_seq(merged, d);
     } else if (noisyIsLeftCover(full_cover)) {
         left = collect_left_digars(read.digars, read_beg, noisy_reg_beg);
-        msa = collect_left_msa_digars(read_beg, read_end, digar2qlen_lcd(read.digars), noisy_reg_beg, ref_read_aln);
+        // longcallD passes digar->qlen (BAM l_qseq), not digar2qlen(digars).
+        msa = collect_left_msa_digars(read_beg, read_end, read_packed_qlen_lcd(read), noisy_reg_beg,
+                                       ref_read_aln);
         for (const DigarOp& d : left) push_digar_alt_seq(merged, d);
         for (const DigarOp& d : msa) push_digar0(merged, d);
     } else if (noisyIsRightCover(full_cover)) {
@@ -826,7 +832,8 @@ int wfa_end2end_aln(const uint8_t* pattern, int plen,
 
     if (heuristic == kWfaNoHeuristic) {
         attr.heuristic.strategy = wf_heuristic_none;
-    } else if (heuristic == kWfaAdaptive) {
+    }
+    if (heuristic == kWfaAdaptive) {
         attr.heuristic.strategy = wf_heuristic_wfadaptive;
     } else if (heuristic == kWfaZdrop) {
         attr.heuristic.strategy = wf_heuristic_zdrop;
@@ -860,6 +867,80 @@ int wfa_end2end_aln(const uint8_t* pattern, int plen,
 
     wavefront_aligner_delete(wf);
     return aln_len;
+}
+
+// Mirrors longcallD wfa_end2end_aln(..., cigar_buf, cigar_length, ...) cigar branch (align.c).
+static int wfa_end2end_aln_collect_cigar(const uint8_t* pattern, int plen,
+                                         const uint8_t* text, int tlen,
+                                         int gap_aln, int b, int q, int e, int q2, int e2,
+                                         int heuristic, int affine_gap,
+                                         std::vector<uint32_t>& cigar_buf_out) {
+    wavefront_aligner_attr_t attr = wavefront_aligner_attr_default;
+    if (affine_gap == kWfaAffine2p) {
+        attr.distance_metric = gap_affine_2p;
+        attr.affine2p_penalties.match       = 0;
+        attr.affine2p_penalties.mismatch    = b;
+        attr.affine2p_penalties.gap_opening1 = q;
+        attr.affine2p_penalties.gap_extension1 = e;
+        attr.affine2p_penalties.gap_opening2 = q2;
+        attr.affine2p_penalties.gap_extension2 = e2;
+    } else {
+        attr.distance_metric = gap_affine;
+        attr.affine_penalties.match     = 0;
+        attr.affine_penalties.mismatch  = b;
+        attr.affine_penalties.gap_opening  = q;
+        attr.affine_penalties.gap_extension = e;
+    }
+    attr.alignment_scope = compute_alignment;
+    attr.alignment_form.span = alignment_end2end;
+
+    if (heuristic == kWfaNoHeuristic) {
+        attr.heuristic.strategy = wf_heuristic_none;
+    }
+    if (heuristic == kWfaAdaptive) {
+        attr.heuristic.strategy = wf_heuristic_wfadaptive;
+    } else if (heuristic == kWfaZdrop) {
+        attr.heuristic.strategy = wf_heuristic_zdrop;
+        attr.heuristic.zdrop = std::min(500, static_cast<int>(std::min(plen, tlen) * 0.1));
+        attr.heuristic.steps_between_cutoffs = 100;
+    }
+
+    uint8_t* p = nullptr;
+    uint8_t* t = nullptr;
+    const uint8_t* p_use = pattern;
+    const uint8_t* t_use = text;
+    if (gap_aln == kGapLeftAln) {
+        p = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(plen)));
+        t = static_cast<uint8_t*>(std::malloc(static_cast<size_t>(tlen)));
+        for (int i = 0; i < plen; ++i) p[static_cast<size_t>(i)] = pattern[plen - i - 1];
+        for (int i = 0; i < tlen; ++i) t[static_cast<size_t>(i)] = text[tlen - i - 1];
+        p_use = p;
+        t_use = t;
+    }
+
+    wavefront_aligner_t* wf = wavefront_aligner_new(&attr);
+    wavefront_align(wf, reinterpret_cast<const char*>(p_use), plen,
+                    reinterpret_cast<const char*>(t_use), tlen);
+
+    uint32_t* tmp_cigar = nullptr;
+    int cigar_length = 0;
+    cigar_get_CIGAR(wf->cigar, true, &tmp_cigar, &cigar_length);
+
+    cigar_buf_out.resize(static_cast<size_t>(cigar_length));
+    if (gap_aln == kGapLeftAln) {
+        for (int i = 0; i < cigar_length; ++i) {
+            cigar_buf_out[static_cast<size_t>(i)] = tmp_cigar[cigar_length - i - 1];
+        }
+    } else {
+        for (int i = 0; i < cigar_length; ++i) {
+            cigar_buf_out[static_cast<size_t>(i)] = tmp_cigar[static_cast<size_t>(i)];
+        }
+    }
+
+    wavefront_aligner_delete(wf);
+    std::free(p);
+    std::free(t);
+    return cigar_length;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -990,7 +1071,8 @@ int make_cons_read_aln_str(const uint8_t* cons_row, const uint8_t* read_row,
     out.target_aln.reserve(static_cast<size_t>(msa_len));
     out.query_aln .reserve(static_cast<size_t>(msa_len));
     for (int i = 0; i < msa_len; ++i) {
-        if (cons_row[i] != 5 || read_row[i] != 5) { // skip double-gap columns
+        // longcallD: read_str[i] != 5 || cons_str[i] != 5
+        if (read_row[i] != 5 || cons_row[i] != 5) {
             out.target_aln.push_back(cons_row[i]);
             out.query_aln .push_back(read_row[i]);
         }
@@ -1090,11 +1172,14 @@ int abpoa_aln_msa_cons(const Options& opts, int n_reads,
     abpoa_para_t* abpt = abpoa_init_para();
     abpt->wb = -1;
     abpt->inc_path_score = 1;
+    // longcallD align.c abpoa_aln_msa_cons: out_msa toggled like lcd (we always collect MSA).
+    abpt->out_msa = 0;
     abpt->out_cons = 1;
-    abpt->out_msa  = 1;
+    abpt->out_msa = 1;
+    if (opts.verbose >= 2) abpt->out_msa = 1;
     abpt->cons_algrm = ABPOA_MF;
     abpt->max_n_cons = max_n_cons;
-    abpt->min_freq   = static_cast<float>(opts.min_af);
+    abpt->min_freq   = opts.min_af;
     abpt->match      = opts.match;
     abpt->mismatch   = opts.mismatch;
     abpt->gap_open1  = opts.gap_open1;
@@ -1134,27 +1219,20 @@ int abpoa_aln_msa_cons(const Options& opts, int n_reads,
                 clu_read_ids[0][static_cast<size_t>(k)] = read_ids[static_cast<size_t>(k)];
         }
 
-        // Collect MSA rows split by cluster.
+        // Collect MSA rows split by cluster (longcallD align.c abpoa_aln_msa_cons: always
+        // abc->clu_read_ids[ci][k] -> abc->msa_base[src], never assume row k == input k).
         msa_seq_lens.resize(static_cast<size_t>(abc->n_cons));
         for (int ci = 0; ci < abc->n_cons; ++ci) {
             msa_seq_lens[static_cast<size_t>(ci)] = abc->msa_len;
-            const int n_read_rows = (abc->n_cons > 1) ? abc->clu_n_seq[ci] : n_reads;
+            const int n_read_rows = abc->clu_n_seq[ci];
             const int n_rows = n_read_rows + 1; // reads + consensus
             msa_seqs[static_cast<size_t>(ci)].resize(static_cast<size_t>(n_rows));
-            if (abc->n_cons > 1) {
-                for (int k = 0; k < abc->clu_n_seq[ci]; ++k) {
-                    const int src = abc->clu_read_ids[ci][k];
-                    msa_seqs[static_cast<size_t>(ci)][static_cast<size_t>(k)].assign(
-                        abc->msa_base[src], abc->msa_base[src] + abc->msa_len);
-                }
-            } else {
-                for (int k = 0; k < n_reads; ++k) {
-                    msa_seqs[static_cast<size_t>(ci)][static_cast<size_t>(k)].assign(
-                        abc->msa_base[k], abc->msa_base[k] + abc->msa_len);
-                }
+            for (int k = 0; k < abc->clu_n_seq[ci]; ++k) {
+                const int src = abc->clu_read_ids[ci][k];
+                msa_seqs[static_cast<size_t>(ci)][static_cast<size_t>(k)].assign(
+                    abc->msa_base[src], abc->msa_base[src] + abc->msa_len);
             }
-            // consensus row is stored after all reads in abc->msa_base
-            int cons_row = abc->n_seq + ci;
+            const int cons_row = abc->n_seq + ci;
             msa_seqs[static_cast<size_t>(ci)][static_cast<size_t>(n_read_rows)].assign(
                 abc->msa_base[cons_row], abc->msa_base[cons_row] + abc->msa_len);
         }
@@ -1199,56 +1277,54 @@ static int edlib_xgaps(const uint8_t* target, int tlen, const uint8_t* query, in
     return n_x_gaps;
 }
 
-static void collect_aln_beg_end_from_pretty(const int ext_direction,
-                                             const int ref_len, const int read_len,
-                                             const std::vector<uint8_t>& ref_aln,
-                                             const std::vector<uint8_t>& read_aln,
-                                             int* ref_beg, int* ref_end,
-                                             int* query_beg, int* query_end) {
-    // Mirrors longcallD collect_aln_beg_end, but reconstructs CIGAR ops from
-    // pretty alignment columns where gaps are marked as 5.
-    *ref_beg = 1; *query_beg = 1; *ref_end = ref_len, *query_end = read_len;
-    const int n = static_cast<int>(ref_aln.size());
-
+// Mirrors longcallD collect_aln_beg_end (align.c) — SAM CIGAR from cigar_get_CIGAR(..., true).
+static void collect_aln_beg_end(const uint32_t* cigar_buf, int cigar_len, int ext_direction,
+                                int ref_len, int* ref_beg, int* ref_end,
+                                int read_len, int* read_beg, int* read_end) {
+    *ref_beg = 1;
+    *read_beg = 1;
+    *ref_end = ref_len;
+    *read_end = read_len;
     if (ext_direction == kExtAlnLeftToRight) {
         int tmp_ref_end = 0, tmp_read_end = 0;
-        for (int i = 0; i < n; ++i) {
-            const uint8_t r = ref_aln[static_cast<size_t>(i)];
-            const uint8_t q = read_aln[static_cast<size_t>(i)];
-            const bool r_gap = (r == 5);
-            const bool q_gap = (q == 5);
-            if (!r_gap && !q_gap) {
-                tmp_ref_end++; tmp_read_end++;
-                // CEQUAL/CMATCH in longcallD corresponds to bases equal.
-                if (r == q) {
-                    *ref_end = tmp_ref_end;
-                    *query_end = tmp_read_end;
-                }
-            } else if (!r_gap && q_gap) {
-                // CDEL: reference consumed, query not.
-                tmp_ref_end++;
-            } else if (r_gap && !q_gap) {
-                // CINS: query consumed, reference not.
-                tmp_read_end++;
+        for (int i = 0; i < cigar_len; ++i) {
+            const int op = static_cast<int>(cigar_buf[static_cast<size_t>(i)] & 15u);
+            const int len = static_cast<int>(cigar_buf[static_cast<size_t>(i)] >> 4);
+            if (op == BAM_CEQUAL || op == BAM_CMATCH) {
+                tmp_ref_end += len;
+                tmp_read_end += len;
+                *ref_end = tmp_ref_end;
+                *read_end = tmp_read_end;
+            } else if (op == BAM_CDIFF) {
+                tmp_ref_end += len;
+                tmp_read_end += len;
+            } else if (op == BAM_CDEL) {
+                tmp_ref_end += len;
+            } else if (op == BAM_CINS) {
+                tmp_read_end += len;
+            } else {
+                continue;
             }
         }
     } else {
         int tmp_ref_beg = ref_len + 1, tmp_read_beg = read_len + 1;
-        for (int i = n - 1; i >= 0; --i) {
-            const uint8_t r = ref_aln[static_cast<size_t>(i)];
-            const uint8_t q = read_aln[static_cast<size_t>(i)];
-            const bool r_gap = (r == 5);
-            const bool q_gap = (q == 5);
-            if (!r_gap && !q_gap) {
-                tmp_ref_beg--; tmp_read_beg--;
-                if (r == q) {
-                    *ref_beg = tmp_ref_beg;
-                    *query_beg = tmp_read_beg;
-                }
-            } else if (!r_gap && q_gap) {
-                tmp_ref_beg--;
-            } else if (r_gap && !q_gap) {
-                tmp_read_beg--;
+        for (int i = cigar_len - 1; i >= 0; --i) {
+            const int op = static_cast<int>(cigar_buf[static_cast<size_t>(i)] & 15u);
+            const int len = static_cast<int>(cigar_buf[static_cast<size_t>(i)] >> 4);
+            if (op == BAM_CEQUAL || op == BAM_CMATCH) {
+                tmp_ref_beg -= len;
+                tmp_read_beg -= len;
+                *ref_beg = tmp_ref_beg;
+                *read_beg = tmp_read_beg;
+            } else if (op == BAM_CDIFF) {
+                tmp_ref_beg -= len;
+                tmp_read_beg -= len;
+            } else if (op == BAM_CDEL) {
+                tmp_ref_beg -= len;
+            } else if (op == BAM_CINS) {
+                tmp_read_beg -= len;
+            } else {
+                continue;
             }
         }
     }
@@ -1293,13 +1369,13 @@ static int cal_wfa_partial_aln_beg_end(const int ext_direction, const Options& o
         if (x_gaps > min_len * 0.10) return 0;
     }
 
-    std::vector<uint8_t> pat_alg, txt_alg;
-    const int cigar_len = wfa_end2end_aln(target, tlen, query, qlen, gap_aln, b, q, e, q2, e2,
-                                          kWfaNoHeuristic, kWfaAffine2p, pat_alg, txt_alg);
+    std::vector<uint32_t> cigar_buf;
+    const int cigar_len = wfa_end2end_aln_collect_cigar(target, tlen, query, qlen, gap_aln, b, q, e, q2, e2,
+                                                        kWfaNoHeuristic, kWfaAffine2p, cigar_buf);
     int ret = 1;
     if (cigar_len == 0) ret = 0;
-    else collect_aln_beg_end_from_pretty(ext_direction, _tlen, _qlen, pat_alg, txt_alg,
-                                          target_beg, target_end, query_beg, query_end);
+    else collect_aln_beg_end(cigar_buf.data(), cigar_len, ext_direction, _tlen, target_beg, target_end,
+                             _qlen, query_beg, query_end);
     return ret;
 }
 
@@ -1351,7 +1427,7 @@ int abpoa_partial_aln_msa_cons(const Options& opts, int sampling_reads,
                                const std::vector<uint8_t*>& /*read_quals*/,
                                const std::vector<int>& read_lens,
                                const std::vector<int>& read_full_covers,
-                               int /*max_n_cons*/,
+                               int max_n_cons,
                                int& cons_len_out,
                                std::vector<uint8_t>& cons_seq_out,
                                int& clu_n_seqs_out,
@@ -1360,26 +1436,24 @@ int abpoa_partial_aln_msa_cons(const Options& opts, int sampling_reads,
                                std::vector<std::vector<uint8_t>>& msa_seqs_out) {
     abpoa_t*      ab   = abpoa_init();
     abpoa_para_t* abpt = abpoa_init_para();
+    abpt->cons_algrm = ABPOA_MF;
     abpt->sub_aln = 1;
     abpt->inc_path_score = 1;
     abpt->out_cons = 1;
     abpt->out_msa  = 1;
-    abpt->cons_algrm = ABPOA_MF;
-    abpt->max_n_cons = 1;
-    abpt->min_freq   = static_cast<float>(opts.min_af);
+    abpt->max_n_cons = max_n_cons;
+    abpt->min_freq   = opts.min_af;
     abpt->match      = opts.match;
     abpt->mismatch   = opts.mismatch;
     abpt->gap_open1  = opts.gap_open1;
     abpt->gap_ext1   = opts.gap_ext1;
     abpt->gap_open2  = opts.gap_open2;
     abpt->gap_ext2   = opts.gap_ext2;
+    if (opts.verbose >= 2) abpt->out_msa = 1;
     abpoa_post_set_para(abpt);
 
     ab->abs->n_seq = n_reads;
-    int n_added = 0;
     for (int i = 0; i < n_reads; ++i) {
-        if (read_lens[static_cast<size_t>(i)] <= 0) continue;
-
         abpoa_res_t res{}; res.graph_cigar = nullptr; res.n_cigar = 0;
         int exc_beg = 0, exc_end = 1;
         int seq_beg_cut = 0, seq_end_cut = 0;
@@ -1401,8 +1475,7 @@ int abpoa_partial_aln_msa_cons(const Options& opts, int sampling_reads,
             abpoa_subgraph_nodes(ab, abpt, beg_id, end_id, &exc_beg, &exc_end);
         }
         uint8_t* seq_ptr = read_seqs[static_cast<size_t>(i)] + seq_beg_cut;
-        const int seq_use_len  = read_lens[static_cast<size_t>(i)] - seq_beg_cut - seq_end_cut;
-        if (seq_use_len <= 0) continue;
+        const int seq_use_len = read_lens[static_cast<size_t>(i)] - seq_beg_cut - seq_end_cut;
 
         abpoa_align_sequence_to_subgraph(ab, abpt, exc_beg, exc_end,
                                          seq_ptr, seq_use_len, &res);
@@ -1410,10 +1483,10 @@ int abpoa_partial_aln_msa_cons(const Options& opts, int sampling_reads,
                                      seq_ptr, nullptr, seq_use_len, nullptr,
                                      res, i, n_reads, 0);
         if (res.n_cigar) free(res.graph_cigar);
-        ++n_added;
     }
 
-    abpoa_output(ab, abpt, nullptr);
+    if (opts.verbose >= 2) abpoa_output(ab, abpt, stderr);
+    else abpoa_output(ab, abpt, nullptr);
     abpoa_cons_t* abc = ab->abc;
     int n_cons = 0;
 
@@ -1526,7 +1599,7 @@ int wfa_collect_noisy_aln_str_no_ps_hap(const Options& opts, NoisyReadInfo& info
             // cons-vs-read aln: slot (k+1)*2 - 1.
             const size_t cons_read_slot = static_cast<size_t>((k + 1) * 2 - 1);
             make_cons_read_aln_str(cons_row, read_row, msa_len,
-                                  info.fully_covers[static_cast<size_t>(read_i)],
+                                   info.fully_covers[static_cast<size_t>(ci)],
                                    aln_strs[static_cast<size_t>(ci)][cons_read_slot]);
             const size_t ref_read_slot = static_cast<size_t>((k + 1) * 2);
             if (collect_ref_read_aln_str) {

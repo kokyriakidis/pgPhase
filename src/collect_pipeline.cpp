@@ -530,44 +530,59 @@ static BamChunk process_chunk(const RegionChunk& region,
 }
 
 /**
- * @brief Simple memory-efficient concatenation of threaded variant results.
+ * @brief Concatenate per-chunk candidate tables and drop exact duplicate keys only.
  *
- * Emulates the array `memcpy` structure when chunks synchronize. Rather than 
- * maintaining overlapping complex locks over a giant data structure, each thread 
- * independently allocates `BamChunk` variants and then moves (`std::make_move_iterator`) 
- * them deterministically and sequentially so genomic order is perfectly maintained.
+ * Each worker already ran `collapse_fuzzy_large_insertions` inside `collect_candidate_sites_from_records`
+ * (mirroring longcallD `collect_all_cand_var_sites` for digar-derived sites). longcallD does **not**
+ * apply `exact_comp_var_site_ins` across parallel BAM chunks: `call_var_main.c` writes `write_var_to_vcf`
+ * once per chunk after `make_var_main`. Concatenating pgphase chunk outputs must therefore dedupe with
+ * `exact_comp_var_site` only, preserving distinct large insertions (e.g. noisy recall vs digar) that
+ * fuzzy collapse would incorrectly merge.
  *
- * Does not re-evaluate `fuzzy_collapse` boundary conflicts (which mimics 
- * exactly `longcallD`'s static logic of collapsing purely inside chunks).
+ * Duplicate keys (overlap tiling): longcallD streams chunk `i` before chunk `i+1`; consumers often
+ * `sort -u` on CHROM/POS/REF/ALT so the **first** emitted row wins. Match that by sorting duplicates
+ * with tie-break `(chunk_index ascending, index_in_chunk ascending)` and keeping the first row,
+ * OR-ing `lcd_make_variants_region_pass` like `collapse_exact_duplicate_variants`.
  *
- * @param chunks The completed chunk outputs evaluated by thread workers.
- * @return A unified table mapping the whole runtime block.
+ * @param chunks Completed chunk outputs (tables moved out).
+ * @return Unified candidate table for the batch (exact-key dedupe).
  */
 static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
-    CandidateTable merged;
-    for (BamChunk& chunk : chunks) {
-        CandidateTable& table = chunk.candidates;
-        merged.insert(merged.end(),
-                      std::make_move_iterator(table.begin()),
-                      std::make_move_iterator(table.end()));
+    struct TaggedRow {
+        CandidateVariant v;
+        int chunk_i = 0;
+        int ord_in_chunk = 0;
+    };
+    std::vector<TaggedRow> rows;
+    size_t reserve_n = 0;
+    for (const BamChunk& chunk : chunks) reserve_n += chunk.candidates.size();
+    rows.reserve(reserve_n);
+
+    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+        CandidateTable& table = chunks[ci].candidates;
+        for (size_t j = 0; j < table.size(); ++j) {
+            rows.push_back(TaggedRow{std::move(table[j]), static_cast<int>(ci), static_cast<int>(j)});
+        }
     }
-    if (merged.size() <= 1) return merged;
+    if (rows.empty()) return {};
 
-    std::stable_sort(merged.begin(), merged.end(),
-                     [](const CandidateVariant& lhs, const CandidateVariant& rhs) {
-                         return exact_comp_var_site(&lhs.key, &rhs.key) < 0;
-                     });
+    std::sort(rows.begin(), rows.end(), [](const TaggedRow& a, const TaggedRow& b) {
+        const int c = exact_comp_var_site(&a.v.key, &b.v.key);
+        if (c != 0) return c < 0;
+        if (a.chunk_i != b.chunk_i) return a.chunk_i < b.chunk_i;
+        return a.ord_in_chunk < b.ord_in_chunk;
+    });
 
-    size_t write_i = 1;
-    for (size_t read_i = 1; read_i < merged.size(); ++read_i) {
-        if (exact_comp_var_site(&merged[write_i - 1].key, &merged[read_i].key) == 0) {
-            // Keep the first variant for exact-key duplicates (longcallD merge walk behavior).
+    CandidateTable merged;
+    merged.reserve(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (!merged.empty() &&
+            exact_comp_var_site(&merged.back().key, &rows[i].v.key) == 0) {
+            merged.back().lcd_make_variants_region_pass |= rows[i].v.lcd_make_variants_region_pass;
             continue;
         }
-        if (write_i != read_i) merged[write_i] = std::move(merged[read_i]);
-        ++write_i;
+        merged.push_back(std::move(rows[i].v));
     }
-    merged.resize(write_i);
     return merged;
 }
 
@@ -649,8 +664,8 @@ static ChunkBatchResult collect_chunk_batch_parallel(const Options& opts,
  *
  * Divides linearly scheduled `RegionChunk` boundaries across an active set of `std::thread`,
  * spawning atomic threads parsing discrete BAM boundaries with unique indices without locking.
- * Collects returned processed vectors of variants, reassembles them serially 
- * removing arbitrary split overlaps in `merge_chunk_candidates()`.
+ * Collects returned processed vectors of variants, reassembles them serially with
+ * `merge_chunk_candidates()` (exact duplicate keys only; no cross-chunk fuzzy INS merge).
  *
  * Handles exception safety seamlessly, ensuring memory cleans up on thread death.
  *
@@ -856,7 +871,8 @@ enum LongOption {
     kRefineAlnOption,
     kPhaseReadTsvOption,
     kPhasedVcfOutputOption,
-    kPgbamFileOption
+    kPgbamFileOption,
+    kAmbBaseOption
 };
 
 /**
@@ -905,6 +921,7 @@ static void print_collect_help() {
         << "  -j, --max-var-ratio FLOAT     Skip reads above this variant/ref-span ratio [0.05]\n"
         << "      --max-noisy-frac FLOAT    Skip reads with > this fraction in noisy regions [0.5]\n"
         << "      --include-filtered        Include QC-fail and duplicate reads\n"
+        << "      --amb-base                Emit VCF rows with ambiguous REF/ALT (longcallD --amb-base)\n"
         << "  -o, --output FILE             Output TSV file [output.tsv]\n"
         << "  -v, --vcf-output FILE         Optional VCF output for collected candidates\n"
         << "      --phased-vcf-output FILE  Optional phased VCF (GT:PS from hap/phase_set scaffold)\n"
@@ -973,6 +990,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"max-var-ratio",             required_argument, nullptr, 'j'},
         {"max-noisy-frac",            required_argument, nullptr, kMaxNoisyFracOption},
         {"include-filtered",          no_argument,       nullptr, 'f'},
+        {"amb-base",                  no_argument,       nullptr, kAmbBaseOption},
         {"output",                    required_argument, nullptr, 'o'},
         {"vcf-output",                required_argument, nullptr, 'v'},
         {"phased-vcf-output",         required_argument, nullptr, kPhasedVcfOutputOption},
@@ -1030,6 +1048,7 @@ int collect_bam_variation(int argc, char* argv[]) {
             case 'j': opts.max_var_ratio_per_read = std::stod(optarg); break;
             case kMaxNoisyFracOption:   opts.max_noisy_frac_per_read = std::stod(optarg); break;
             case 'f': opts.include_filtered = true; break;
+            case kAmbBaseOption: opts.output_ambiguous_bases = true; break;
             case 'o': opts.output_tsv = optarg; break;
             case 'v': opts.output_vcf = optarg; break;
             case 'S':

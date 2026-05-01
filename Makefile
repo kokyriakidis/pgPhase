@@ -5,7 +5,7 @@ WFA2_ROOT ?= $(THIRD_PARTY)/WFA2-lib
 ABPOA_ROOT ?= $(THIRD_PARTY)/abPOA
 EDLIB_ROOT ?= $(abspath ../longcallD/edlib)
 
-CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra
+CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -MMD -MP
 WFA_CPPFLAGS = -I$(WFA2_ROOT)
 AB_CPPFLAGS = -I$(ABPOA_ROOT)/include
 EDLIB_CPPFLAGS = -I$(EDLIB_ROOT)/include
@@ -31,6 +31,8 @@ EDLIB_OBJ = src/edlib.o
 OBJS += $(EDLIB_OBJ)
 
 LDFLAGS ?= -lhts -lm -lz -lpthread
+
+-include $(patsubst %.cpp,%.d,$(SOURCES_CXX))
 
 .PHONY: all clean check third-party-libs portable-bundle release release-strict
 
@@ -73,4 +75,4 @@ pgphase: $(OBJS) $(WFA2_LIB) $(ABPOA_LIB)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
 
 clean:
-	rm -f pgphase src/*.o
+	rm -f pgphase src/*.o src/*.d

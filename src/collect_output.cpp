@@ -8,6 +8,8 @@
 
 #include "collect_output.hpp"
 
+#include "collect_phase.hpp"
+
 #include <ctime>
 #include <fstream>
 #include <sstream>
@@ -315,9 +317,34 @@ struct VcfRecordCore {
     std::string info;
 };
 
-static char nt4_to_base(uint8_t b) {
-    static const char kNt4[] = {'A', 'C', 'G', 'T', 'N'};
-    return b < 4 ? kNt4[b] : 'N';
+/** longcallD `vcf_utils.c` `write_var_to_vcf`: skip when `opt->out_amb_base == 0` and any nt ≥ 4 (non-ACGT). */
+static bool lcd_vcf_seq_has_non_acgt(const std::string& s) {
+    for (unsigned char uc : s) {
+        const char c = static_cast<char>(uc);
+        if (c != 'A' && c != 'C' && c != 'G' && c != 'T') return true;
+    }
+    return false;
+}
+
+/**
+ * longcallD collect_var.c `make_variants`: for INS/DEL, when cand.alt_ref_base != 4 the first
+ * emitted ALT byte is the raw consensus anchor (`alt_ref_base`); when it equals 4, the anchor is
+ * taken from reference (`nst_nt4_table`). Values > 3 (e.g. abPOA gap 5 or '-' mapped to 5 in LCD's
+ * nst_nt4_table) are copied into alt_bases and rejected by vcf_utils.c write_var_to_vcf
+ * (`alt_bases[j][k] >= 4` with verbose \"Invalid alt base\") — those variants never appear in LCD VCF.
+ */
+static bool passes_lcd_write_var_alt_ref_base_gate(const CandidateVariant& candidate) {
+    if (candidate.key.type != VariantType::Insertion && candidate.key.type != VariantType::Deletion)
+        return true;
+    if (candidate.alt_ref_base != 4 && candidate.alt_ref_base > 3) return false;
+    return true;
+}
+
+static bool passes_longcalld_vcf_amb_base_gate(const Options& opts, const VcfRecordCore& core) {
+    if (opts.output_ambiguous_bases) return true;
+    if (lcd_vcf_seq_has_non_acgt(core.ref_seq)) return false;
+    if (lcd_vcf_seq_has_non_acgt(core.alt_seq)) return false;
+    return true;
 }
 
 static bool is_longcalld_germline_output_category(VariantCategory category) {
@@ -333,8 +360,20 @@ static bool is_longcalld_germline_output_category(VariantCategory category) {
     }
 }
 
+/**
+ * longcallD `vcf_utils.c` `write_var_to_vcf`: skip when `var.DP < opt->min_dp` or `var.AD[1] < opt->min_alt_dp`
+ * (germline branch). `make_variants` sets `var.DP = cand_vars[cand_i].total_cov` only — not including
+ * low_qual_cov — so VCF emission must match that gate even though `classify_var_cate` uses
+ * `total_cov + low_qual_cov` for LOW_COV classification.
+ */
 static bool passes_longcalld_vcf_depth_gates(const CandidateVariant& candidate, const Options& opts) {
-    return candidate.counts.total_cov >= opts.min_depth && candidate.counts.alt_cov >= opts.min_alt_depth;
+    return candidate.counts.total_cov >= opts.min_depth &&
+           candidate.counts.alt_cov >= opts.min_alt_depth;
+}
+
+/** longcallD `make_variants`: `is_clean = (var_i_to_cate & LONGCALLD_CAND_GERMLINE_CLEAN_VAR_CATE) != 0`. */
+static bool lcd_make_variants_is_clean(const CandidateVariant& candidate) {
+    return (candidate.lcd_var_i_to_cate & kCandGermlineClean) != 0;
 }
 
 static std::pair<int, int> derive_hap_alt_ref_from_consensus(const CandidateVariant& candidate) {
@@ -369,6 +408,7 @@ static std::vector<const CandidateVariant*> project_longcalld_like_vcf_candidate
         if (!is_longcalld_germline_output_category(candidate.counts.category)) continue;
         if (!passes_longcalld_vcf_depth_gates(candidate, opts)) continue;
         if (require_alt_genotype && !is_alt_genotype(candidate)) continue;
+        if (!candidate.lcd_make_variants_region_pass) continue;
         projected.push_back(&candidate);
     }
     return projected;
@@ -391,16 +431,21 @@ static VcfRecordCore build_vcf_record_core(const CandidateVariant& candidate,
         const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
         core.pos = anchor_pos;
         const char anchor_base = ref.base(key.tid, anchor_pos, header);
-        const char alt_anchor_base =
-            candidate.alt_ref_base < 4 ? nt4_to_base(candidate.alt_ref_base) : anchor_base;
+        // Mirrors longcallD make_variants INS anchor branch (raw nt index when != 4).
+        const char alt_anchor_base = (candidate.alt_ref_base != 4)
+                                         ? static_cast<char>(
+                                               "ACGTN"[static_cast<size_t>(candidate.alt_ref_base)])
+                                         : anchor_base;
         core.ref_seq = std::string(1, anchor_base);
         core.alt_seq = std::string(1, alt_anchor_base) + key.alt;
     } else { // Deletion
         const hts_pos_t anchor_pos = std::max<hts_pos_t>(1, key.pos - 1);
         core.pos = anchor_pos;
         const char anchor_base = ref.base(key.tid, anchor_pos, header);
-        const char alt_anchor_base =
-            candidate.alt_ref_base < 4 ? nt4_to_base(candidate.alt_ref_base) : anchor_base;
+        const char alt_anchor_base = (candidate.alt_ref_base != 4)
+                                         ? static_cast<char>(
+                                               "ACGTN"[static_cast<size_t>(candidate.alt_ref_base)])
+                                         : anchor_base;
         const std::string del_seq = ref.subseq(key.tid, key.pos, key.ref_len, header);
         core.ref_seq = std::string(1, anchor_base) + del_seq;
         core.alt_seq = std::string(1, alt_anchor_base);
@@ -421,8 +466,7 @@ static VcfRecordCore build_vcf_record_core(const CandidateVariant& candidate,
     const hts_pos_t end_pos = core.pos + static_cast<hts_pos_t>(core.ref_seq.size()) - 1;
     std::ostringstream info;
     info << "END=" << end_pos;
-    if (counts.category == VariantCategory::CleanHetSnp || counts.category == VariantCategory::CleanHetIndel ||
-        counts.category == VariantCategory::CleanHom) {
+    if (lcd_make_variants_is_clean(candidate)) {
         info << ";CLEAN";
     }
     if (key.type == VariantType::Insertion || key.type == VariantType::Deletion) {
@@ -462,12 +506,14 @@ void write_variants_vcf_records(std::ostream& out,
                                 ReferenceCache& ref,
                                 const CandidateTable& variants) {
     const std::vector<const CandidateVariant*> projected =
-        project_longcalld_like_vcf_candidates(variants, opts, false);
+        project_longcalld_like_vcf_candidates(variants, opts, true);
     for (const CandidateVariant* candidate_ptr : projected) {
         const CandidateVariant& candidate = *candidate_ptr;
+        if (!passes_lcd_write_var_alt_ref_base_gate(candidate)) continue;
         const VariantKey& key = candidate.key;
         const std::string chrom = header->target_name[key.tid];
         const VcfRecordCore core = build_vcf_record_core(candidate, opts, header, ref);
+        if (!passes_longcalld_vcf_amb_base_gate(opts, core)) continue;
         out << chrom << '\t' << core.pos << "\t.\t" << core.ref_seq << '\t' << core.alt_seq
             << "\t.\t" << core.filter << '\t' << core.info << '\n';
     }
@@ -482,9 +528,11 @@ void write_phased_variants_vcf_records(std::ostream& out,
         project_longcalld_like_vcf_candidates(variants, opts, true);
     for (const CandidateVariant* candidate_ptr : projected) {
         const CandidateVariant& candidate = *candidate_ptr;
+        if (!passes_lcd_write_var_alt_ref_base_gate(candidate)) continue;
         const VariantKey& key = candidate.key;
         const std::string chrom = header->target_name[key.tid];
         const VcfRecordCore core = build_vcf_record_core(candidate, opts, header, ref);
+        if (!passes_longcalld_vcf_amb_base_gate(opts, core)) continue;
 
         const auto [hap_alt, hap_ref] = derive_hap_alt_ref_from_consensus(candidate);
         std::string gt = "./.";

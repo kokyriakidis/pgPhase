@@ -24,25 +24,45 @@ namespace pgphase_collect {
  * @name Category flags
  * @brief Bitmask constants for `assign_hap_based_on_germline_het_vars_kmeans`.
  *
- * Each flag selects which `VariantCategory` values participate in phasing.
- * Combine with `|` to build the `flags` argument (longcallD `target_var_cate`). Mirrors
- * `LONGCALLD_*` masks in longcallD `collect_var.h`.
+ * Values and composites are copied verbatim from longcallD `collect_var.h` (lines 11–27): the same
+ * integers used for `var_i_to_cate[]` and `target_var_cate` in `assign_hap.c`.
  */
 ///@{
-constexpr uint32_t kCandCleanHetSnp   = 1u << 0; ///< `LONGCALLD_CLEAN_HET_SNP`
-constexpr uint32_t kCandCleanHetIndel = 1u << 1; ///< `LONGCALLD_CLEAN_HET_INDEL`
-constexpr uint32_t kCandCleanHom      = 1u << 2; ///< `LONGCALLD_CLEAN_HOM_VAR`
-constexpr uint32_t kCandNoisyCandHet  = 1u << 3; ///< `LONGCALLD_NOISY_CAND_HET_VAR`
-constexpr uint32_t kCandNoisyCandHom  = 1u << 4; ///< `LONGCALLD_NOISY_CAND_HOM_VAR`
+/** `LONGCALLD_LOW_COV_VAR` */
+constexpr uint32_t kLongcalldLowCovVar = 0x001u;
+/** `LONGCALLD_STRAND_BIAS_VAR` */
+constexpr uint32_t kLongcalldStrandBiasVar = 0x002u;
+/** `LONGCALLD_CLEAN_HET_SNP` */
+constexpr uint32_t kCandCleanHetSnp = 0x004u;
+/** `LONGCALLD_CLEAN_HET_INDEL` */
+constexpr uint32_t kCandCleanHetIndel = 0x008u;
+/** `LONGCALLD_REP_HET_VAR` */
+constexpr uint32_t kLongcalldRepHetVar = 0x010u;
+/** `LONGCALLD_CAND_SOMATIC_VAR` */
+constexpr uint32_t kLongcalldCandSomaticVar = 0x040u;
+/** `LONGCALLD_CLEAN_HOM_VAR` */
+constexpr uint32_t kCandCleanHom = 0x080u;
+/** `LONGCALLD_NOISY_CAND_HET_VAR` */
+constexpr uint32_t kCandNoisyCandHet = 0x100u;
+/** `LONGCALLD_NOISY_CAND_HOM_VAR` */
+constexpr uint32_t kCandNoisyCandHom = 0x200u;
+/** `LONGCALLD_LOW_AF_VAR` */
+constexpr uint32_t kLongcalldLowAfVar = 0x400u;
+/** `LONGCALLD_NON_VAR` */
+constexpr uint32_t kLongcalldNonVar = 0x800u;
 
-/** `LONGCALLD_CAND_HET_VAR_CATE`: phased het sites (clean + noisy het), no hom. */
+/** `LONGCALLD_NOT_CAND_VAR_CATE` — skipped before `cr_is_contained` in classify compaction. */
+constexpr uint32_t kLongcalldNotCandVarCate =
+    kLongcalldNonVar | kLongcalldLowCovVar | kLongcalldStrandBiasVar;
+
+/** `LONGCALLD_CAND_HET_VAR_CATE` */
 constexpr uint32_t kCandHetVarCate =
     kCandCleanHetSnp | kCandCleanHetIndel | kCandNoisyCandHet;
 
-/** `LONGCALLD_CAND_GERMLINE_CLEAN_VAR_CATE` — sole k-means call in longcallD `collect_var_main` phase 3. */
+/** `LONGCALLD_CAND_GERMLINE_CLEAN_VAR_CATE` */
 constexpr uint32_t kCandGermlineClean = kCandCleanHetSnp | kCandCleanHetIndel | kCandCleanHom;
 
-/** `LONGCALLD_CAND_GERMLINE_VAR_CATE` (used after longcallD noisy MSA step 4, not in phase 3 block). */
+/** `LONGCALLD_CAND_GERMLINE_VAR_CATE` */
 constexpr uint32_t kCandGermlineVarCate =
     kCandGermlineClean | kCandNoisyCandHet | kCandNoisyCandHom;
 ///@}
@@ -59,19 +79,17 @@ uint32_t category_to_flag(VariantCategory c);
 /**
  * @brief Stitch haplotype assignments across chunk boundaries.
  *
- * Mirrors longcallD `stitch_var_main` / `flip_variant_hap` from `collect_var.c`.
+ * Matches longcallD `stitch_var_main` exactly: for each adjacent pair on the same contig,
+ * calls `flip_variant_hap` logic only — overlapping boundary reads (`down_ovlp_read_i` /
+ * `up_ovlp_read_i`, same pairing order as longcallD load) vote on orientation; when the
+ * vote is decisive (`flip_hap_score != 0`), applies `update_chunk_var_hap_phase_set1` and,
+ * only if phased alignment output is requested (`opts != nullptr &&
+ * !opts->output_aln.empty()`, analogous to `opt->out_aln_fp != NULL`), read-level hap/PS updates.
  *
- * For each pair of adjacent chunks on the same contig, reads that span the boundary
- * (already catalogued in `down_ovlp_read_i` / `up_ovlp_read_i`) are matched by query
- * name. If the majority have inconsistent haplotype labels (hap1 in one chunk → hap2
- * in the other), the current chunk's haplotype assignments are flipped. In either case,
- * if both chunks have a valid phase block touching the boundary, the current chunk's
- * earliest phase-set anchor is rewritten to the previous chunk's latest anchor, merging
- * the two blocks into one.
+ * The `pgbam_sidecar` argument is ignored (kept for call-site compatibility); longcallD does
+ * not perform pangenome-graph stitching or within-chunk phase-block merges here.
  *
- * @param chunks Ordered, adjacent `BamChunk` objects from `collect_chunk_batch_parallel`,
- *               each already phased by `assign_hap_based_on_germline_het_vars_kmeans`.
- *               Chunks on different contigs are silently skipped at the boundary.
+ * @param chunks Ordered, adjacent `BamChunk` objects, each already phased by k-means.
  */
 void stitch_chunk_haps(std::vector<BamChunk>& chunks,
                        const Options* opts = nullptr,
@@ -82,9 +100,11 @@ void stitch_chunk_haps(std::vector<BamChunk>& chunks,
  *
  * Mirrors longcallD `assign_hap_based_on_germline_het_vars_kmeans` from `assign_hap.c`.
  *
- * @note Parity is with **assign_hap.c only**: category masks use pgPhase `kCand*` bit positions
- *       (not longcallD `0x004`/`0x008`/… hex values); they are self-consistent via
- *       `category_to_flag`. This function does **not** set VCF-style output; pgPhase additionally
+ * @note Parity is with **assign_hap.c**: `flags` is a `LONGCALLD_*` composite (`target_var_cate`);
+ *       masking uses `CandidateVariant::lcd_var_i_to_cate` (longcallD `var_i_to_cate[i]`), not
+ *       `counts.category` alone — matching `assign_hap_based_on_germline_het_vars_kmeans` /
+ *       `init_assign_read_hap_based_on_cons_alle` / `select_init_var` / profile updates.
+ *       This function does **not** set VCF-style output; pgPhase additionally
  *       fills `hap_alt`/`hap_ref` after the k-means loop using logic shaped like longcallD
  *       `make_variants`, which downstream longcallD does in a separate pass.
  *

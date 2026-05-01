@@ -2,7 +2,7 @@
 # verify_refine_regression.sh
 #
 # Fast local regression check for phased BAM output parity behavior WITHOUT longcallD.
-# It runs pgphase on the bundled HiFi fixture in:
+# It runs pgphase on the bundled HG002 HiFi chr20 slice (CHM13) in:
 #   1) normal phased BAM mode
 #   2) --refine-aln phased BAM mode
 # and compares sorted SAM SHA-256 hashes against known-good expected values.
@@ -19,13 +19,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PGPHASE="${PGPHASE:-$ROOT/pgphase}"
-FA="${FA:-$ROOT/test_data/chr11_2M.fa}"
-BAM="${BAM:-$ROOT/test_data/HG002_chr11_hifi_test.bam}"
-REGION="${REGION:-chr11:1255000-1260000}"
+FA="${FA:-$ROOT/test_data/chr20_quick/CHM13_chr20_only.fa}"
+BAM="${BAM:-$ROOT/test_data/chr20_quick/HG002_CHM13_chr20_15000001_15500000.bam}"
+REGION="${REGION:-CHM13#0#chr20:15200000-15205000}"
 
 # Known-good hashes from strict parity baseline (normal + refine).
-EXPECTED_NORMAL_SHA="c8c45960d884029887bd85b8ffbb0836af007b3178d2b2feee66243b1cbc5811"
-EXPECTED_REFINE_SHA="02c217b128897cf264d9a6fb66e6d8014a2fac46285645959bfd3e9f97154884"
+EXPECTED_NORMAL_SHA="27761c029a62018d00f4c9c7d045db958362b57fce9ffd1409f3c41000bbee66"
+EXPECTED_REFINE_SHA="e45ecbd1b3d5a2e7d31b1929f2941cd18aaa28c650acba23e5f6bfa9568a742a"
 
 fail_setup() { echo "error: $*" >&2; exit 2; }
 

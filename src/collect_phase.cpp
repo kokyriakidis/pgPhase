@@ -9,9 +9,7 @@
 #include <array>
 #include <climits>
 #include <cstdlib>
-#include <iterator>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 extern "C" {
@@ -49,229 +47,37 @@ static bool parse_debug_site_pos(const std::string& site, hts_pos_t& pos_out) {
     }
 }
 
-static uint32_t aux_read_u32_le(const uint8_t* p) {
-    return static_cast<uint32_t>(p[0]) |
-           (static_cast<uint32_t>(p[1]) << 8) |
-           (static_cast<uint32_t>(p[2]) << 16) |
-           (static_cast<uint32_t>(p[3]) << 24);
-}
-
-static int extract_hs_set_ids(const ReadRecord& read, std::vector<uint32_t>& out_ids) {
-    out_ids.clear();
-    if (!read.alignment) return 0;
-    uint8_t* hs = bam_aux_get(read.alignment.get(), "hs");
-    if (hs == nullptr || hs[0] != 'B') return 0;
-    const uint8_t subtype = hs[1];
-    const uint32_t n = aux_read_u32_le(hs + 2);
-    const uint8_t* data = hs + 6;
-    out_ids.reserve(static_cast<size_t>(n));
-
-    if (subtype == 'I' || subtype == 'i') {
-        for (uint32_t i = 0; i < n; ++i) out_ids.push_back(aux_read_u32_le(data + i * 4));
-        return 1;
-    }
-    if (subtype == 'S' || subtype == 's') {
-        for (uint32_t i = 0; i < n; ++i) {
-            const uint8_t* p = data + i * 2;
-            out_ids.push_back(static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8));
-        }
-        return 1;
-    }
-    if (subtype == 'C' || subtype == 'c') {
-        for (uint32_t i = 0; i < n; ++i) out_ids.push_back(static_cast<uint32_t>(data[i]));
-        return 1;
-    }
-    return 0;
-}
-
-static bool collect_thread_set_for_group(const BamChunk& chunk,
-                                         int hap,
-                                         hts_pos_t phase_set,
-                                         const PgbamSidecarData& sidecar,
-                                         std::vector<uint64_t>& threads) {
-    threads.clear();
-    std::vector<uint32_t> hs_ids;
-    bool saw_any_valid_read = false;
-
-    for (size_t i = 0; i < chunk.reads.size(); ++i) {
-        if (chunk.reads[i].is_skipped || chunk.haps[i] != hap || chunk.phase_sets[i] != phase_set) continue;
-        const int hs_ok = extract_hs_set_ids(chunk.reads[i], hs_ids);
-        if (!hs_ok || hs_ids.empty()) continue;
-        bool read_resolved = false;
-        for (uint32_t set_id : hs_ids) {
-            auto it = sidecar.set_to_threads.find(set_id);
-            if (it == sidecar.set_to_threads.end()) continue;
-            for (uint64_t tid : it->second) threads.push_back(tid);
-            read_resolved = true;
-        }
-        if (read_resolved) saw_any_valid_read = true;
-    }
-    if (!threads.empty()) {
-        std::sort(threads.begin(), threads.end());
-        threads.erase(std::unique(threads.begin(), threads.end()), threads.end());
-    }
-    return saw_any_valid_read;
-}
-
-static int intersection_size(const std::vector<uint64_t>& lhs, const std::vector<uint64_t>& rhs) {
-    int n = 0;
-    auto li = lhs.begin();
-    auto ri = rhs.begin();
-    while (li != lhs.end() && ri != rhs.end()) {
-        if (*li < *ri) ++li;
-        else if (*ri < *li) ++ri;
-        else {
-            ++n;
-            ++li;
-            ++ri;
-        }
-    }
-    return n;
-}
-
-static void sort_unique_threads(std::vector<uint64_t>& threads) {
-    if (threads.empty()) return;
-    std::sort(threads.begin(), threads.end());
-    threads.erase(std::unique(threads.begin(), threads.end()), threads.end());
-}
-
-static std::vector<uint64_t> set_difference_threads(const std::vector<uint64_t>& lhs,
-                                                    const std::vector<uint64_t>& rhs) {
-    std::vector<uint64_t> out;
-    out.reserve(lhs.size());
-    auto li = lhs.begin();
-    auto ri = rhs.begin();
-    while (li != lhs.end()) {
-        while (ri != rhs.end() && *ri < *li) ++ri;
-        if (ri == rhs.end() || *li < *ri) out.push_back(*li);
-        ++li;
-    }
-    return out;
-}
-
-static std::vector<uint64_t> union_threads(const std::vector<uint64_t>& lhs,
-                                           const std::vector<uint64_t>& rhs) {
-    std::vector<uint64_t> out;
-    out.reserve(lhs.size() + rhs.size());
-    std::set_union(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(), std::back_inserter(out));
-    return out;
-}
-
-struct PhaseBlockThreadState {
-    hts_pos_t anchor = -1;
-    std::array<std::vector<uint64_t>, 3> hap_threads;
-    std::array<std::vector<uint64_t>, 3> hap_unique_threads;
-};
-
-static void refresh_phase_block_unique_threads(PhaseBlockThreadState& state) {
-    state.hap_unique_threads[1] = set_difference_threads(state.hap_threads[1], state.hap_threads[2]);
-    state.hap_unique_threads[2] = set_difference_threads(state.hap_threads[2], state.hap_threads[1]);
-}
-
-static void build_read_thread_cache(const BamChunk& chunk,
-                                    const PgbamSidecarData& sidecar,
-                                    std::vector<std::vector<uint64_t>>& read_threads) {
-    read_threads.clear();
-    read_threads.resize(chunk.reads.size());
-    std::vector<uint32_t> hs_ids;
-
-    for (size_t i = 0; i < chunk.reads.size(); ++i) {
-        if (chunk.reads[i].is_skipped) continue;
-        if (!extract_hs_set_ids(chunk.reads[i], hs_ids) || hs_ids.empty()) continue;
-        std::vector<uint64_t>& threads = read_threads[i];
-        for (uint32_t set_id : hs_ids) {
-            auto it = sidecar.set_to_threads.find(set_id);
-            if (it == sidecar.set_to_threads.end()) continue;
-            for (uint64_t tid : it->second) threads.push_back(tid);
-        }
-        sort_unique_threads(threads);
-    }
-}
-
-static std::vector<PhaseBlockThreadState>
-build_phase_block_thread_states(const BamChunk& chunk,
-                                const std::vector<hts_pos_t>& psets,
-                                const std::vector<std::vector<uint64_t>>& read_threads) {
-    std::vector<PhaseBlockThreadState> states(psets.size());
-    std::unordered_map<hts_pos_t, size_t> pset_to_state;
-    pset_to_state.reserve(psets.size());
-    for (size_t i = 0; i < psets.size(); ++i) {
-        states[i].anchor = psets[i];
-        pset_to_state[psets[i]] = i;
-    }
-
-    for (size_t read_i = 0; read_i < chunk.reads.size(); ++read_i) {
-        if (chunk.reads[read_i].is_skipped) continue;
-        const int hap = chunk.haps[read_i];
-        if (hap != 1 && hap != 2) continue;
-        auto it = pset_to_state.find(chunk.phase_sets[read_i]);
-        if (it == pset_to_state.end()) continue;
-        const std::vector<uint64_t>& threads = read_threads[read_i];
-        states[it->second].hap_threads[hap].insert(states[it->second].hap_threads[hap].end(),
-                                                   threads.begin(), threads.end());
-    }
-
-    for (PhaseBlockThreadState& state : states) {
-        sort_unique_threads(state.hap_threads[1]);
-        sort_unique_threads(state.hap_threads[2]);
-        refresh_phase_block_unique_threads(state);
-    }
-    return states;
-}
-
-static PhaseBlockThreadState collect_phase_block_thread_state(const BamChunk& chunk,
-                                                              hts_pos_t phase_set,
-                                                              const PgbamSidecarData& sidecar) {
-    PhaseBlockThreadState state;
-    state.anchor = phase_set;
-    collect_thread_set_for_group(chunk, 1, phase_set, sidecar, state.hap_threads[1]);
-    collect_thread_set_for_group(chunk, 2, phase_set, sidecar, state.hap_threads[2]);
-    refresh_phase_block_unique_threads(state);
-    return state;
-}
-
-static bool decide_phase_block_concordance(const PhaseBlockThreadState& left,
-                                           const PhaseBlockThreadState& right,
-                                           bool& do_flip) {
-    const int s11 = intersection_size(left.hap_unique_threads[1], right.hap_unique_threads[1]);
-    const int s12 = intersection_size(left.hap_unique_threads[1], right.hap_unique_threads[2]);
-    const int s21 = intersection_size(left.hap_unique_threads[2], right.hap_unique_threads[1]);
-    const int s22 = intersection_size(left.hap_unique_threads[2], right.hap_unique_threads[2]);
-    const int score_nonflip = s11 + s22;
-    const int score_flip = s12 + s21;
-
-    if (score_nonflip == score_flip) return false;
-    if (std::max(score_nonflip, score_flip) < 2) return false;
-    do_flip = score_flip > score_nonflip;
-    return true;
-}
-
-static PhaseBlockThreadState merge_phase_block_thread_states(const PhaseBlockThreadState& left,
-                                                             const PhaseBlockThreadState& right,
-                                                             bool do_flip) {
-    PhaseBlockThreadState merged;
-    merged.anchor = left.anchor;
-    const int right_hap_for_1 = do_flip ? 2 : 1;
-    const int right_hap_for_2 = do_flip ? 1 : 2;
-    merged.hap_threads[1] = union_threads(left.hap_threads[1], right.hap_threads[right_hap_for_1]);
-    merged.hap_threads[2] = union_threads(left.hap_threads[2], right.hap_threads[right_hap_for_2]);
-    refresh_phase_block_unique_threads(merged);
-    return merged;
-}
-
 // ════════════════════════════════════════════════════════════════════════════
 // Category flag mapping
 // ════════════════════════════════════════════════════════════════════════════
 
 uint32_t category_to_flag(VariantCategory c) {
+    // longcallD collect_var.h `var_i_to_cate` values from classify_var_cate / classify_cand_vars.
     switch (c) {
-        case VariantCategory::CleanHetSnp:   return kCandCleanHetSnp;
-        case VariantCategory::CleanHetIndel: return kCandCleanHetIndel;
-        case VariantCategory::CleanHom:      return kCandCleanHom;
-        case VariantCategory::NoisyCandHet:  return kCandNoisyCandHet;
-        case VariantCategory::NoisyCandHom:  return kCandNoisyCandHom;
-        default: return 0;
+        case VariantCategory::LowCoverage:
+            return kLongcalldLowCovVar;
+        case VariantCategory::LowAlleleFraction:
+            return kLongcalldLowAfVar;
+        case VariantCategory::StrandBias:
+            return kLongcalldStrandBiasVar;
+        case VariantCategory::CleanHetSnp:
+            return kCandCleanHetSnp;
+        case VariantCategory::CleanHetIndel:
+            return kCandCleanHetIndel;
+        case VariantCategory::CleanHom:
+            return kCandCleanHom;
+        case VariantCategory::NoisyCandHet:
+            return kCandNoisyCandHet;
+        case VariantCategory::NoisyCandHom:
+            return kCandNoisyCandHom;
+        case VariantCategory::NoisyResolved:
+            return 0; // no LONGCALLD_* germline phasing category; LCD path does not assign this bit.
+        case VariantCategory::RepeatHetIndel:
+            return kLongcalldRepHetVar;
+        case VariantCategory::NonVariant:
+            return kLongcalldNonVar;
     }
+    return 0;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -340,8 +146,8 @@ static void var_init_hap_profile_cons_allele(bool is_ont,
         var.hap_to_alle_profile[1].assign(na, 0);
         var.hap_to_alle_profile[2].assign(na, 0);
         var.hap_to_cons_alle[0] = get_var_init_max_cov_allele(is_ont, var);
-        const uint32_t flag = category_to_flag(var.counts.category);
-        if (flag == kCandCleanHom || flag == kCandNoisyCandHom) {
+        const uint32_t vic = var.lcd_var_i_to_cate;
+        if (vic == kCandNoisyCandHom || vic == kCandCleanHom) {
             var.hap_to_cons_alle[1] = 1;
             var.hap_to_cons_alle[2] = 1;
         } else {
@@ -373,16 +179,16 @@ static int select_init_var(const CandidateTable& variants,
     int snp_dp = 0, indel_dp = 0, noisy_snp_dp = 0, noisy_indel_dp = 0;
     for (int _vi = 0; _vi < (int)valid_var_idx.size(); ++_vi) {
         const CandidateVariant& var = variants[valid_var_idx[_vi]];
-        const uint32_t flag = category_to_flag(var.counts.category);
-        if (flag == kCandCleanHetSnp) {
+        const uint32_t vic = var.lcd_var_i_to_cate;
+        if (vic == kCandCleanHetSnp) {
             if (snp_i == -1 || var.counts.total_cov > snp_dp) {
                 snp_i = _vi; snp_dp = var.counts.total_cov;
             }
-        } else if (flag == kCandCleanHetIndel) {
+        } else if (vic == kCandCleanHetIndel) {
             if (indel_i == -1 || var.counts.total_cov > indel_dp) {
                 indel_i = _vi; indel_dp = var.counts.total_cov;
             }
-        } else if (flag == kCandNoisyCandHet) {
+        } else if (vic == kCandNoisyCandHet) {
             if (var.key.type == VariantType::Snp) {
                 if (noisy_snp_i == -1 || var.counts.total_cov > noisy_snp_dp) {
                     noisy_snp_i = _vi; noisy_snp_dp = var.counts.total_cov;
@@ -420,9 +226,11 @@ static void update_var_hap_to_cons_alle(bool is_ont, CandidateVariant& var, int 
 // Score a read allele against the hap consensus; infers complement when one hap is unknown.
 // Returns +var_score (match), −var_score (mismatch), or 0 (no info).
 // Side effect: may set hap_to_cons_alle[hap] or [3-hap] when one is -1.
-// Mirrors longcallD read_to_cons_allele_score.
-static int read_to_cons_allele_score(CandidateVariant& var, int hap, uint32_t vflag, int allele_i) {
-    const int var_score = (vflag == kCandCleanHetSnp || vflag == kCandCleanHetIndel) ? 2 : 1;
+// Mirrors longcallD read_to_cons_allele_score (`assign_hap.c`): var_score from `var_cate` equality.
+static int read_to_cons_allele_score(CandidateVariant& var, int hap, uint32_t var_i_to_cate, int allele_i) {
+    int var_score = 1;
+    if (var_i_to_cate == kCandCleanHetSnp) var_score = 2;
+    else if (var_i_to_cate == kCandCleanHetIndel) var_score = 2;
     if (var.hap_to_cons_alle[hap] == -1 && var.hap_to_cons_alle[3 - hap] == -1) return 0;
     if (var.hap_to_cons_alle[hap] == -1) var.hap_to_cons_alle[hap] = 1 - var.hap_to_cons_alle[3 - hap];
     if (var.hap_to_cons_alle[3 - hap] == -1) var.hap_to_cons_alle[3 - hap] = 1 - var.hap_to_cons_alle[hap];
@@ -450,26 +258,24 @@ static int init_assign_read_hap(BamChunk& chunk, int read_i, uint32_t flags) {
 
     for (int vi = prof.start_var_idx; vi <= prof.end_var_idx; ++vi) {
         CandidateVariant& var = chunk.candidates[vi];
-        const uint32_t vflag = category_to_flag(var.counts.category);
-        if ((vflag & flags) == 0) continue;
-        // Homopolymer indels and NoisyCandHom are skipped entirely.
-        if (var.is_homopolymer_indel || vflag == kCandNoisyCandHom) continue;
+        const uint32_t vic = var.lcd_var_i_to_cate;
+        if ((vic & flags) == 0) continue;
+        // longcallD init_assign_read_hap_based_on_cons_alle: HP-indel or NOISY_CAND_HOM only.
+        if (var.is_homopolymer_indel || vic == kCandNoisyCandHom) continue;
 
         const int aidx = prof.alleles[vi - prof.start_var_idx];
         if (aidx < 0) continue;
 
         for (int hap = 1; hap <= 2; ++hap) {
-            const int score = read_to_cons_allele_score(var, hap, vflag, aidx);
-            // CleanHom does not contribute to hap_scores or n_vars_used.
-            if (vflag != kCandCleanHom) {
-                if (score != 0) n_vars_used[hap]++;
-                hap_scores[hap] += score;
+            const int score = read_to_cons_allele_score(var, hap, vic, aidx);
+            if (score != 0) {
+                if (vic != kCandCleanHom) n_vars_used[hap]++;
+                if ((vic & kCandGermlineClean) != 0 && var.key.type == VariantType::Snp) {
+                    if (score > 0) n_clean_agree[hap]++;
+                    else n_clean_conflict[hap]++;
+                }
             }
-            // Count agree/conflict for all clean SNPs (including CleanHom SNPs).
-            if ((vflag & kCandGermlineClean) && var.key.type == VariantType::Snp && score != 0) {
-                if (score > 0) n_clean_agree[hap]++;
-                else n_clean_conflict[hap]++;
-            }
+            if (vic != kCandCleanHom) hap_scores[hap] += score;
         }
     }
 
@@ -497,19 +303,17 @@ static void update_var_hap_profile_cons_alle(BamChunk& chunk, bool is_ont,
     const ReadVariantProfile& prof = chunk.read_var_profile[read_i];
     if (prof.start_var_idx < 0) return;
     for (int vi = prof.start_var_idx; vi <= prof.end_var_idx; ++vi) {
-        const uint32_t vflag = category_to_flag(chunk.candidates[vi].counts.category);
-        if ((vflag & flags) == 0) continue;
+        const uint32_t vic = chunk.candidates[vi].lcd_var_i_to_cate;
+        if ((vic & flags) == 0) continue;
         const int aidx = prof.alleles[vi - prof.start_var_idx];
         if (aidx < 0) continue;
         CandidateVariant& var = chunk.candidates[vi];
         if (hap == 0) {
             for (int h = 1; h <= 2; ++h) {
-                if (aidx >= static_cast<int>(var.hap_to_alle_profile[h].size())) continue;
                 var.hap_to_alle_profile[h][aidx]++;
                 update_var_hap_to_cons_alle(is_ont, var, h);
             }
         } else {
-            if (aidx >= static_cast<int>(var.hap_to_alle_profile[hap].size())) continue;
             var.hap_to_alle_profile[hap][aidx]++;
             update_var_hap_to_cons_alle(is_ont, var, hap);
         }
@@ -522,19 +326,16 @@ static void update_var_hap_profile(BamChunk& chunk, int read_i, int hap, uint32_
     const ReadVariantProfile& prof = chunk.read_var_profile[read_i];
     if (prof.start_var_idx < 0) return;
     for (int vi = prof.start_var_idx; vi <= prof.end_var_idx; ++vi) {
-        const uint32_t vflag = category_to_flag(chunk.candidates[vi].counts.category);
-        if ((vflag & flags) == 0) continue;
+        const uint32_t vic = chunk.candidates[vi].lcd_var_i_to_cate;
+        if ((vic & flags) == 0) continue;
         const int aidx = prof.alleles[vi - prof.start_var_idx];
         if (aidx < 0) continue;
         CandidateVariant& cand = chunk.candidates[vi];
         if (hap == 0) {
-            if (aidx < static_cast<int>(cand.hap_to_alle_profile[1].size()))
-                cand.hap_to_alle_profile[1][aidx]++;
-            if (aidx < static_cast<int>(cand.hap_to_alle_profile[2].size()))
-                cand.hap_to_alle_profile[2][aidx]++;
+            cand.hap_to_alle_profile[1][aidx]++;
+            cand.hap_to_alle_profile[2][aidx]++;
         } else {
-            if (aidx < static_cast<int>(cand.hap_to_alle_profile[hap].size()))
-                cand.hap_to_alle_profile[hap][aidx]++;
+            cand.hap_to_alle_profile[hap][aidx]++;
         }
     }
 }
@@ -712,7 +513,7 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
     valid_var_idx.reserve(n_cands);
     std::vector<bool> var_is_valid(n_cands, false);
     for (int i = 0; i < n_cands; ++i) {
-        if ((category_to_flag(chunk.candidates[i].counts.category) & flags) == 0) continue;
+        if ((chunk.candidates[i].lcd_var_i_to_cate & flags) == 0) continue;
         valid_var_idx.push_back(i);
         var_is_valid[i] = true;
     }
@@ -744,9 +545,9 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
 
         for (int idx = 0; idx < nv; ++idx) {
             const int vi = valid_var_idx[var_ii[idx]];
-            const uint32_t vflag = category_to_flag(chunk.candidates[vi].counts.category);
-            // Hom variants are not used in Phase 1.
-            if (vflag == kCandCleanHom || vflag == kCandNoisyCandHom) continue;
+            const uint32_t vic = chunk.candidates[vi].lcd_var_i_to_cate;
+            // longcallD 1st loop: HOM vars not used in the 1st round.
+            if (vic == kCandCleanHom || vic == kCandNoisyCandHom) continue;
 
             const int64_t ovlp_n = cr_overlap(cr, "cr", vi, vi + 1, &ovlp_b, &max_b);
             for (int64_t oi = 0; oi < ovlp_n; ++oi) {
@@ -779,6 +580,8 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
     for (auto& var : chunk.candidates) {
         int c1 = var.hap_to_cons_alle[1];
         int c2 = var.hap_to_cons_alle[2];
+        var.hap_alt = 0;
+        var.hap_ref = 0;
         if (c1 == -1 && c2 == -1) {
             c1 = c2 = var.hap_to_cons_alle[0]; // hom_idx fallback
         }
@@ -829,18 +632,27 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
 /**
  * @brief Stitch one pair of adjacent chunks (strict longcallD flip_variant_hap).
  *
- * Mirrors longcallD `flip_variant_hap` + `update_chunk_var_hap_phase_set1`
- * + `update_chunk_read_hap_phase_set1` from collect_var.c lines 1593–1695.
+ * Mirrors longcallD `update_chunk_var_hap_phase_set1` + conditional
+ * `update_chunk_read_hap_phase_set1` from collect_var.c lines 1593–1695:
+ * candidate hap swap + candidate/read PS rename always matches the var half; read hap flip
+ * + read PS rename run only when \p touch_read_phase matches `opt->out_aln_fp != NULL`.
  */
-static void apply_chunk_flip_and_merge(BamChunk& cur, bool do_flip, hts_pos_t max_pre_ps, hts_pos_t min_cur_ps) {
-    if (do_flip && min_cur_ps != INT64_MAX) {
+static void apply_chunk_flip_and_merge(BamChunk& cur,
+                                       bool do_flip,
+                                       hts_pos_t max_pre_ps,
+                                       hts_pos_t min_cur_ps,
+                                       bool touch_read_phase) {
+    // Mirrors collect_var.c: hap flip iff flip_hap && flip_cur_PS != -1.
+    if (do_flip && min_cur_ps != INT64_MAX && min_cur_ps != static_cast<hts_pos_t>(-1)) {
         for (CandidateVariant& v : cur.candidates) {
             if (v.phase_set != min_cur_ps) continue;
             std::swap(v.hap_to_cons_alle[1], v.hap_to_cons_alle[2]);
         }
-        for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
-            if (cur.reads[read_i].is_skipped || cur.haps[read_i] == 0) continue;
-            if (cur.phase_sets[read_i] == min_cur_ps) cur.haps[read_i] = 3 - cur.haps[read_i];
+        if (touch_read_phase) {
+            for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
+                if (cur.reads[read_i].is_skipped || cur.haps[read_i] == 0) continue;
+                if (cur.phase_sets[read_i] == min_cur_ps) cur.haps[read_i] = 3 - cur.haps[read_i];
+            }
         }
     }
     if (max_pre_ps != -1 && min_cur_ps != INT64_MAX) {
@@ -848,45 +660,22 @@ static void apply_chunk_flip_and_merge(BamChunk& cur, bool do_flip, hts_pos_t ma
             if (v.phase_set == -1) continue;
             if (v.phase_set == min_cur_ps) v.phase_set = max_pre_ps;
         }
-        for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
-            if (cur.phase_sets[read_i] == -1) continue;
-            if (cur.phase_sets[read_i] == min_cur_ps) cur.phase_sets[read_i] = max_pre_ps;
+        if (touch_read_phase) {
+            for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
+                if (cur.phase_sets[read_i] == -1) continue;
+                if (cur.phase_sets[read_i] == min_cur_ps) cur.phase_sets[read_i] = max_pre_ps;
+            }
         }
     }
 }
 
-static void stitch_phase_blocks_within_chunk(BamChunk& chunk, const PgbamSidecarData& sidecar) {
-    std::vector<hts_pos_t> psets;
-    for (size_t i = 0; i < chunk.reads.size(); ++i) {
-        if (chunk.reads[i].is_skipped || chunk.haps[i] == 0 || chunk.phase_sets[i] < 0) continue;
-        psets.push_back(chunk.phase_sets[i]);
-    }
-    std::sort(psets.begin(), psets.end());
-    psets.erase(std::unique(psets.begin(), psets.end()), psets.end());
-    if (psets.size() < 2) return;
+/**
+ * Mirrors longcallD `flip_variant_hap` (collect_var.c): same guard order and early exits;
+ * only overlapping-read voting + `update_chunk_var_hap_phase_set1` (+ optional read updates).
+ */
+static void flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
+    if (pre.region.tid != cur.region.tid) return;
 
-    std::vector<std::vector<uint64_t>> read_threads;
-    build_read_thread_cache(chunk, sidecar, read_threads);
-    std::vector<PhaseBlockThreadState> states =
-        build_phase_block_thread_states(chunk, psets, read_threads);
-
-    for (size_t i = 1; i < psets.size(); ++i) {
-        const hts_pos_t left_ps  = psets[i - 1];
-        const hts_pos_t right_ps = psets[i];
-
-        bool do_flip = false;
-        if (!decide_phase_block_concordance(states[i - 1], states[i], do_flip)) continue;
-        apply_chunk_flip_and_merge(chunk, do_flip, left_ps, right_ps);
-        states[i] = merge_phase_block_thread_states(states[i - 1], states[i], do_flip);
-        psets[i] = left_ps;  // propagate merged identity so next iteration uses the correct left anchor
-    }
-}
-
-static bool flip_chunk_hap(BamChunk& pre,
-                           BamChunk& cur,
-                           const Options* opts,
-                           const PgbamSidecarData* pgbam_sidecar) {
-    if (pre.region.tid != cur.region.tid) return false;
     int n_cur_ovlp_reads = 0;
     int n_pre_ovlp_reads = 0;
     const size_t n_bams = cur.up_ovlp_read_i.size();
@@ -899,76 +688,61 @@ static bool flip_chunk_hap(BamChunk& pre,
     if (n_cur_ovlp_reads != n_pre_ovlp_reads) {
         throw std::runtime_error("overlap read count mismatch between adjacent chunks");
     }
-    int flip_score = 0;
-    hts_pos_t max_pre_ps = -1;
-    hts_pos_t min_cur_ps = INT64_MAX;
+    if (n_cur_ovlp_reads <= 0) return;
+    if (pre.candidates.empty() || cur.candidates.empty()) return;
 
-    if (n_cur_ovlp_reads > 0) {
-        if (pre.candidates.empty() || cur.candidates.empty()) return false;
-        for (size_t bi = 0; bi < n_bams; ++bi) {
-            const std::vector<int>& cur_list = cur.up_ovlp_read_i[bi];
-            const std::vector<int>& pre_list = pre.down_ovlp_read_i[bi];
-            for (size_t j = 0; j < cur_list.size(); ++j) {
-                if (j >= pre_list.size()) {
-                    throw std::runtime_error("overlap read pairing mismatch between adjacent chunks");
-                }
-                const int cur_read_i = cur_list[j];
-                const int pre_read_i = pre_list[j];
-                if (pre_read_i < 0 || static_cast<size_t>(pre_read_i) >= pre.reads.size() ||
-                    cur_read_i < 0 || static_cast<size_t>(cur_read_i) >= cur.reads.size()) {
-                    throw std::runtime_error("overlap read index out of bounds during chunk stitching");
-                }
-                if (pre.reads[static_cast<size_t>(pre_read_i)].is_skipped || pre.haps[static_cast<size_t>(pre_read_i)] == 0 ||
-                    cur.reads[static_cast<size_t>(cur_read_i)].is_skipped || cur.haps[static_cast<size_t>(cur_read_i)] == 0) continue;
-                const int pre_hap = pre.haps[static_cast<size_t>(pre_read_i)];
-                const hts_pos_t pre_ps = pre.phase_sets[static_cast<size_t>(pre_read_i)];
-                const int cur_hap = cur.haps[static_cast<size_t>(cur_read_i)];
-                const hts_pos_t cur_ps = cur.phase_sets[static_cast<size_t>(cur_read_i)];
-                if (pre_hap == cur_hap) --flip_score;
-                else ++flip_score;
-                if (max_pre_ps < pre_ps) max_pre_ps = pre_ps;
-                if (min_cur_ps > cur_ps) min_cur_ps = cur_ps;
+    int flip_hap_score = 0;
+    hts_pos_t max_pre_read_ps = -1;
+    hts_pos_t min_cur_read_ps = INT64_MAX;
+
+    for (size_t bi = 0; bi < n_bams; ++bi) {
+        const std::vector<int>& cur_list = cur.up_ovlp_read_i[bi];
+        const std::vector<int>& pre_list = pre.down_ovlp_read_i[bi];
+        for (size_t j = 0; j < cur_list.size(); ++j) {
+            if (j >= pre_list.size()) {
+                throw std::runtime_error("overlap read pairing mismatch between adjacent chunks");
             }
+            const int cur_read_i = cur_list[j];
+            const int pre_read_i = pre_list[j];
+            if (pre_read_i < 0 || static_cast<size_t>(pre_read_i) >= pre.reads.size() ||
+                cur_read_i < 0 || static_cast<size_t>(cur_read_i) >= cur.reads.size()) {
+                throw std::runtime_error("overlap read index out of bounds during chunk stitching");
+            }
+            if (pre.reads[static_cast<size_t>(pre_read_i)].is_skipped ||
+                pre.haps[static_cast<size_t>(pre_read_i)] == 0 ||
+                cur.reads[static_cast<size_t>(cur_read_i)].is_skipped ||
+                cur.haps[static_cast<size_t>(cur_read_i)] == 0) {
+                continue;
+            }
+            const int pre_read_hap = pre.haps[static_cast<size_t>(pre_read_i)];
+            const hts_pos_t pre_read_ps = pre.phase_sets[static_cast<size_t>(pre_read_i)];
+            const int cur_read_hap = cur.haps[static_cast<size_t>(cur_read_i)];
+            const hts_pos_t cur_read_ps = cur.phase_sets[static_cast<size_t>(cur_read_i)];
+            if (pre_read_hap == cur_read_hap)
+                --flip_hap_score;
+            else
+                ++flip_hap_score;
+            if (max_pre_read_ps < pre_read_ps) max_pre_read_ps = pre_read_ps;
+            if (min_cur_read_ps > cur_read_ps) min_cur_read_ps = cur_read_ps;
         }
-        if (flip_score != 0) {
-            apply_chunk_flip_and_merge(cur, flip_score > 0, max_pre_ps, min_cur_ps);
-            return true;
-        }
     }
 
-    if (opts == nullptr || pgbam_sidecar == nullptr || opts->pgbam_file.empty()) return false;
+    if (flip_hap_score == 0) return;
 
-    max_pre_ps = -1;
-    min_cur_ps = INT64_MAX;
-    for (size_t i = 0; i < pre.reads.size(); ++i) {
-        if (pre.reads[i].is_skipped || pre.haps[i] == 0 || pre.phase_sets[i] < 0) continue;
-        if (pre.phase_sets[i] > max_pre_ps) max_pre_ps = pre.phase_sets[i];
-    }
-    for (size_t i = 0; i < cur.reads.size(); ++i) {
-        if (cur.reads[i].is_skipped || cur.haps[i] == 0 || cur.phase_sets[i] < 0) continue;
-        if (cur.phase_sets[i] < min_cur_ps) min_cur_ps = cur.phase_sets[i];
-    }
-    if (max_pre_ps < 0 || min_cur_ps == INT64_MAX) return false;
-
-    const PhaseBlockThreadState pre_state =
-        collect_phase_block_thread_state(pre, max_pre_ps, *pgbam_sidecar);
-    const PhaseBlockThreadState cur_state =
-        collect_phase_block_thread_state(cur, min_cur_ps, *pgbam_sidecar);
-    bool do_flip = false;
-    if (!decide_phase_block_concordance(pre_state, cur_state, do_flip)) return false;
-    apply_chunk_flip_and_merge(cur, do_flip, max_pre_ps, min_cur_ps);
-    return true;
+    const bool touch_read_phase = opts != nullptr && !opts->output_aln.empty();
+    apply_chunk_flip_and_merge(cur,
+                               flip_hap_score > 0,
+                               max_pre_read_ps,
+                               min_cur_read_ps,
+                               touch_read_phase);
 }
 
 void stitch_chunk_haps(std::vector<BamChunk>& chunks,
                        const Options* opts,
                        const PgbamSidecarData* pgbam_sidecar) {
-    if (pgbam_sidecar != nullptr && opts != nullptr && !opts->pgbam_file.empty()) {
-        for (BamChunk& chunk : chunks)
-            stitch_phase_blocks_within_chunk(chunk, *pgbam_sidecar);
-    }
+    (void)pgbam_sidecar;
     for (size_t ii = 1; ii < chunks.size(); ++ii)
-        flip_chunk_hap(chunks[ii - 1], chunks[ii], opts, pgbam_sidecar);
+        flip_chunk_hap(chunks[ii - 1], chunks[ii], opts);
 }
 
 } // namespace pgphase_collect

@@ -165,19 +165,43 @@ struct NoisyRegionBuilder {
         xid_push_win(q, pos, len, count, noisy_out, cur_start, cur_end, q_start, q_end);
     }
 
-    bool suppress_left_clip = false;
-    bool suppress_right_clip = false;
-
-    void add_end_clip_region(int cigar_idx, int n_cigar, hts_pos_t ref_pos, hts_pos_t tlen, int clip_len) {
-        // longcallD: mark end-clip noisy region only when len > end_clip_reg.
-        if (clip_len <= kLongClipLength) return;
-        if (cigar_idx == 0 && ref_pos > 10) { // left end clip
-            if (!suppress_left_clip)
-                noisy_out.push_back(Interval{ref_pos, std::min<hts_pos_t>(tlen, ref_pos + kClipFlank), 0});
-        } else if (cigar_idx == n_cigar - 1 && ref_pos < tlen - 10) { // right end clip
-            if (!suppress_right_clip)
-                noisy_out.push_back(Interval{std::max<hts_pos_t>(1, ref_pos - kClipFlank), ref_pos, 0});
+    void add_end_clip_region(int cigar_idx,
+                             int n_cigar,
+                             hts_pos_t pos,
+                             hts_pos_t tlen,
+                             int clip_len,
+                             bool left_clip_is_palindrome,
+                             bool right_clip_is_palindrome,
+                             ReadRecord& read) {
+        // Line-aligned with longcallD collect_digar_from_eqx_cigar() clip branch (bam_utils.c):
+        //   if ((i == 0 && pos > 10) || (i != 0 && pos < tlen - 10)) {
+        //     if (len > end_clip_reg) {
+        //       if (i == 0 && !left_clip_is_palindrome) {
+        //         if (pos > 1) cr_add(..., pos-1, pos+end_clip_reg_flank_win, 0);
+        //         n_total_cand_vars++;
+        //       } else if (i != 0 && !right_clip_is_palindrome) {
+        //         if (pos < tlen) cr_add(..., pos-1-end_clip_reg_flank_win, pos, 0);
+        //         n_total_cand_vars++;
+        //       }
+        //     }
+        //   }
+        constexpr int end_clip_reg = kLongClipLength;        // LONGCALLD_NOISY_END_CLIP
+        constexpr int end_clip_flank = kClipFlank;             // LONGCALLD_NOISY_END_CLIP_WIN
+        if (!((cigar_idx == 0 && pos > 10) || (cigar_idx != 0 && pos < tlen - 10))) return;
+        if (clip_len <= end_clip_reg) return;
+        if (cigar_idx == 0 && !left_clip_is_palindrome) {
+            if (pos > 1) {
+                noisy_out.push_back(Interval{pos - 1, pos + static_cast<hts_pos_t>(end_clip_flank), 0});
+            }
+            read.total_cand_events++;
+        } else if (cigar_idx != 0 && !right_clip_is_palindrome) {
+            if (pos < tlen) {
+                noisy_out.push_back(
+                    Interval{pos - 1 - static_cast<hts_pos_t>(end_clip_flank), pos, 0});
+            }
+            read.total_cand_events++;
         }
+        (void)n_cigar;
     }
 
     void flush() {
@@ -464,27 +488,17 @@ static hts_pos_t contig_len_from_header(const bam_hdr_t* header, int tid) {
     return static_cast<hts_pos_t>(header->target_len[tid]);
 }
 
-/** 
- * @brief Scans for extended explicit alignment operators (=/X).
- * 
- * An early gating check testing if the aligner emitted explicit byte-matching characters.
- * If =/X are present and M operations (ambiguous match/mismatch) are avoided, we can 
- * completely bypass genomic FASTA cache lookups using the EQX fast-path algorithms.
- * 
- * @param aln Target read alignment string to scan.
- * @return True if =/X operations are present over M, selecting the zero-reference parser.
- */
-static bool cigar_has_eqx_without_m(const bam1_t* aln) {
+/** longcallD `has_equal_X_in_bam_cigar` (`bam_utils.c`) — chooses EQX vs CS/MD/ref digar paths. */
+static bool longcalld_has_equal_x_in_bam_cigar(const bam1_t* aln) {
     const uint32_t* cigar = bam_get_cigar(aln);
     const int n_cigar = aln->core.n_cigar;
     if (n_cigar <= 0) return false;
-    bool saw_eqx = false;
     for (int i = 0; i < n_cigar; ++i) {
         const int op = bam_cigar_op(cigar[i]);
+        if (op == BAM_CEQUAL || op == BAM_CDIFF) return true;
         if (op == BAM_CMATCH) return false;
-        if (op == BAM_CEQUAL || op == BAM_CDIFF) saw_eqx = true;
     }
-    return saw_eqx;
+    return false;
 }
 
 /**
@@ -516,8 +530,8 @@ static void build_digars_ref_cigar(const bam1_t* aln,
     const hts_pos_t tlen = contig_len_from_header(header, aln->core.tid);
     NoisyRegionBuilder noisy_builder(
         static_cast<int>(std::max<uint32_t>(1u, aln->core.n_cigar * 2u + 8u)), opts, read.noisy_regions);
-    noisy_builder.suppress_left_clip  = read.is_ont_palindrome && bam_is_rev(aln);
-    noisy_builder.suppress_right_clip = read.is_ont_palindrome && !bam_is_rev(aln);
+    const bool left_clip_is_palindrome = read.is_ont_palindrome && bam_is_rev(aln);
+    const bool right_clip_is_palindrome = read.is_ont_palindrome && !bam_is_rev(aln);
 
     for (uint32_t i = 0; i < aln->core.n_cigar; ++i) {
         const int op = bam_cigar_op(cigar[i]);
@@ -573,7 +587,14 @@ static void build_digars_ref_cigar(const bam1_t* aln,
         } else if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
             const DigarType clip_type = op == BAM_CSOFT_CLIP ? DigarType::SoftClip : DigarType::HardClip;
             append_digar(read.digars, DigarOp{ref_pos, clip_type, len, query_pos, false, ""});
-            noisy_builder.add_end_clip_region(static_cast<int>(i), aln->core.n_cigar, ref_pos, tlen, len);
+            noisy_builder.add_end_clip_region(static_cast<int>(i),
+                                              static_cast<int>(aln->core.n_cigar),
+                                              ref_pos,
+                                              tlen,
+                                              len,
+                                              left_clip_is_palindrome,
+                                              right_clip_is_palindrome,
+                                              read);
             if (op == BAM_CSOFT_CLIP) query_pos += len;
         } else if (op == BAM_CREF_SKIP) {
             // longcallD collect_digar_*: skip N op without adding a digar entry.
@@ -611,8 +632,8 @@ static void build_digars_eqx_cigar(const bam1_t* aln,
     const hts_pos_t tlen = contig_len_from_header(header, aln->core.tid);
     NoisyRegionBuilder noisy_builder(
         static_cast<int>(std::max<uint32_t>(1u, aln->core.n_cigar * 2u + 8u)), opts, read.noisy_regions);
-    noisy_builder.suppress_left_clip  = read.is_ont_palindrome && bam_is_rev(aln);
-    noisy_builder.suppress_right_clip = read.is_ont_palindrome && !bam_is_rev(aln);
+    const bool left_clip_is_palindrome = read.is_ont_palindrome && bam_is_rev(aln);
+    const bool right_clip_is_palindrome = read.is_ont_palindrome && !bam_is_rev(aln);
 
     for (uint32_t i = 0; i < aln->core.n_cigar; ++i) {
         const int op = bam_cigar_op(cigar[i]);
@@ -654,7 +675,14 @@ static void build_digars_eqx_cigar(const bam1_t* aln,
         } else if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
             const DigarType clip_type = op == BAM_CSOFT_CLIP ? DigarType::SoftClip : DigarType::HardClip;
             append_digar(read.digars, DigarOp{ref_pos, clip_type, len, query_pos, false, ""});
-            noisy_builder.add_end_clip_region(static_cast<int>(i), aln->core.n_cigar, ref_pos, tlen, len);
+            noisy_builder.add_end_clip_region(static_cast<int>(i),
+                                              static_cast<int>(aln->core.n_cigar),
+                                              ref_pos,
+                                              tlen,
+                                              len,
+                                              left_clip_is_palindrome,
+                                              right_clip_is_palindrome,
+                                              read);
             if (op == BAM_CSOFT_CLIP) query_pos += len;
         } else if (op == BAM_CREF_SKIP) {
             // longcallD collect_digar_*: skip N op without adding a digar entry.
@@ -700,8 +728,8 @@ static bool build_digars_md_cigar(const bam1_t* aln,
     const int n_cigar = aln->core.n_cigar;
     const hts_pos_t tlen = contig_len_from_header(header, aln->core.tid);
     NoisyRegionBuilder noisy_builder(static_cast<int>(std::max(1, n_cigar * 2 + 8)), opts, read.noisy_regions);
-    noisy_builder.suppress_left_clip  = read.is_ont_palindrome && bam_is_rev(aln);
-    noisy_builder.suppress_right_clip = read.is_ont_palindrome && !bam_is_rev(aln);
+    const bool left_clip_is_palindrome = read.is_ont_palindrome && bam_is_rev(aln);
+    const bool right_clip_is_palindrome = read.is_ont_palindrome && !bam_is_rev(aln);
     int last_eq_len = 0;
 
     for (int i = 0; i < n_cigar; ++i) {
@@ -786,7 +814,14 @@ static bool build_digars_md_cigar(const bam1_t* aln,
         } else if (op == BAM_CSOFT_CLIP || op == BAM_CHARD_CLIP) {
             const DigarType clip_type = op == BAM_CSOFT_CLIP ? DigarType::SoftClip : DigarType::HardClip;
             append_digar(read.digars, DigarOp{ref_pos, clip_type, len, query_pos, false, ""});
-            noisy_builder.add_end_clip_region(i, n_cigar, ref_pos, tlen, len);
+            noisy_builder.add_end_clip_region(i,
+                                              n_cigar,
+                                              ref_pos,
+                                              tlen,
+                                              len,
+                                              left_clip_is_palindrome,
+                                              right_clip_is_palindrome,
+                                              read);
             if (op == BAM_CSOFT_CLIP) query_pos += len;
         } else if (op == BAM_CREF_SKIP) {
             ref_pos += len;
@@ -847,8 +882,8 @@ static bool build_digars_cs_tag(const bam1_t* aln,
     int query_pos = 0;
     NoisyRegionBuilder noisy_builder(
         static_cast<int>(std::max<uint32_t>(1u, aln->core.n_cigar * 2u + 8u)), opts, read.noisy_regions);
-    noisy_builder.suppress_left_clip  = read.is_ont_palindrome && bam_is_rev(aln);
-    noisy_builder.suppress_right_clip = read.is_ont_palindrome && !bam_is_rev(aln);
+    const bool left_clip_is_palindrome = read.is_ont_palindrome && bam_is_rev(aln);
+    const bool right_clip_is_palindrome = read.is_ont_palindrome && !bam_is_rev(aln);
     const hts_pos_t tlen = contig_len_from_header(header, aln->core.tid);
 
     if (n_cigar > 0) {
@@ -857,7 +892,14 @@ static bool build_digars_cs_tag(const bam1_t* aln,
             const int len0 = bam_cigar_oplen(cigar[0]);
             const DigarType clip_type = op0 == BAM_CSOFT_CLIP ? DigarType::SoftClip : DigarType::HardClip;
             append_digar(read.digars, DigarOp{ref_pos, clip_type, len0, query_pos, false, ""});
-            noisy_builder.add_end_clip_region(0, n_cigar, ref_pos, tlen, len0);
+            noisy_builder.add_end_clip_region(0,
+                                              n_cigar,
+                                              ref_pos,
+                                              tlen,
+                                              len0,
+                                              left_clip_is_palindrome,
+                                              right_clip_is_palindrome,
+                                              read);
             if (op0 == BAM_CSOFT_CLIP) query_pos += len0;
         }
     }
@@ -950,7 +992,14 @@ static bool build_digars_cs_tag(const bam1_t* aln,
             const int lenl = bam_cigar_oplen(cigar[n_cigar - 1]);
             const DigarType clip_type = opi == BAM_CSOFT_CLIP ? DigarType::SoftClip : DigarType::HardClip;
             append_digar(read.digars, DigarOp{ref_pos, clip_type, lenl, query_pos, false, ""});
-            noisy_builder.add_end_clip_region(n_cigar - 1, n_cigar, ref_pos, tlen, lenl);
+            noisy_builder.add_end_clip_region(n_cigar - 1,
+                                              n_cigar,
+                                              ref_pos,
+                                              tlen,
+                                              lenl,
+                                              left_clip_is_palindrome,
+                                              right_clip_is_palindrome,
+                                              read);
             if (opi == BAM_CSOFT_CLIP) query_pos += lenl;
         }
     }
@@ -964,7 +1013,7 @@ static bool build_digars_cs_tag(const bam1_t* aln,
  * Tries four strategies in order and falls back when a strategy is unavailable or malformed:
  *
  * 1. **EQX CIGAR** (`=`/`X` operators, no `M`): explicit match/mismatch; no reference lookup
- *    needed. Most accurate and fastest. Used when `cigar_has_eqx_without_m`.
+ *    needed. Most accurate and fastest. Used when `longcalld_has_equal_x_in_bam_cigar`.
  * 2. **`cs:Z:` tag** (minimap2 format): `:` matches, `*xy` mismatches, `+seq` insertions,
  *    `-seq` deletions. Falls back to ref-comparison if the tag is missing or malformed.
  * 3. **`MD:Z:` tag** + CIGAR: reconstructs SNPs from the `MD` string; insertions from CIGAR.
@@ -994,7 +1043,7 @@ void build_digars_and_events(const bam1_t* aln,
     read.total_cand_events = 0;
     read.digars.reserve(static_cast<size_t>(aln->core.n_cigar) * 2u + 8u);
 
-    if (cigar_has_eqx_without_m(aln)) {
+    if (longcalld_has_equal_x_in_bam_cigar(aln)) {
         build_digars_eqx_cigar(aln, header, opts, read);
     } else if (bam_aux_get(const_cast<bam1_t*>(aln), "cs") != nullptr) {
         if (!build_digars_cs_tag(aln, header, opts, read)) {

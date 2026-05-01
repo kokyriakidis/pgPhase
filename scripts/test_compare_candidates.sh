@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Integration test: pgPhase TSV vs longcallD stderr (verbose) on a small chr11 window.
+# Integration test: pgPhase TSV vs longcallD stderr (verbose) on HG002 HiFi chr20 slice.
 # Requires: built ./pgphase, samtools (optional, for sanity), longcallD binary.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PGPHASE="${PGPHASE:-$ROOT/pgphase}"
 LONGCALLD_BIN="${LONGCALLD:-$ROOT/../longcallD/bin/longcallD}"
-FA="$ROOT/test_data/chr11_2M.fa"
-BAM="$ROOT/test_data/HG002_chr11_hifi_test.bam"
-REGION="chr11:1230000-1260000"
+FA="$ROOT/test_data/chr20_quick/CHM13_chr20_only.fa"
+BAM="$ROOT/test_data/chr20_quick/HG002_CHM13_chr20_15000001_15500000.bam"
+REGION="CHM13#0#chr20:15000001-15500000"
 
 if [[ ! -x "$PGPHASE" ]]; then
   echo "error: pgphase not found at $PGPHASE (run: make)" >&2
@@ -41,7 +41,7 @@ echo "ok: compare_candidates.py (--category-stage final) passed on $REGION"
 python3 "$ROOT/scripts/compare_candidates.py" \
   --pgphase "$TMP/pg.tsv" \
   --longcalld "$TMP/lcd.log" \
-  --chrom chr11 \
+  --chrom 'CHM13#0#chr20' \
   --category-stage initial
 
 echo "ok: compare_candidates.py (--category-stage initial, INIT_CAT) passed on $REGION"

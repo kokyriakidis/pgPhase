@@ -179,6 +179,8 @@ struct Options {
     int gap_aln    = 1;   ///< Gap alignment direction: 1=left-most (LONGCALLD_GAP_LEFT_ALN).
     double partial_aln_ratio = 1.1; ///< Max longer/shorter ratio for partial alignment (LONGCALLD_PARTIAL_ALN_RATIO).
     int verbose = 0;
+    /** Mirrors longcallD `opt->out_amb_base`; default false = skip VCF rows with non-ACGT REF/ALT (LCD nt4 ≥ 4). */
+    bool output_ambiguous_bases = false;
     bool include_filtered = false;
     bool autosome = false;
     bool input_is_list = false;
@@ -411,12 +413,25 @@ struct CandidateVariant {
     VariantKey key;
     VariantCounts counts;
     uint8_t ref_base = 4;     // 0-3=ACGT, 4=unknown; SNPs only (longcallD cand_var_t::ref_base)
-    uint8_t alt_ref_base = 4; // 0-3=ACGT, 4=unknown; INS/DEL only (longcallD cand_var_t::alt_ref_base)
+    uint8_t alt_ref_base = 4; // INS/DEL: longcallD cand_var_t::alt_ref_base — 0–3 consensus ACGT, 4→use ref anchor, >3 e.g. gap (LCD skips VCF)
     hts_pos_t phase_set = 0;
     int hap_alt = 0;
     int hap_ref = 0;
-    /** True when the variant lies in a homopolymer or STR run (longcallD `is_homopolymer_indel`). */
+    /** longcallD `cand_var_t::is_homopolymer_indel`: set only for MSA gaps (`var_is_homopolymer_indel`), never from REP_HET classify. */
     bool is_homopolymer_indel = false;
+    /**
+     * longcallD `collect_var.c` `make_variants` line 1488: emit only when VCF POS lies in
+     * `[chunk->reg_beg, chunk->reg_end]` (INS/DEL use `cand.pos - 1` as in lines 1481–1483).
+     * Filled in `collect_var_main`; `collapse_exact_duplicate_variants` ORs across tiling overlaps.
+     */
+    bool lcd_make_variants_region_pass = true;
+    /**
+     * longcallD parallel array `chunk->var_i_to_cate[i]` (`collect_var.h` bitmask, e.g.
+     * `LONGCALLD_CLEAN_HET_SNP`). Kept in sync wherever lcd updates `var_i_to_cate`; VCF INFO
+     * `CLEAN` follows `make_variants`: `(lcd_var_i_to_cate & LONGCALLD_CAND_GERMLINE_CLEAN_VAR_CATE)`.
+     */
+    uint32_t lcd_var_i_to_cate = 0;
+
     /**
      * Per-haplotype allele count profiles for k-means phasing (longcallD `hap_to_alle_profile`).
      * Indexed [hap 0–2][allele i]. hap=0 unused here; haps 1–2 are diploid. Length matches
