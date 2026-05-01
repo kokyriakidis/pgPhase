@@ -539,10 +539,9 @@ static BamChunk process_chunk(const RegionChunk& region,
  * `exact_comp_var_site` only, preserving distinct large insertions (e.g. noisy recall vs digar) that
  * fuzzy collapse would incorrectly merge.
  *
- * Duplicate keys (overlap tiling): longcallD streams chunk `i` before chunk `i+1`; consumers often
- * `sort -u` on CHROM/POS/REF/ALT so the **first** emitted row wins. Match that by sorting duplicates
- * with tie-break `(chunk_index ascending, index_in_chunk ascending)` and keeping the first row,
- * OR-ing `lcd_make_variants_region_pass` like `collapse_exact_duplicate_variants`.
+ * Duplicate keys (overlap tiling): longcallD emits variants only from a chunk's active make-variants
+ * region. Prefer the duplicate that passes that active-region gate; if both rows have the same pass
+ * state, keep stream order `(chunk_index ascending, index_in_chunk ascending)`.
  *
  * @param chunks Completed chunk outputs (tables moved out).
  * @return Unified candidate table for the batch (exact-key dedupe).
@@ -578,7 +577,13 @@ static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
     for (size_t i = 0; i < rows.size(); ++i) {
         if (!merged.empty() &&
             exact_comp_var_site(&merged.back().key, &rows[i].v.key) == 0) {
-            merged.back().lcd_make_variants_region_pass |= rows[i].v.lcd_make_variants_region_pass;
+            const bool prev_pass = merged.back().lcd_make_variants_region_pass;
+            const bool cur_pass = rows[i].v.lcd_make_variants_region_pass;
+            if (!prev_pass && cur_pass) {
+                merged.back() = std::move(rows[i].v);
+            } else {
+                merged.back().lcd_make_variants_region_pass = prev_pass || cur_pass;
+            }
             continue;
         }
         merged.push_back(std::move(rows[i].v));

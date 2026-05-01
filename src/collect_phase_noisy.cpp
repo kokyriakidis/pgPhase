@@ -1015,9 +1015,7 @@ void merge_var_profile(BamChunk& chunk,
 int collect_noisy_vars1(BamChunk& chunk, const Options& opts, int noisy_reg_i) {
     const Interval& reg = chunk.noisy_regions[static_cast<size_t>(noisy_reg_i)];
     // longcallD `collect_noisy_vars1` enters with `noisy_reg_beg = cr_start(chunk_noisy_regs, i)`.
-    // The stored `Interval::beg` here is the printed left edge (`NoisyRegion: beg-1`) plus one,
-    // so step 4 must add one to match longcallD's `cr_start` coordinate exactly.
-    hts_pos_t noisy_reg_beg = reg.beg + 1;
+    hts_pos_t noisy_reg_beg = reg.beg;
     hts_pos_t noisy_reg_end = reg.end;
 
     // mirrors longcallD: skip regions longer than max_noisy_reg_len (return 0 = done, no vars).

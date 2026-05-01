@@ -191,13 +191,13 @@ struct NoisyRegionBuilder {
         if (clip_len <= end_clip_reg) return;
         if (cigar_idx == 0 && !left_clip_is_palindrome) {
             if (pos > 1) {
-                noisy_out.push_back(Interval{pos - 1, pos + static_cast<hts_pos_t>(end_clip_flank), 0});
+                noisy_out.push_back(Interval{pos, pos + static_cast<hts_pos_t>(end_clip_flank), 0});
             }
             read.total_cand_events++;
         } else if (cigar_idx != 0 && !right_clip_is_palindrome) {
             if (pos < tlen) {
                 noisy_out.push_back(
-                    Interval{pos - 1 - static_cast<hts_pos_t>(end_clip_flank), pos, 0});
+                    Interval{pos - static_cast<hts_pos_t>(end_clip_flank), pos, 0});
             }
             read.total_cand_events++;
         }

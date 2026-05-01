@@ -684,10 +684,7 @@ void intervals_from_cr(const cgranges_t* cr, std::vector<Interval>& out) {
 }
 
 // longcallD `post_process_noisy_regs`: final `cr_add(noisy_regs, "cr", noisy_reg_start[reg_i],
-// noisy_reg_end[reg_i], ...)` stores `st == noisy_reg_start` (1-based genomic start), not `start-1`.
-// Use these when converting that tree to/from `Interval` so `sort_noisy_regs` lens match
-// `cr_end - cr_start` and step-4 bounds match `collect_noisy_vars1`.
-
+// noisy_reg_end[reg_i], ...)` stores `st == noisy_reg_start`, not `start - 1`.
 static void intervals_from_cr_lcd_chunk_noisy_post_merge(const cgranges_t* cr, std::vector<Interval>& out) {
     out.clear();
     if (cr == nullptr || cr->n_r == 0) return;
@@ -2072,7 +2069,7 @@ static void dump_all_noisy_regions(const BamChunk& chunk, const Options& opts, c
     for (const Interval& region : chunk.noisy_regions) {
         std::fprintf(stderr, "NoisyRegion: %s:%" PRId64 "-%" PRId64 " (%d)\n",
                      chrom,
-                     static_cast<int64_t>(region.beg - 1),
+                     static_cast<int64_t>(region.beg),
                      static_cast<int64_t>(region.end),
                      region.label);
     }
