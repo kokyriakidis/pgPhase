@@ -86,8 +86,8 @@ uint32_t category_to_flag(VariantCategory c);
  * only if phased alignment output is requested (`opts != nullptr &&
  * !opts->output_aln.empty()`, analogous to `opt->out_aln_fp != NULL`), read-level hap/PS updates.
  *
- * The `pgbam_sidecar` argument is ignored (kept for call-site compatibility); longcallD does
- * not perform pangenome-graph stitching or within-chunk phase-block merges here.
+ * When `pgbam_sidecar` is provided through `--pgbam-file`, annotated-BAM `hs` tags and sidecar
+ * thread IDs are used to merge phase blocks that lack decisive common-read overlap.
  *
  * @param chunks Ordered, adjacent `BamChunk` objects, each already phased by k-means.
  */

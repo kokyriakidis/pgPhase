@@ -4,6 +4,7 @@
  */
 
 #include "collect_phase.hpp"
+#include "collect_phase_pgbam.hpp"
 
 #include <algorithm>
 #include <array>
@@ -673,8 +674,8 @@ static void apply_chunk_flip_and_merge(BamChunk& cur,
  * Mirrors longcallD `flip_variant_hap` (collect_var.c): same guard order and early exits;
  * only overlapping-read voting + `update_chunk_var_hap_phase_set1` (+ optional read updates).
  */
-static void flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
-    if (pre.region.tid != cur.region.tid) return;
+static bool flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
+    if (pre.region.tid != cur.region.tid) return false;
 
     int n_cur_ovlp_reads = 0;
     int n_pre_ovlp_reads = 0;
@@ -688,8 +689,8 @@ static void flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
     if (n_cur_ovlp_reads != n_pre_ovlp_reads) {
         throw std::runtime_error("overlap read count mismatch between adjacent chunks");
     }
-    if (n_cur_ovlp_reads <= 0) return;
-    if (pre.candidates.empty() || cur.candidates.empty()) return;
+    if (n_cur_ovlp_reads <= 0) return false;
+    if (pre.candidates.empty() || cur.candidates.empty()) return false;
 
     int flip_hap_score = 0;
     hts_pos_t max_pre_read_ps = -1;
@@ -727,7 +728,7 @@ static void flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
         }
     }
 
-    if (flip_hap_score == 0) return;
+    if (flip_hap_score == 0) return false;
 
     const bool touch_read_phase = opts != nullptr && !opts->output_aln.empty();
     apply_chunk_flip_and_merge(cur,
@@ -735,14 +736,22 @@ static void flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
                                max_pre_read_ps,
                                min_cur_read_ps,
                                touch_read_phase);
+    return true;
 }
 
 void stitch_chunk_haps(std::vector<BamChunk>& chunks,
                        const Options* opts,
                        const PgbamSidecarData* pgbam_sidecar) {
-    (void)pgbam_sidecar;
-    for (size_t ii = 1; ii < chunks.size(); ++ii)
-        flip_chunk_hap(chunks[ii - 1], chunks[ii], opts);
+    const bool use_pgbam = opts != nullptr && pgbam_sidecar != nullptr && !opts->pgbam_file.empty();
+    if (use_pgbam) {
+        for (BamChunk& chunk : chunks) stitch_phase_blocks_with_pgbam(chunk, *pgbam_sidecar);
+    }
+    for (size_t ii = 1; ii < chunks.size(); ++ii) {
+        const bool stitched = flip_chunk_hap(chunks[ii - 1], chunks[ii], opts);
+        if (!stitched && use_pgbam) {
+            stitch_adjacent_chunks_with_pgbam(chunks[ii - 1], chunks[ii], *pgbam_sidecar);
+        }
+    }
 }
 
 } // namespace pgphase_collect

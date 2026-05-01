@@ -20,6 +20,7 @@ SOURCES_CXX = src/main.cpp \
 	src/bam_digar.cpp \
 	src/collect_var.cpp \
 	src/collect_phase.cpp \
+	src/collect_phase_pgbam.cpp \
 	src/collect_phase_noisy.cpp \
 	src/align.cpp \
 	src/collect_bam_output.cpp \
