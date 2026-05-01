@@ -4,11 +4,12 @@ This document describes the implementation of the `pgphase collect-bam-variation
 
 The implementation is organized as a **staged pipeline** so that memory stays bounded on whole-genome runs and so each stage has a clear responsibility:
 
-- **`collect_pipeline.cpp`** — End-to-end orchestration: parse regions and BED, build `RegionChunk` tiles with neighbour metadata (`reg_chunk_i`, prev/next overlap hints), stream batches to disk, and expose the `collect_bam_variation` CLI. This is the “control plane” of the tool.
-- **`collect_var.cpp`** — The “biology core” ported from longcallD: gather candidate keys from digars, sweep reads for allele depths, then merge and filter chunk-level noisy regions (`cgranges`, `pre_process_noisy_regs` timing), run Fisher strand bias in ONT mode, run the two-pass `classify_cand_vars`-shaped classification, build read-level allele profiles (`collect_read_var_profile`), and co-phase clean germline het markers iteratively (`assign_hap_based_on_germline_het_vars_kmeans`).
+- **`collect_pipeline.cpp`** — End-to-end orchestration: parse regions and BED, build `RegionChunk` tiles with neighbour metadata (`reg_chunk_i`, prev/next overlap hints), stream batches to disk through `run_collect_bam_variation`, and expose the `collect_bam_variation` CLI wrapper. This is the “control plane” of the tool.
+- **`collect_var.cpp`** — The “biology core” ported from longcallD: gather candidate keys from digars, sweep reads for allele depths, then merge and filter chunk-level noisy regions (`cgranges`, `pre_process_noisy_regs_pgphase` timing), run Fisher strand bias in ONT mode, run the two-pass `classify_cand_vars`-shaped classification, and build read-level allele profiles (`collect_read_var_profile`). It calls k-means phasing, but the implementation of `assign_hap_based_on_germline_het_vars_kmeans` lives in `collect_phase.cpp`.
 - **`bam_digar.cpp`** — The “alignment plane”: stream BAM/CRAM into `ReadRecord` rows, apply read filters, build digars from EQX / MD / `cs` / reference comparison, and detect **per-read** noisy intervals using the same sliding-window rule as longcallD (see §8).
-- **`collect_output.cpp`** — Serializers only: TSV header/body, optional projected VCF and projected phased VCF (longcallD-style FILTER/INFO/category gates), and optional read×site read-support TSV. No classification logic lives here.
-- **`collect_phase.cpp` / `collect_phase.hpp`** — K-means read–haplotype clustering (`assign_hap_based_on_germline_het_vars_kmeans`), ported from longcallD `assign_hap.c`; category bitmask flags (`kCandCleanHetSnp`, …) for selecting which `VariantCategory` values participate in phasing; chunk-boundary stitching (`stitch_chunk_haps` / `flip_chunk_hap`) with common-read voting as primary path and pangenome-graph thread intersection as fallback (§19.7) when `--pgbam-file` is supplied.
+- **`collect_output.cpp`** — Serializers only: TSV header/body, optional projected VCF and projected phased VCF (longcallD-style FILTER/INFO/category gates), optional read×site read-support TSV, optional phase-read TSV, and optional phased alignment output helpers. No classification logic lives here.
+- **`collect_phase.cpp` / `collect_phase.hpp`** — K-means read–haplotype clustering (`assign_hap_based_on_germline_het_vars_kmeans`), ported from longcallD `assign_hap.c`; category bitmask flags (`kCandCleanHetSnp`, …) for selecting which `VariantCategory` values participate in phasing; chunk-boundary stitching (`stitch_chunk_haps` / `flip_chunk_hap`) with common-read voting as the primary path.
+- **`collect_phase_pgbam.cpp` / `collect_phase_pgbam.hpp`** — Annotated-BAM/`.pgbam` phase-block stitching: parses `hs` BAM tags, maps sidecar set IDs to graph thread IDs, merges phase blocks within chunks, and provides fallback adjacent-chunk stitching when `flip_chunk_hap` cannot apply a common-read stitch (§19.7).
 - **`collect_types.hpp`** — Shared structs (`Options`, `BamChunk`, `ReadRecord`, `CandidateVariant`, `ReadVariantProfile`, per-read `haps` / `phase_sets`, `PgbamSidecarData`, …) and small RAII helpers (`SamFile`, `ReferenceCache`, HTS deleters).
 
 Together, these files implement “longcallD-shaped” candidate collection in C++17 with explicit streaming and multi-BAM pooling.
@@ -26,7 +27,7 @@ Coordinate conventions used throughout:
 
 Representation conventions used throughout:
 
-- Candidate TSV is the internal explanatory surface (includes filtered categories).
+- Candidate TSV is the internal explanatory surface for retained candidate categories. LongcallD-not-candidate categories (`NON_VAR`, `LOW_COV`, `STRAND_BIAS`) are pruned before emission.
 - Optional VCF/phased VCF outputs are projected call surfaces (category/depth gated).
 - Same-position multi-allelic behavior is represented as multiple biallelic records when alleles survive gates.
 
@@ -47,24 +48,27 @@ The project ships **`src/cgranges.c`** and **`src/cgranges.h`** as **vendored** 
 They are **not** the same as the minimal upstream library [lh3/cgranges](https://github.com/lh3/cgranges) alone: longcallD’s copy adds APIs this pipeline relies on, including:
 
 - **`cr_merge` / `cr_merge2`** — merge nearby intervals with fixed and dynamic distance parameters (noisy-region geometry after extension).
-- **`cr_is_contained`** — test whether a query span is fully covered by some stored interval (non-ONT containment filter for candidates inside noisy blocks).
+- **`cr_is_contained`** — test whether a query span is fully covered by some stored interval (final containment filter for candidates inside noisy blocks).
 
 **Why vendored instead of a submodule?** A plain clone plus `make` remains sufficient; the exact C snapshot stays pinned to the validated longcallD revision; and release tarballs do not depend on recursive submodule checkout. If longcallD updates `cgranges` upstream, this tree is refreshed intentionally (diff + test) rather than floating on a submodule pointer.
 
 The main source files are:
 
 ```text
-collect_pipeline.cpp   region parsing, BED/autosome filters, chunk neighbours, streaming run,
-                       getopt CLI (collect_bam_variation), WorkerContext batch workers
+collect_pipeline.cpp   region parsing, BED/autosome filters, chunk neighbours, streaming run
+                       (`run_collect_bam_variation`), getopt CLI wrapper (`collect_bam_variation`),
+                       WorkerContext batch workers
 collect_var.cpp        candidate sites, allele counts, noisy-region prep/post-process,
                        Fisher/strand (ONT), classify_cand_vars, collect_read_var_profile,
-                       assign_hap_based_on_germline_het_vars_kmeans
+                       calls into collect_phase k-means
 bam_digar.cpp          BAM/CRAM iteration, filters, EQX/MD/cs/ref digars, per-read noisy windows
-collect_output.cpp     TSV, optional VCF, optional read-support TSV
+collect_output.cpp     TSV, optional projected VCF/phased VCF, read-support TSV,
+                       phase-read TSV, phased alignment helpers
 collect_phase.cpp      assign_hap_based_on_germline_het_vars_kmeans (longcallD assign_hap.c),
-                       stitch_chunk_haps / flip_chunk_hap (longcallD stitch_var_main / flip_variant_hap),
-                       pgbam fallback stitching (extract_hs_set_ids, collect_thread_set_for_group,
-                       unique hap-thread concordance, apply_chunk_flip_and_merge)
+                       stitch_chunk_haps / flip_chunk_hap (longcallD stitch_var_main / flip_variant_hap)
+collect_phase_pgbam.cpp
+                       annotated-BAM `hs` tag parsing, pgbam sidecar thread-set concordance,
+                       within-chunk phase-block merging, adjacent-chunk fallback stitching
 collect_phase.hpp      kCand* flags (incl. kCandGermlineClean, kCandGermlineVarCate), assign_hap decl.,
                        stitch_chunk_haps decl. (opts + pgbam_sidecar optional params)
 collect_types.hpp      Options (incl. pgbam_file), BamChunk, ReadRecord, candidates, ReadVariantProfile,
@@ -120,7 +124,7 @@ Two option semantics require explicit clarification:
 --include-filtered
   controls whether BAM reads marked QC-fail or duplicate are loaded.
   It does not mean "include filtered candidate categories in the output";
-  the TSV writer already emits all final candidate categories.
+  candidate-category pruning follows the longcallD-shaped pipeline.
 
 --hifi
   selects HiFi-oriented behavior: a 100 bp default noisy-read window. Like
@@ -140,10 +144,11 @@ Two option semantics require explicit clarification:
 Only one of --hifi, --ont, and --short-reads may be supplied.
 
 --pgbam-file FILE
-  Optional path to a pgbam sidecar (.pgbam). When supplied, chunk-boundary
-  stitching falls back to pangenome-graph thread intersection (§19.7) for
-  boundaries where common-read voting has no signal (flip_score == 0). Has
-  no effect on the common-read path; when absent the fallback is disabled.
+  Optional path to a pgbam sidecar (.pgbam). When supplied, annotated-BAM `hs`
+  tags plus sidecar graph-thread mappings are used after regular per-chunk
+  k-means phasing: first to merge phase blocks within each chunk, then as a
+  fallback for adjacent chunk boundaries where common-read voting has no
+  decisive signal. Has no effect when absent.
 ```
 
 The command supports explicit region restriction:
@@ -218,30 +223,33 @@ With default chunk_size = 500000:
 
 Chunking provides two benefits. First, it limits read and candidate state held in memory at one time. Second, it creates independent work units for parallel processing.
 
-Reads can span chunk boundaries. Because each chunk queries reads overlapping that chunk, a long read may be loaded for two adjacent chunks. Candidate collection is still restricted to Digar events inside the current chunk boundaries. This means a boundary-spanning read can contribute evidence to candidates on both sides, while each chunk only creates candidate sites for its own interval. Fuzzy large-insertion deduplication runs **only inside each chunk** (longcallD `collect_all_cand_var_sites`); batch output **concatenates** per-chunk tables without a second contig-wide collapse, so near-boundary fuzzy duplicates across chunks are not merged at the candidate stage (same as longcallD).
+Reads can span chunk boundaries. Because each chunk queries reads overlapping that chunk, a long read may be loaded for two adjacent chunks. Candidate collection is still restricted to Digar events inside the current chunk boundaries. This means a boundary-spanning read can contribute evidence to candidates on both sides, while each chunk only creates candidate sites for its own interval. Fuzzy large-insertion deduplication runs **only inside each chunk** (longcallD `collect_all_cand_var_sites`); batch output does not run a second contig-wide fuzzy collapse, so near-boundary fuzzy duplicates across chunks are not merged by insertion similarity (same as longcallD).
 
 ## 4. Parallel Chunk Processing and Streaming Output
 
-The central orchestrator is `run_collect_bam_variation` (`collect_pipeline.cpp`). It **streams** results to disk so the full merged candidate table for an entire genome need not sit in memory at once. The streaming loop groups chunks by `reg_chunk_i`, runs a thread pool over each group, merges only within the batch, and appends to open output streams—so peak RAM scales with **one contig’s batch** plus worker scratch space, not with every variant on the genome. For readers navigating the code, `collect_pipeline.cpp` / `.hpp` document each step (`load_region_chunks`, `collect_chunk_batch_parallel`, CLI parsing) with Doxygen-style comments.
+The central orchestrator is `run_collect_bam_variation` (`collect_pipeline.cpp`). It **streams** results to disk so the full merged candidate table for an entire genome need not sit in memory at once. The streaming loop groups chunks by `reg_chunk_i`, runs a thread pool over each group, stitches phase state, exact-site merges candidates within the batch, and appends to open output streams—so peak RAM scales with **one contig’s batch** plus worker scratch space, not with every variant on the genome. For readers navigating the code, `collect_pipeline.cpp` / `.hpp` document each step (`load_region_chunks`, `collect_chunk_batch_parallel`, CLI parsing) with Doxygen-style comments.
 
 High-level flow:
 
 ```text
+collect_bam_variation(argc, argv) parses CLI options
+run_collect_bam_variation(opts) starts streaming execution
 load reference index (FAI)
 build sorted RegionChunk list (`annotate_chunk_neighbors`: chunk_id, reg_chunk_i, prev/next overlaps)
-open TSV (and optional VCF / read-support) streams; write headers
+open TSV (and optional VCF / phased VCF / read-support / phase-read / phased alignment) streams; write headers
 for each batch of consecutive chunks sharing the same reg_chunk_i:
     run collect_chunk_batch_parallel (atomic chunk claiming within the batch)
-    merge_chunk_candidates(batch) → concat chunk tables only (fuzzy collapse already per chunk)
-    append write_variants_tsv_records (and optional VCF / read-support rows)
-close streams; print summary counts
+    stitch_chunk_haps(batch.chunks, &opts, sidecar.get())
+    merge_chunk_candidates(batch.chunks) → exact-site merge, active-region-passing duplicate preferred
+    append write_variants_tsv_records (and optional VCF / phased VCF / read-support / phase-read / alignment rows)
+close streams; coordinate-sort refined alignment output if requested; index BAM/CRAM output; print summary counts
 ```
 
-**`reg_chunk_i` batches:** After `annotate_chunk_neighbors`, every chunk on the same reference sequence (contig) shares one `reg_chunk_i`; the batch loop processes **all chunks of one contig** together, concatenates their candidate tables, and appends. If the user supplies multiple disjoint region filters on different chromosomes, chunk order is sorted by contig and start, so each contig’s chunks still form their own batch. Batching is for streaming I/O and ordering; it does **not** re-run fuzzy collapse across chunks (longcallD parity).
+**`reg_chunk_i` batches:** After `annotate_chunk_neighbors`, every chunk on the same reference sequence (contig) shares one `reg_chunk_i`; the batch loop processes **all chunks of one contig** together, stitches phase state, merges exact duplicate candidate keys, and appends. If the user supplies multiple disjoint region filters on different chromosomes, chunk order is sorted by contig and start, so each contig’s chunks still form their own batch. Batching is for streaming I/O and ordering; it does **not** re-run fuzzy collapse across chunks (longcallD parity).
 
-**Workers:** Inside a batch, each worker owns a `WorkerContext`, claims the next chunk index with `fetch_add`, runs `process_chunk` (load reads → noisy prep → candidates → classify), and stores a `BamChunk` in a **fixed offset** so completion order does not scramble indices.
+**Workers:** Inside a batch, each worker owns a `WorkerContext`, claims the next chunk index with `fetch_add`, runs `process_chunk` (load reads → full per-chunk `collect_var_main` workflow: sites, allele counts, noisy prep, classification, noisy post-process/containment/pruning, read profiling, k-means, Step 4 noisy MSA recall), and stores a `BamChunk` in a **fixed offset** so completion order does not scramble indices.
 
-**`collect_chunks_parallel`:** A small helper still exists for “all chunks in one shot” (e.g. tests); the default CLI path uses the streaming loop above.
+**`collect_chunks_parallel`:** A small helper still exists for “all chunks in one shot” (e.g. tests); the default CLI path uses the streaming loop above. It calls `stitch_chunk_haps(..., nullptr)`, so CLI-only `--pgbam-file` sidecar stitching is not active through this helper.
 
 Example (same contig, five chunks, two threads inside one batch):
 
@@ -252,7 +260,9 @@ Workers steal indices until the batch is done:
   worker may process C0, C2, C4 / C1, C3 (order of claiming varies)
 
 Merge for this batch:
-  candidates(C0) ∥ … ∥ candidates(C4) → append to TSV (each Ci already fuzzy-collapsed internally)
+  candidates(C0) ∥ … ∥ candidates(C4)
+      → exact-site merge, active-region-passing duplicate preferred
+      → append to TSV (each Ci already fuzzy-collapsed internally)
 ```
 
 ## 5. Read Loading for a Chunk
@@ -580,7 +590,7 @@ span length of the interval
 
 This label is passed through the interval data structure and is used by the merge routines as interval metadata. Conceptually, it records how large or severe the noisy interval is.
 
-Long terminal clips also create noisy regions. A soft or hard clip of at least `30 bp` at a read end creates a noisy interval extending `100 bp` into the reference from the clip edge.
+Long terminal clips also create noisy regions. A soft or hard clip longer than `30 bp` at a read end creates a noisy interval extending `100 bp` into the reference from the clip edge, matching longcallD's strict `len > LONGCALLD_NOISY_END_CLIP` check.
 
 Example:
 
@@ -594,7 +604,7 @@ Add noisy interval approximately chr11:5000-5100.
 
 This captures places where the read alignment begins or ends abruptly, which may indicate local misalignment, structural variation, or unresolved sequence.
 
-Only terminal clips are used for this long-clip noisy-region rule. Internal clips are not treated the same way here. A left-end clip creates a region starting at the current reference position and extending to the right; a right-end clip creates a region extending leftward into the reference.
+Only terminal clips are used for this long-clip noisy-region rule. Internal clips are not treated the same way here. A left-end clip creates a region starting at the current reference position and extending to the right; a right-end clip creates a region extending leftward into the reference. The C++ `Interval` coordinates are chosen so that the later `intervals_to_cr` conversion lands on the same 0-based `cr_add(..., pos-1, ...)` starts used by longcallD for clipped ends.
 
 ## 9. Chunk Finalization
 
@@ -743,7 +753,7 @@ else:
     no observation
 ```
 
-The matching test uses the same longcallD-compatible comparison used for candidate collapsing. Therefore, a read carrying a large insertion can support a candidate large insertion even if the inserted sequence is not exactly identical, as long as the large-insertion fuzzy comparison considers them equivalent. This is important for long reads, where large inserted alleles may be represented with slightly different lengths or sequences across alignments.
+The matching test uses a longcallD-compatible merge-site comparison equivalent to `update_cand_vars_from_digar`: the depth sweep skips only `Equal` digars, so clips/refskips and other non-equal digars still participate in ordering while candidate rows remain SNP/INS/DEL keys. Therefore, a read carrying a large insertion can support a candidate large insertion even if the inserted sequence is not exactly identical, as long as the large-insertion fuzzy comparison considers them equivalent. This is important for long reads, where large inserted alleles may be represented with slightly different lengths or sequences across alignments.
 
 Reference observations are counted only when the read reaches the candidate position. A read that ends before the site, starts after the site, maps to another contig, or is skipped contributes no observation for that candidate.
 
@@ -921,7 +931,7 @@ Because this support check occurs after low-complexity extension and noisy-regio
 
 ### 12.4 Coordinate Convention Used by Later Noisy MSA (Step 4)
 
-`chunk.noisy_regions` is stored in C++ as 1-based inclusive intervals (`Interval{beg,end}`), but longcallD Step 4 noisy calling starts from `cr_start(...)` (0-based left edge in `cgranges` storage). To preserve line-by-line behavior, the Step 4 entry path converts the stored interval back to longcallD start semantics (`noisy_reg_beg = reg.beg - 1`, `noisy_reg_end = reg.end`) before collecting noisy reads and alignments. This is required to avoid 1 bp anchor drift in noisy no-PS recall.
+`chunk.noisy_regions` is stored in C++ as `Interval{beg,end}` while longcallD Step 4 noisy calling starts from the `cr_start(...)` value held in its `cgranges` interval. For finalized chunk noisy regions, pgPhase preserves that longcallD start value through the dedicated `intervals_from_cr_lcd_chunk_noisy_post_merge` / `intervals_to_cr_lcd_chunk_noisy_post_merge` conversions. Consequently `collect_noisy_vars1` uses `noisy_reg_beg = reg.beg` and `noisy_reg_end = reg.end` on entry. This avoids the 1 bp insertion-anchor drift that appears if the generic `Interval` 1-based conversion is applied a second time after longcallD-style post-processing.
 
 ## 13. Initial Variant Classification
 
@@ -1098,7 +1108,7 @@ category = CLEAN_HET_SNP
 
 Classification also feeds information back into the noisy-region model.
 
-First, in non-ONT mode, including HiFi and short-read mode, if a candidate overlaps a trusted chunk noisy region, it is classified as `NON_VAR`.
+First, if a candidate overlaps a trusted chunk noisy region, it is classified as `NON_VAR`.
 
 Example:
 
@@ -1195,7 +1205,7 @@ Post-processing is performed after candidate classification because final noisy-
 
 ## 16. Final Noisy-Containment Filter
 
-In non-ONT mode, including HiFi and short-read mode, the pipeline performs a final containment sweep. Any candidate contained in a finalized noisy region is marked `NON_VAR`.
+After post-processing noisy regions, the pipeline performs a final containment sweep. Any candidate contained in a finalized noisy region is marked `NON_VAR`.
 
 Example:
 
@@ -1212,35 +1222,18 @@ For insertions, containment is tested over the insertion's anchor interval:
 insertion at pos P is treated as interval [P-1, P)
 ```
 
-This final filter is not applied in ONT mode in the current implementation, matching the ported longcallD behavior for this part of the pipeline.
+This pass follows the ported longcallD containment behavior (`cr_is_contained`) and is applied by the current implementation regardless of read-technology mode.
 
-## 17. Resolving Large Noisy Candidates
+## 17. Reserved Noisy-Resolved Category
 
-After classification, candidates with category `NOISY_CAND_HET`, `NOISY_CAND_HOM`, or `REP_HET_INDEL` can be converted to `NOISY_RESOLVED` if they are large enough:
+`VariantCategory::NoisyResolved` exists in the shared enum and output serializers, but the current `collect-bam-variation` implementation does not run a separate large-event promotion pass that rewrites `NOISY_CAND_HET`, `NOISY_CAND_HOM`, or `REP_HET_INDEL` to `NOISY_RESOLVED`.
 
-```text
-insertion length >= 30
-or deletion length >= 30
-```
-
-Example:
-
-```text
-candidate: chr11:10000 deletion length 45
-category before resolution: REP_HET_INDEL
-
-45 >= 30
-category after resolution: NOISY_RESOLVED
-```
-
-This distinguishes large events that originated from noisy or repeat-associated logic but are large enough to be retained as resolved structural-like candidates.
-
-In the present **digar collect** flow, only `REP_HET_INDEL` is commonly promoted here: longcallD `classify_cand_vars` does not assign `NOISY_CAND_HET` / `NOISY_CAND_HOM` (`e` / `h`) to BAM-sweep candidates (these labels are reserved for MSA-recalled variants inside noisy regions). The initial classifier most often produces `LOW_COV`, `STRAND_BIAS`, `LOW_AF`, `CLEAN_HOM`, `REP_HET_INDEL`, `CLEAN_HET_SNP`, `CLEAN_HET_INDEL`, and `NON_VAR`.
+In the present **digar collect** flow, `REP_HET_INDEL` remains `REP_HET_INDEL` unless later logic explicitly changes it. `NOISY_CAND_HET` / `NOISY_CAND_HOM` (`e` / `h`) are reserved for MSA-recalled variants inside noisy regions. The initial classifier most often produces `LOW_COV`, `STRAND_BIAS`, `LOW_AF`, `CLEAN_HOM`, `REP_HET_INDEL`, `CLEAN_HET_SNP`, `CLEAN_HET_INDEL`, and `NON_VAR`, with `LOW_COV`, `STRAND_BIAS`, and `NON_VAR` pruned before the retained candidate table is emitted.
 
 
 ## 18. Intra-Chunk Phasing and Noisy-Region Recall (Steps 3.1, 3.2, 4)
 
-Per-chunk biology is driven by **`collect_var_main`** (`collect_var.cpp`), which mirrors longcallD’s numbered `collect_var_main`: steps **1.x** (sites and allele counts), **2.x** (noisy prep, `classify_chunk_candidates`, noisy post-process, non-ONT containment), then **3.1–3.2** (read profiles and k-means phasing). The worker entry point is **`process_chunk`** → **`collect_var_main`** (`collect_pipeline.cpp`).
+Per-chunk biology is driven by **`collect_var_main`** (`collect_var.cpp`), which mirrors longcallD’s numbered `collect_var_main`: steps **1.x** (sites and allele counts), **2.x** (noisy prep, `classify_chunk_candidates`, noisy post-process, containment/pruning), then **3.1–3.2** (read profiles and k-means phasing). The worker entry point is **`process_chunk`** → **`collect_var_main`** (`collect_pipeline.cpp`).
 
 Phasing runs **only when** `chunk.candidates` is non-empty after classification (same guard pattern as longcallD: no candidates ⇒ no profile or k-means work).
 
@@ -1280,7 +1273,7 @@ Public entry declared in **`collect_phase.hpp`**. It implements longcallD **`ass
 1. **Phase 1 — pivot sweep:** **`select_init_var`** picks the deepest `CLEAN_HET_SNP`, else `CLEAN_HET_INDEL`, else noisy het SNP/indel (homopolymer indels excluded from noisy-indel pivot). Variants are visited in an outward order from that pivot index within the **valid** (flag-filtered) list. For each variant, overlapping reads with **`haps[read_i] == 0`** get **`init_assign_read_hap`**, then **`update_var_hap_profile_cons_alle`**. Reads that still have no informative score are seeded as hap **1** (longcallD behavior). Hom categories are skipped in this round.
 2. **Phase 2 — up to 10 iterations:** **`iter_update_var_hap_cons_phase_set`** counts spanning-read agreement vs conflict between **adjacent phased het** variants (via `read_var_cr` overlap on global variant indices). Weak linkage (`n_agree < 2` and `n_conflict < 2`) starts a new **phase_set** anchor at **`VariantKey::sort_pos()`** (SNP → `pos`, indel → `pos - 1`, matching longcallD). When conflicts dominate, **`flip`** toggles; the consensus swap uses longcallD’s loop **`for (hap = 1; hap <= LONGCALLD_DEF_PLOID; ++hap)`** swapping `[hap]` with `[3-hap]`—at diploid ploidy **2** this is **two swaps** and leaves **`hap_to_cons_alle[1]`/`[2]`** unchanged (binary parity with released `assign_hap.c`). **`iter_update_var_hap_to_cons_alle`** clears profiles, re-assigns every read in **`ordered_read_ids`** order, rebuilds profiles, and updates consensus; stops early if haps 1–2 consensus is unchanged.
 3. **Phase 3:** **`update_read_phase_set`** sets each read’s **`phase_sets[read_i]`** from the first phased het variant in profile order.
-4. **Phase 4:** Fill **`hap_alt` / `hap_ref`** on every candidate from finalized **`hap_to_cons_alle`**. For ALT/REF polarization, non-zero consensus allele indices are treated as ALT (`c != 0`), matching longcallD output projection behavior for multi-allelic contexts.
+4. **Phase 4:** Fill **`hap_alt` / `hap_ref`** on every candidate from finalized **`hap_to_cons_alle`**. These fields are reset before projection, matching longcallD `make_variants` local-variable behavior rather than accumulating stale values from an earlier pass. For ALT/REF polarization, non-zero consensus allele indices are treated as ALT (`c != 0`), matching longcallD output projection behavior for multi-allelic contexts.
 
 **ONT:** Homopolymer indels use the **67%** read-support guard when updating consensus alleles, as in longcallD **`update_var_hap_to_cons_alle`**.
 
@@ -1306,6 +1299,7 @@ Implementation details aligned to longcallD:
 - **One-consensus handling parity:** single-consensus outputs treat the cluster/read-row mapping as in longcallD wrappers.
 - **Boundary parity helpers:** partial-alignment trimming uses the ported longcallD `edlib_xgaps` + WFA boundary functions.
 - **Homopolymer veto parity:** insertion homopolymer checks use the longcallD anchor behavior (`ref_pos-1`).
+- **Allele-match threshold parity:** `is_match_aln_str` compares `n_eq >= len * cons_sim_thres` as floating-point arithmetic, matching longcallD and avoiding integer truncation at noisy insertion alleles.
 
 ### 18.1 Mid-Free: Releasing Intermediates After K-means (`mid_free_chunk`)
 
@@ -1366,22 +1360,22 @@ track max_pre_ps = max over matched reads of pre.phase_sets[pre_read_i]
 track min_cur_ps = min over matched reads of cur.phase_sets[cur_read_i]
 ```
 
-If `flip_score == 0` (tied or no informative boundary reads), stop.
+If `flip_score == 0` (tied or no informative boundary reads), the longcallD common-read path has no decisive signal. `flip_chunk_hap` returns `false`; when `--pgbam-file` is active, `stitch_chunk_haps` then tries the `.pgbam` adjacent-chunk fallback (§19.7). Without a sidecar, the boundary is left unchanged. Other early exits also return `false` before scoring, including no boundary-overlap reads, different contigs, or either chunk having no candidates.
 
-**Step 4 — apply flip and phase-set merge.**
-`do_flip = (flip_score > 0)` (majority of boundary reads were inconsistent).
+**Step 4 — apply flip/no-flip orientation and phase-set merge.**
+If `flip_score < 0`, the common-read path still stitches the boundary with `do_flip = false` and merges the current anchor into the previous anchor. If `flip_score > 0`, it stitches with `do_flip = true`. Only `flip_score == 0` skips `apply_chunk_flip_and_merge`.
 
 For every `CandidateVariant v` in `cur`:
 - If `do_flip` and `v.phase_set == min_cur_ps`: swap `hap_to_cons_alle[1] ↔ [2]`.
 - If `v.phase_set == min_cur_ps` and both anchors are valid: rewrite `v.phase_set = max_pre_ps`.
 
-`apply_chunk_flip_and_merge` (extracted helper) applies both parts: if `do_flip`, it swaps `hap_to_cons_alle[1] ↔ [2]` and flips read `haps` (`3 - hap`) for all reads whose `phase_sets` entry equals `min_cur_ps`; then, if both anchors are valid, it rewrites candidate and read `phase_sets` from `min_cur_ps` to `max_pre_ps`. Both candidate-level and read-level phase state are updated. Projected phased VCF output derives GT orientation from `hap_to_cons_alle`.
+`apply_chunk_flip_and_merge` (extracted helper) applies both parts: if `do_flip`, it swaps `hap_to_cons_alle[1] ↔ [2]`; when phased alignment output is requested it also flips read `haps` (`3 - hap`) for reads whose `phase_sets` entry equals `min_cur_ps`. If both anchors are valid, it rewrites candidate `phase_set` from `min_cur_ps` to `max_pre_ps` and, when phased alignment output is requested, rewrites matching read `phase_sets` too. Projected phased VCF output derives GT orientation directly from `hap_to_cons_alle`.
 
 **`stitch_chunk_haps`** iterates pairs `(chunks[0], chunks[1])`, `(chunks[1], chunks[2])`, … left to right, calling `flip_chunk_hap` for each.
 
 ### 19.2 Phase-Set Anchor Semantics
 
-`min_cur_ps` is the earliest phase-set anchor among boundary-spanning reads in the current chunk; `max_pre_ps` is the latest anchor among the matching reads in the previous chunk. After stitching, all variants and reads that carried `min_cur_ps` now carry `max_pre_ps`, effectively **extending the previous chunk’s phase block** into the current one and merging them into a single continuous block.
+`min_cur_ps` is the earliest phase-set anchor among boundary-spanning reads in the current chunk; `max_pre_ps` is the latest anchor among the matching reads in the previous chunk. After common-read stitching, all variants that carried `min_cur_ps` carry `max_pre_ps`, effectively **extending the previous chunk’s phase block** into the current one and merging them into a single continuous block. Reads are rewritten by the common-read path only when phased alignment output is requested; `.pgbam` merges always rewrite the matching read hap/phase-set state because later sidecar comparisons depend on live read phase blocks.
 
 ### 19.3 Worked Example — No Flip Needed
 
@@ -1396,8 +1390,9 @@ flip_score = -1 - 1 = -2   (both consistent)
 do_flip = false
 max_pre_ps = 450000,  min_cur_ps = 500000
 
-C1 variants/reads with ps=500000: phase_set rewritten to 450000.
-C1 candidates: hap_to_cons_alle unchanged; hap_alt/hap_ref unchanged.
+C1 variants with ps=500000: phase_set rewritten to 450000.
+C1 reads with ps=500000: phase_set rewritten when phased alignment output is active.
+C1 candidates: hap_to_cons_alle unchanged.
 Result: C0 and C1 share one phase block anchored at 450000.
 ```
 
@@ -1417,8 +1412,9 @@ max_pre_ps = 450000,  min_cur_ps = 500000
 
 C1 variants with ps=500000:
   hap_to_cons_alle[1] ↔ [2] swapped
-  hap_alt: 1→2, 2→1;  hap_ref: 1→2, 2→1
   phase_set: 500000 → 450000
+C1 reads with ps=500000:
+  hap: 1↔2 and phase_set rewritten when phased alignment output is active
 
 Result: C1 labels are coherent with C0; both in one phase block anchored at 450000.
 ```
@@ -1446,8 +1442,8 @@ while batch_begin < chunks.size():
     batch_end = first index where reg_chunk_i changes   ← one contig
     batch = collect_chunk_batch_parallel(batch_begin, batch_end)   ← PARALLEL
     stitch_chunk_haps(batch.chunks, &opts, sidecar.get())          ← SEQUENTIAL
-    merge_chunk_candidates(batch)                                   ← concat
-    write output (TSV / VCF / read-support / phased BAM)
+    merge_chunk_candidates(batch.chunks)                            ← exact-site merge, active-region preference
+    write output (TSV / VCF / phased VCF / read-support / phase-read / phased alignment)
     batch_begin = batch_end
 ```
 
@@ -1459,21 +1455,23 @@ Each contig is fully processed and written before the next contig begins. The to
 
 #### Sequential stitch (single thread, left to right)
 
-After all workers join, `stitch_chunk_haps` runs on the main thread. It performs two left-to-right passes over the batch:
+After all workers join, `stitch_chunk_haps` runs on the main thread. Without `--pgbam-file`, it performs only the longcallD common-read adjacent-chunk sweep. With `--pgbam-file`, it first runs a `.pgbam` within-chunk phase-block merge and then runs the adjacent-chunk sweep with `.pgbam` fallback enabled:
 
 ```text
 pass 1 — within-chunk:
     for each chunk in left-to-right order:
-        stitch_phase_blocks_within_chunk(chunk, sidecar)  ← §19.7
+        stitch_phase_blocks_with_pgbam(chunk, sidecar)  ← only when --pgbam-file is set
 
 pass 2 — cross-chunk:
     for each adjacent pair (chunk[i-1], chunk[i]):
-        flip_chunk_hap(chunk[i-1], chunk[i], opts, sidecar)  ← §19.5 / §19.8
+        flip_chunk_hap(chunk[i-1], chunk[i], opts)      ← longcallD common-read path
+        if common-read path returns false and pgbam is active:
+            stitch_adjacent_chunks_with_pgbam(chunk[i-1], chunk[i], sidecar)
 ```
 
 Within-chunk stitching runs first so that by the time the cross-chunk pass reaches a boundary, each chunk already has its internal phase blocks oriented consistently. The cross-chunk pass then draws thread signal from the full merged read population of the boundary-adjacent phase block rather than from a single small block.
 
-For the pgbam path, "full merged read population" is represented by live hap-thread state, not by carrying forward old pairwise vote totals. When phase blocks A and B merge, the implementation unions B's oriented hap-thread sets into A's cached state. The next comparison, AB versus C, recomputes a fresh 2x2 concordance matrix from AB's current hap-thread evidence and C's hap-thread evidence. The previous A-versus-B score is deliberately discarded because it answered a different question and would bias the next boundary.
+For the pgbam path, "full merged read population" is represented by live hap-thread state, not by carrying forward old pairwise vote totals. When phase blocks A and B merge, the implementation unions B's oriented hap-thread sets into A's cached state. The next comparison, AB versus C, recomputes a fresh 2x2 concordance matrix from AB's current hap-thread evidence and C's hap-thread evidence. The previous A-versus-B score is deliberately discarded because it answered a different question and would bias the next boundary. This sidecar-specific logic lives in `collect_phase_pgbam.cpp`; `collect_phase.cpp` only decides when to invoke it.
 
 #### Why stitching must be sequential
 
@@ -1485,9 +1483,9 @@ This matches longcallD's `stitch_var_main`, which is also a sequential left-to-r
 
 Stitching holds every `BamChunk` of the contig in memory simultaneously. `mid_free_chunk` (called inside each parallel worker, §18.1) releases the heavy per-chunk intermediates — read variant profiles, noisy region interval trees, candidate depth tallies — beforehand, keeping only what stitching and output require: `reads[].alignment` (needed by `bam_aux_get("hs")` in the pgbam path and by phased-BAM output), `haps[]`, `phase_sets[]`, and `candidates[]`.
 
-### 19.7 pgbam Fallback Stitching
+### 19.7 pgbam Phase-Block Stitching
 
-When common-read scoring yields `flip_score == 0` (no boundary-spanning reads with haplotype signal) and a pgbam sidecar is loaded, `flip_chunk_hap` attempts a **pangenome-graph thread intersection** to resolve orientation. This is the "pgbam fallback" path.
+When a pgbam sidecar is loaded, `stitch_chunk_haps` invokes the sidecar module in two places. First, it runs `stitch_phase_blocks_with_pgbam` inside each chunk to merge local phase blocks that share graph-thread evidence. Second, if `flip_chunk_hap(pre, cur, opts)` returns `false`, it calls `stitch_adjacent_chunks_with_pgbam` as a **pangenome-graph thread intersection** fallback.
 
 #### Why common-read stitching can fail
 
@@ -1497,7 +1495,7 @@ The common-read path requires at least one read that is phased in both the previ
 - **Assembly or reference gaps.** Hard-masked or absent reference sequence creates coverage voids that reads cannot span.
 - **Extreme coverage drops.** Even without a structural event, low-coverage regions can leave a boundary with zero spanning reads by chance.
 
-In all these cases `flip_score == 0` not because the chunks are in phase but because the evidence channel is simply absent. The correct response is to use a different evidence channel rather than leave orientation unresolved.
+In zero-overlap or uninformative-overlap cases, the chunks are not known to be in phase; the common-read evidence channel is absent or inconclusive. The sidecar path supplies a different evidence channel rather than leaving orientation unresolved when graph-thread support is decisive.
 
 #### Why pangenome-graph threads provide orientation evidence
 
@@ -1511,25 +1509,25 @@ This provides **orientation evidence across gaps** that the common-read path can
 
 | Property | Design decision | Benefit |
 |---|---|---|
-| Fallback-only | pgbam path runs only when `flip_score == 0` | Common-read evidence always takes precedence; pgbam cannot override an existing vote |
+| Common-read precedence | adjacent-chunk pgbam stitching runs only when `flip_chunk_hap` returns false | Non-zero common-read evidence always takes precedence across chunk boundaries; pgbam cannot override an existing boundary vote |
 | Unweighted intersection | Support = raw thread-ID intersection count, not coverage-weighted | Thread IDs are already haplotype-resolved; weighting by coverage would conflate depth with haplotype identity |
 | 2x2 hap concordance | Adjacent blocks are compared as hap1/hap2 thread-set intersections (`s11`, `s12`, `s21`, `s22`) | The signal is block-local orientation evidence, not accumulated historical vote totals |
 | Hap-unique support | Threads present on both hap sides within the same block are removed before scoring | Ambiguous graph threads do not make a block look artificially concordant with both orientations |
 | Live merged state | A successful within-chunk merge carries forward oriented hap-thread sets, not old pairwise scores | Large merged blocks contribute their accumulated hap identity without letting previous merge decisions inflate later scores |
 | Read-thread cache | Within-chunk stitching resolves each read's `hs` tag once before the sweep | Many small short-read phase blocks do not repeatedly parse the same BAM aux tags |
 | Cached hap-unique sets | `hap_unique_threads[1/2]` are stored in `PhaseBlockThreadState` and refreshed only on state creation/merge | Comparisons against a large merged block do not repeatedly recompute `hap1 - hap2` and `hap2 - hap1` |
-| Temporary stitch memory | Cached read-thread and phase-block states live only inside `stitch_phase_blocks_within_chunk` | RAM increases during the within-chunk pgbam sweep, but the cache is released before moving to the next chunk |
+| Temporary stitch memory | Cached read-thread and phase-block states live only inside `stitch_phase_blocks_with_pgbam` | RAM increases during the within-chunk pgbam sweep, but the cache is released before moving to the next chunk |
 | Min winner support ≥ 2 | Orientation call requires the winning side to have at least 2 shared hap-unique threads | Screens out single-thread noise without coverage-weighting by read depth |
 | Graceful degradation | Tied score or fewer than 2 winner intersections → return false, boundary left unstitched | No worse than baseline; incorrect orientation is actively avoided |
 | Read-skip on unresolved `hs` | Reads with no `hs` tag or unmapped set IDs are skipped, not counted | Partial sidecar coverage is tolerated; only positively resolved reads contribute signal |
 
 #### Algorithm
 
-**Entry condition.** The pgbam path is reached in three cases: (a) `n_cur_ovlp_reads == 0` — there are no boundary-spanning reads at all (the primary use case); (b) `n_cur_ovlp_reads > 0` but all overlap reads are unphased (`hap == 0`) or skipped, so `flip_score` is never updated from zero; or (c) `n_cur_ovlp_reads > 0` and the reads are phased but their votes cancel exactly (equal numbers agree and disagree). In all three cases the common-read path provides no orientation signal. The common-read computation is gated on `n_cur_ovlp_reads > 0` so that zero-overlap boundaries skip straight to the pgbam check without triggering the overlap-count mismatch guard.
+**Adjacent-chunk entry condition.** The adjacent-chunk pgbam fallback is reached whenever `flip_chunk_hap(pre, cur, opts)` returns `false`. That includes: different contigs, no boundary-spanning reads, either chunk having no candidates, all overlap reads being skipped or unphased, or phased overlap reads voting to an exact tie (`flip_score == 0`). In all these cases the common-read path did not apply a boundary stitch.
 
 **Anchor computation (fallback).** Because boundary-spanning reads are absent or uninformative, `max_pre_ps` and `min_cur_ps` are recomputed from all phased reads in each chunk rather than from the overlap lists: `max_pre_ps` = largest `phase_sets` value among non-skipped, hap-assigned reads in `pre`; `min_cur_ps` = smallest such value in `cur`. If either chunk has no phased reads, the fallback returns false.
 
-**Within-chunk anchors.** `stitch_phase_blocks_within_chunk` first collects all non-negative `phase_sets` from hap-assigned, non-skipped reads, sorts them by anchor position, deduplicates them, and sweeps the resulting anchor list left to right. The anchor list is fixed, but entries are rewritten after successful merges (`psets[i] = left_ps`) so the next iteration uses the surviving merged identity.
+**Within-chunk anchors.** `stitch_phase_blocks_with_pgbam` first collects all non-negative `phase_sets` from hap-assigned, non-skipped reads, sorts them by anchor position, deduplicates them, and sweeps the resulting anchor list left to right. The anchor list is fixed, but entries are rewritten after successful merges (`psets[i] = left_ps`) so the next iteration uses the surviving merged identity.
 
 **Read-thread cache.** Within a chunk, `build_read_thread_cache` resolves each read's `hs` tag once:
 
@@ -1545,7 +1543,7 @@ The read-thread cache is temporary. It is allocated inside the within-chunk stit
 
 1. `extract_hs_set_ids` parses the BAM `hs` auxiliary array tag (type `B`, subtypes `I`/`i` 4-byte, `S`/`s` 2-byte, `C`/`c` 1-byte) and returns a `uint32_t` vector of set IDs.
 2. Each set ID is looked up in `PgbamSidecarData::set_to_threads`. All resolved thread IDs are appended to a `std::vector<uint64_t>` for that group.
-3. Reads with no `hs` tag, an empty tag, or set IDs absent from the sidecar are skipped. The function returns `true` only if at least one read contributed threads.
+3. Reads with no `hs` tag, an empty tag, or set IDs absent from the sidecar are skipped. If no reads contribute, the resulting thread vector stays empty and the later concordance scorer naturally lacks support for that hap/block side.
 4. After all reads are scanned the vector is sorted and deduplicated (`std::sort` + `std::unique`) so that `intersection_size` can use a linear merge.
 
 **Phase block state.** Each block carries a compact live state:
@@ -1590,9 +1588,9 @@ score_nonflip = s11 + s22
 score_flip    = s12 + s21
 ```
 
-Within a chunk, `stitch_phase_blocks_within_chunk` caches each read's resolved thread IDs once, builds one `PhaseBlockThreadState` per starting phase-set anchor, and then sweeps anchors left to right. On a successful merge, the right block's state is first oriented according to the flip decision and then unioned into the left block's hap-thread state. The next comparison therefore uses all hap-thread evidence from the merged phase block, while old pairwise scores are discarded.
+Within a chunk, `stitch_phase_blocks_with_pgbam` caches each read's resolved thread IDs once, builds one `PhaseBlockThreadState` per starting phase-set anchor, and then sweeps anchors left to right. On a successful merge, the right block's state is first oriented according to the flip decision and then unioned into the left block's hap-thread state. The next comparison therefore uses all hap-thread evidence from the merged phase block, while old pairwise scores are discarded.
 
-**Merge-state update.** The cached state update mirrors the real read/candidate update performed by `apply_chunk_flip_and_merge`:
+**Merge-state update.** The cached state update mirrors the real read/candidate update performed by the pgbam-sidecar merge helper:
 
 ```text
 if do_flip:
@@ -1622,9 +1620,9 @@ else                                    → do_flip = false
 
 The minimum winner support of 2 is the only threshold. A single shared hap-unique thread with no opposition could be noise; two or more shared hap-unique threads with fewer opposing intersections constitute a call.
 
-**Apply.** `apply_chunk_flip_and_merge` is called with the fallback-derived `do_flip`, `max_pre_ps`, and `min_cur_ps` — identical to the common-read path from that point on.
+**Apply.** The pgbam path applies the fallback-derived `do_flip`, `max_pre_ps`, and `min_cur_ps` through `apply_pgbam_phase_merge`, which flips and/or renames both candidate phase state and read hap/phase-set state.
 
-**Within-chunk application.** For within-chunk stitching, `apply_chunk_flip_and_merge(chunk, do_flip, left_ps, right_ps)` flips and/or renames only reads and candidates currently carrying the right block's anchor. After that mutation, the cached state at the current sweep position is replaced with the merged AB state and `psets[i]` is rewritten to `left_ps`. If a later block C merges, `left_ps` is already the surviving anchor and the cached left state already contains A and B.
+**Within-chunk application.** For within-chunk stitching, `apply_pgbam_phase_merge(chunk, do_flip, left_ps, right_ps)` flips and/or renames only reads and candidates currently carrying the right block's anchor. After that mutation, the cached state at the current sweep position is replaced with the merged AB state and `psets[i]` is rewritten to `left_ps`. If a later block C merges, `left_ps` is already the surviving anchor and the cached left state already contains A and B.
 
 **Cross-chunk application.** For cross-chunk fallback, the same `decide_phase_block_concordance` scorer is used, but the state is collected on demand for the boundary-adjacent phase blocks: `max_pre_ps` in the previous chunk and `min_cur_ps` in the current chunk. Cross-chunk stitching still mutates only the current chunk, rewriting `min_cur_ps` to `max_pre_ps` and optionally flipping its haps.
 
@@ -1663,7 +1661,9 @@ Duplicate `set_id` values within one file are rejected with `std::runtime_error`
 
 ## 20. Merging Candidate Tables Across Chunks
 
-Each chunk produces a candidate table with **`collapse_fuzzy_large_insertions` already applied inside that chunk** (same as longcallD `collect_all_cand_var_sites`). For each **`reg_chunk_i` batch** (see §4), the pipeline **concatenates** those tables in chunk order and appends rows to the TSV (and optional VCF / read-support) streams. There is **no** second `collapse_fuzzy_large_insertions` on the concatenated list, matching longcallD (candidate-site deduplication is per BAM/region chunk only; chunk-boundary stitching (§19) does not merge candidate sites).
+Each chunk produces a candidate table with **`collapse_fuzzy_large_insertions` already applied inside that chunk** (same as longcallD `collect_all_cand_var_sites`). For each **`reg_chunk_i` batch** (see §4), the pipeline walks chunk tables in order and performs only an **exact-key** merge for duplicate `VariantKey` rows. There is **no** second `collapse_fuzzy_large_insertions` on the concatenated list, matching longcallD (candidate-site deduplication is per BAM/region chunk only; chunk-boundary stitching (§19) does not fuzzy-merge candidate sites).
+
+When exact duplicate keys collide across chunks, the row whose `lcd_make_variants_region_pass` flag is true is preferred. This mirrors the active-region selection effect of longcallD `make_variants`: a duplicate from a neighboring chunk should not replace the candidate that belongs to the current active region. If both rows have the same pass state, the earlier row remains the winner and the pass flag is OR-ed.
 
 Example:
 
@@ -1672,8 +1672,8 @@ chunk 1: chr11:1-500000
 chunk 2: chr11:500001-1000000
 
 If two fuzzy-equivalent large insertion rows appeared in different chunks (unusual but possible
-near boundaries), they remain separate rows in the output, as they would in longcallD’s
-per-chunk candidate lists.
+near boundaries), they remain separate rows unless their complete `VariantKey` values are identical.
+Exact duplicates collapse to one row, with active-region-passing rows preferred.
 ```
 
 ## 21. TSV Output
@@ -1702,7 +1702,7 @@ HAP_ALT
 HAP_REF
 ```
 
-- **`CATEGORY`**: final label after the full longcallD-shaped classify pass (noisy overlap, `LOW_AF`→`LOW_COV` rewrite, post-process, containment filter where applicable). Use this for phasing filters and for VCF projection eligibility (`--vcf-output` / `--phased-vcf-output`) plus `INFO.CAT`.
+- **`CATEGORY`**: final label after the full longcallD-shaped classify pass, post-process, containment filter, and not-candidate pruning. Use this for phasing filters and for VCF projection eligibility (`--vcf-output` / `--phased-vcf-output`) plus `INFO.CAT`.
 - **`INIT_CAT`**: first-pass `classify_var_cate` only (matches longcallD’s first `CandVarCate-` block before `After classify var:`). Use for parity checks against `longcallD -V 2` stderr (`scripts/compare_candidates.py --category-stage initial`).
 
 Example row:
@@ -1718,7 +1718,7 @@ The row is still a **candidate** table, not a full diploid VCF genotype: these c
 
 For deletions, the reference allele is fetched from the FASTA. For insertions, the TSV uses `REF = "."` and stores the inserted sequence in `ALT`.
 
-The TSV writer emits every candidate present in the final candidate table, including filtered categories such as `LOW_COV`, `STRAND_BIAS`, and `NON_VAR`. The **`CATEGORY`** column is therefore essential for downstream phasing: choose which categories are usable rather than assuming every TSV row is clean.
+Before TSV emission, the pipeline prunes longcallD not-candidate categories: `LOW_COV`, `STRAND_BIAS`, and `NON_VAR`. The TSV writer then emits every row remaining in the final candidate table. The **`CATEGORY`** column is still essential for downstream phasing because retained rows can include non-clean categories such as `LOW_AF`, `REP_HET_INDEL`, `NOISY_CAND_HET`, or `NOISY_CAND_HOM`; `NOISY_RESOLVED` is reserved but not currently assigned by the collect path.
 
 Typical phase-informative categories are:
 
@@ -1731,10 +1731,10 @@ Potentially useful but not heterozygous-marker categories include:
 
 ```text
 CLEAN_HOM
-NOISY_RESOLVED
+REP_HET_INDEL
 ```
 
-Categories such as `LOW_COV`, `STRAND_BIAS`, and `NON_VAR` are generally excluded from ordinary germline phasing markers.
+Categories such as `REP_HET_INDEL`, `LOW_AF`, `NOISY_CAND_HET`, `NOISY_CAND_HOM`, and the currently reserved `NOISY_RESOLVED` require category-aware handling and are generally excluded from ordinary clean germline phasing markers unless a downstream model explicitly wants them.
 
 ## 22. Optional VCF Output
 
@@ -1774,8 +1774,7 @@ VCF:
   ALT = C
 ```
 
-Only projected germline/noisy-call categories are emitted to VCF. Rows that remain candidate-only
-(`LOW_COV`, `LOW_AF`, `STRAND_BIAS`, `NON_VAR`) stay visible in TSV but are omitted from VCF.
+Only projected germline/noisy-call categories are emitted to VCF: `CLEAN_HET_SNP`, `CLEAN_HET_INDEL`, `CLEAN_HOM`, `NOISY_CAND_HET`, and `NOISY_CAND_HOM`. Retained candidate-only rows such as `LOW_AF` or `REP_HET_INDEL` stay visible in TSV but are omitted from VCF. `LOW_COV`, `STRAND_BIAS`, and `NON_VAR` are pruned before TSV/VCF emission.
 
 There is no extra left-normalization/rotation layer beyond the longcallD-equivalent representation logic above; this is intentional for parity with longcallD writer behavior.
 
@@ -1789,7 +1788,21 @@ NoCall  reserved for depth=0 calls (typically omitted by projection)
 ```
 
 `--vcf-output` remains site-level (no FORMAT/sample columns), but emitted sites now follow final-call
-projection gates (category + depth/alt-depth) for longcallD parity.
+projection gates for longcallD parity:
+
+```text
+category in {CLEAN_HET_SNP, CLEAN_HET_INDEL, CLEAN_HOM, NOISY_CAND_HET, NOISY_CAND_HOM}
+total_cov >= min_depth
+alt_cov >= min_alt_depth
+ALT-bearing genotype after hap-consensus projection
+lcd_make_variants_region_pass == true
+valid INS/DEL alt_ref_base anchor
+no ambiguous REF/ALT bases unless --amb-base is set
+```
+
+The VCF depth gate follows longcallD `write_var_to_vcf`: `DP` is `CandidateVariant::counts.total_cov`, and the row is skipped when `total_cov < min_depth` or `alt_cov < min_alt_depth`. `low_qual_cov` remains visible in `INFO.LQC` and participates in `LOW_COV` classification through `total_cov + low_qual_cov`, but it is **not** added to `DP` for VCF emission.
+
+For noisy-region indels, `alt_ref_base` follows longcallD `make_variants`: when it is not `4`, that raw consensus anchor is used for the first ALT byte. Values outside A/C/G/T are rejected before writing, matching longcallD's `write_var_to_vcf` invalid-alt-base behavior.
 
 The `INFO` field includes:
 
@@ -1819,11 +1832,11 @@ in files like `pgphase_phased.vcf`.
 1|0   hap1 = ALT, hap2 = REF  (phased, hap_alt=1, hap_ref=2)
 0|1   hap1 = REF, hap2 = ALT  (phased, hap_alt=2, hap_ref=1)
 1|1   homozygous ALT on both   (hap_alt=3)
-0/0   homozygous REF           (not emitted by projected phased VCF)
-./.   unresolved by k-means    (not emitted by projected phased VCF)
+0/0   homozygous REF           (generic writer branch; projected output filters these rows)
+./.   unresolved by k-means    (generic writer branch; projected output filters these rows)
 ```
 
-The pipe `|` separator signals a phased genotype; the slash `/` separator signals an unphased one. This follows the VCF 4.2 specification.
+The pipe `|` separator signals a phased genotype; the slash `/` separator signals an unphased one. This follows the VCF 4.2 specification. In projected output, rows are filtered to ALT-bearing calls before writing, so the `0/0` and `./.` branches are retained as generic writer safety paths rather than expected emitted records.
 
 **PS** (Phase Set) is the anchor coordinate of the phase block. It is set to the `PHASE_SET` value from the k-means output — the `sort_pos()` of the first variant in the block (see §21). It is written as `.` for unphased calls (`0/0` and `./.`). Two records sharing the same `(CHROM, PS)` value were phased together in one k-means run; a change in PS on the same chromosome marks a phase-set break caused by insufficient spanning reads between adjacent het variants.
 
@@ -1869,9 +1882,33 @@ This indicates that `read_42` supports the alternate allele `G` at `chr11:1000`;
 
 For phasing, this file is valuable because it converts the candidate set into read-by-site allele observations.
 
-The read-support output uses the same candidate table as the TSV. Consequently, it can include observations for candidates that are later classified as filtered categories. A phasing stage combines read-support rows with the candidate category table and selects categories appropriate for the intended phasing model.
+The read-support output is collected during the allele-counting pass, before final classification pruning. Consequently, it can include observations for sites that are later classified as `LOW_COV`, `STRAND_BIAS`, or `NON_VAR` and therefore do not appear in the final TSV. A downstream consumer should treat this file as an observation log and join against the final TSV when it needs the retained candidate set.
 
-## 23.1 Optional Phased Alignment Output (SAM/BAM/CRAM)
+### 23.1 Optional Phase-Read TSV Output (`--phase-read-tsv`)
+
+If `--phase-read-tsv FILE` is provided, the command writes one row per loaded read after per-contig stitching:
+
+```text
+CHUNK_ID
+REG_CHUNK_I
+CHROM
+CHUNK_BEG
+CHUNK_END
+QNAME
+READ_CHROM
+INPUT_IDX
+READ_BEG
+READ_END
+MAPQ
+REVERSE
+SKIPPED
+HAP
+PHASE_SET
+```
+
+This is a debugging view of `chunk.haps` and `chunk.phase_sets`, not the final candidate table. A subtle implementation detail matters: the common-read stitch path rewrites read-level hap/phase-set arrays only when phased alignment output (`-S`, `-b`, or `-C`) is requested, mirroring longcallD's output-alignment update path. Candidate phase state is still stitched for VCF/TSV projection. `.pgbam` merges always rewrite matching read state because later sidecar stitching relies on live read phase blocks. Therefore, without phased alignment output or `.pgbam` read merges, `--phase-read-tsv` can show per-read boundary state that lags the merged candidate phase-set state at common-read-stitched boundaries.
+
+## 23.2 Optional Phased Alignment Output (SAM/BAM/CRAM)
 
 If `-S`, `-b`, or `-C` is provided, `collect-bam-variation` emits a phased alignment stream with
 `HP`/`PS` tags, following longcallD `write_read_to_bam` behavior. This output can be emitted in:
@@ -1884,7 +1921,7 @@ If `-S`, `-b`, or `-C` is provided, `collect-bam-variation` emits a phased align
 
 `--refine-aln` enables longcallD-style alignment refinement before writing phased reads.
 
-### 23.1.1 CLI and mode semantics
+### 23.2.1 CLI and mode semantics
 
 Implementation surface:
 
@@ -1902,7 +1939,7 @@ Mode selection is **flag-driven**, not filename-extension-driven:
 
 This matches longcallD's output-open behavior (`hts_open` mode selected by CLI option).
 
-### 23.1.2 Writer construction and header behavior
+### 23.2.2 Writer construction and header behavior
 
 The writer lives in `collect_bam_output.cpp` (`PhasedAlignmentWriter`).
 
@@ -1921,7 +1958,7 @@ On construction:
 Failure handling is longcallD-style fatal behavior in this path (error message + immediate terminate),
 not deferred exception recovery.
 
-### 23.1.3 Read iteration and overlap-skipping model
+### 23.2.3 Read iteration and overlap-skipping model
 
 For each processed chunk, the writer re-iterates input BAM records over that chunk interval:
 
@@ -1947,7 +1984,7 @@ unprocessed if:
 
 Unprocessed records are still written (after overlap-skip), but `HP`/`PS` are stripped.
 
-### 23.1.4 HP/PS tagging rules
+### 23.2.4 HP/PS tagging rules
 
 For processed records:
 
@@ -1962,7 +1999,7 @@ Tag type and append semantics match longcallD (`'i'`, 4-byte payload).
 If tag exists and value is unchanged, it is left untouched; if value differs, old tag is removed and
 new value appended.
 
-### 23.1.5 `--refine-aln` behavior
+### 23.2.5 `--refine-aln` behavior
 
 When `--refine-aln` is enabled, processed reads run through `refine_bam1` before tag write:
 
@@ -1988,7 +2025,7 @@ matching longcallD update_bam1_tags behavior.
 So this path does not synthesize missing `MD`/`cs`; it updates existing tags when refined alignment
 changes them.
 
-### 23.1.6 Post-MSA digar rewrite (critical for refine parity)
+### 23.2.6 Post-MSA digar rewrite (critical for refine parity)
 
 A strict parity-critical step occurs before final BAM refinement in noisy regions:
 
@@ -2008,7 +2045,7 @@ n_cons > 0 && opts.refine_aln && !opts.output_aln.empty()
 Without this rewrite, refine output can still be close, but CIGAR/NM parity diverges at noisy loci.
 With it enabled, refined BAM parity aligns with longcallD for the tested fixtures.
 
-### 23.1.7 Worked behavior example
+### 23.2.7 Worked behavior example
 
 Example command:
 
@@ -2033,7 +2070,7 @@ strip HP/PS
 write original alignment payload unchanged
 ```
 
-### 23.1.8 Validation and parity status
+### 23.2.8 Validation and parity status
 
 On the repository parity dataset (`test_data/HG002_chr11_hifi_test.bam`,
 `chr11:1255000-1260000`), after the strict parity ports in this path:
@@ -2045,7 +2082,7 @@ refined phased BAM : pgphase == longcallD (0 diff lines)
 
 The zero-diff check is done on sorted SAM views of emitted BAMs, ensuring record-order neutrality.
 
-### 23.1.9 Output alignment indexing (`.bai` / `.crai`)
+### 23.2.9 Output alignment indexing (`.bai` / `.crai`)
 
 After phased alignment writing completes, pgPhase now auto-indexes binary alignment outputs:
 
@@ -2114,7 +2151,7 @@ supplementary-alignment stitching
 split-read structural-variant reconstruction
 ```
 
-These boundaries matter for interpretation. A `NON_VAR` or `LOW_COV` candidate in the TSV is not a final biological assertion that no event exists at the locus. It means the collector did not consider that candidate reliable enough under its evidence and classification rules. **`PHASE_SET` / `HAP_*`** summarize the in-pipeline phasing state from §18 (including noisy-region MSA integration) plus boundary stitching from §19; they are not genotype-likelihood inference or somatic calling.
+These boundaries matter for interpretation. `NON_VAR`, `LOW_COV`, and `STRAND_BIAS` are internal classifications that cause a site to be pruned from the final candidate TSV; they are not final biological assertions that no event exists at the locus. **`PHASE_SET` / `HAP_*`** summarize the in-pipeline phasing state from §18 (including noisy-region MSA integration) plus boundary stitching from §19; they are not genotype-likelihood inference or somatic calling.
 
 ## 26. Summary of the Complete Pipeline
 
@@ -2123,11 +2160,12 @@ from CLI entry to final outputs.
 
 ### 26.1 Entry, Option Parsing, and Technology Mode
 
-**Code path:** `main.cpp` -> `collect_pipeline.cpp::collect_bam_variation` -> `collect_types.hpp::Options`.
+**Code path:** `main.cpp` -> `collect_pipeline.cpp::collect_bam_variation` -> `collect_pipeline.cpp::run_collect_bam_variation` -> `collect_types.hpp::Options`.
 
 1. `main.cpp` dispatches `collect-bam-variation` to `collect_bam_variation(...)` in `collect_pipeline.cpp`.
-2. CLI options are parsed into `Options` (`collect_types.hpp`), including thresholds, output paths, and threading.
-3. Read technology mode is fixed (`--hifi`, `--ont`, or `--short-reads`) and controls:
+2. `collect_bam_variation(...)` parses CLI options into `Options` (`collect_types.hpp`), including thresholds, output paths, and threading, then dispatches to `run_collect_bam_variation(opts)`.
+3. `run_collect_bam_variation(...)` owns the streaming batch/stitch/merge/write loop.
+4. Read technology mode is fixed (`--hifi`, `--ont`, or `--short-reads`) and controls:
    - noisy sliding-window width,
    - ONT-only Fisher strand-bias classification path,
    - downstream parity behavior.
@@ -2136,146 +2174,151 @@ from CLI entry to final outputs.
 
 **Code path:** `collect_pipeline.cpp` (`parse_region`, region/BED normalization, `build_region_chunks`, neighbor annotation).
 
-4. Input alignment sources are resolved (single BAM/CRAM, list file, or primary + `-X` files).
-5. FASTA index and BAM/CRAM headers are opened for coordinate and contig-name validation.
-6. Region requests are normalized (CLI `chr:start-end`, BED, autosome, or full contig).
-7. Regions are split into `RegionChunk` tiles (`chunk_size`, default 500k), then neighbor metadata is attached.
-8. Chunks are grouped by `reg_chunk_i` so one batch corresponds to one contig stream-write unit.
+5. Input alignment sources are resolved (single BAM/CRAM, list file, or primary + `-X` files).
+6. FASTA index and BAM/CRAM headers are opened for coordinate and contig-name validation.
+7. Region requests are normalized (CLI `chr:start-end`, BED, autosome, or full contig).
+8. Regions are split into `RegionChunk` tiles (`chunk_size`, default 500k), then neighbor metadata is attached.
+9. Chunks are grouped by `reg_chunk_i` so one batch corresponds to one contig stream-write unit.
 
 ### 26.3 Output Stream Initialization
 
 **Code path:** `collect_output.cpp` (`write_*_header`, stream setup from `collect_pipeline.cpp`).
 
-9. Output streams are opened and headers written:
+10. Output streams are opened and headers written:
    - mandatory candidate TSV,
    - optional projected site-level VCF (`--vcf-output`),
    - optional projected phased VCF (`--phased-vcf-output`),
-   - optional read-support TSV (`--read-support`).
+   - optional read-support TSV (`--read-support`),
+   - optional phase-read TSV (`--phase-read-tsv`),
+   - optional phased alignment output (`-S`, `-b`, `-C`), with optional refine/sort/index handling.
 
 ### 26.4 Batch and Worker Execution Model
 
 **Code path:** `collect_pipeline.cpp` (`collect_chunk_batch_parallel`, `WorkerContext`, fixed-slot result merge).
 
-10. For each contig batch (`reg_chunk_i`), worker threads process chunks in parallel.
-11. Each worker writes its result to a fixed slot index for deterministic post-join ordering.
-12. Chunk processing itself is performed by `process_chunk(...)` -> `collect_var_main(...)`.
+11. For each contig batch (`reg_chunk_i`), worker threads process chunks in parallel.
+12. Each worker writes its result to a fixed slot index for deterministic post-join ordering.
+13. Chunk processing itself is performed by `process_chunk(...)` -> `collect_var_main(...)`.
 
 ### 26.5 Per-Chunk Read Loading and Digar Construction
 
 **Code path:** `collect_pipeline.cpp::load_and_prepare_chunk`, `bam_digar.cpp` digar builders/noisy detectors.
 
-13. For each input BAM/CRAM:
+14. For each input BAM/CRAM:
     - reads overlapping chunk bounds are loaded,
     - read-level filters are applied (`MAPQ`, duplicate/QC policy, etc.),
     - digars are built from EQX/`cs`/MD/reference comparison in `bam_digar.cpp`.
-14. While digars are built, per-read noisy intervals are detected using longcallD-style sliding-window logic.
-15. Reads exceeding variant/noisy density skip criteria remain present for bookkeeping but are excluded from evidence contribution.
-16. Reads from all input files are pooled and deterministically sorted.
+15. While digars are built, per-read noisy intervals are detected using longcallD-style sliding-window logic.
+16. Reads exceeding variant/noisy density skip criteria remain present for bookkeeping but are excluded from evidence contribution.
+17. Reads from all input files are pooled and deterministically sorted.
 
 ### 26.6 Reference/Context Preparation
 
 **Code path:** `collect_pipeline.cpp` (reference slice fetch) + `collect_var.cpp` low-complexity/noisy aggregation helpers.
 
-17. Chunk reference sequence slice is loaded from FASTA.
-18. Low-complexity intervals are computed from the reference (sdust).
-19. Read-level noisy intervals are unioned into chunk noisy intervals.
+18. Chunk reference sequence slice is loaded from FASTA.
+19. Low-complexity intervals are computed from the reference (sdust).
+20. Read-level noisy intervals are unioned into chunk noisy intervals.
 
 ### 26.7 Candidate Discovery (Site Pass)
 
 **Code path:** `collect_var.cpp` (`collect_all_cand_var_sites`, `collapse_fuzzy_large_insertions`).
 
-20. Candidate SNP/INS/DEL sites are collected from non-skipped read digars.
-21. Candidate keys are sorted with longcallD-compatible ordering.
-22. Fuzzy large-insertion collapse is applied inside the chunk only (no cross-chunk second collapse).
+21. Candidate SNP/INS/DEL sites are collected from non-skipped read digars.
+22. Candidate keys are sorted with longcallD-compatible ordering.
+23. Fuzzy large-insertion collapse is applied inside the chunk only (no cross-chunk second collapse).
 
 ### 26.8 Candidate Evidence Counting (Depth Pass)
 
 **Code path:** `collect_var.cpp` (`collect_allele_counts_from_records`, optional read-support emission hooks).
 
-23. A second pass counts per-candidate support:
+24. A second pass counts per-candidate support:
     - `total_cov`, `ref_cov`, `alt_cov`, `low_qual_cov`,
     - strand-specific alt/ref tallies,
     - AF and supporting per-read observation rows (if enabled).
-24. This strict separation of site pass and depth pass matches longcallD structure.
+25. This strict separation of site pass and depth pass matches longcallD structure.
 
 ### 26.9 Noisy-Region Pre-Processing and Classification
 
-**Code path:** `collect_var.cpp` (`pre_process_noisy_regs`, `classify_chunk_candidates`, noisy feedback/post-process/containment).
+**Code path:** `collect_var.cpp` (`pre_process_noisy_regs_pgphase`, `classify_chunk_candidates`, noisy feedback/post-process/containment).
 
-25. Chunk noisy intervals are pre-processed (`pre_process_noisy_regs`):
+26. Chunk noisy intervals are pre-processed (`pre_process_noisy_regs_pgphase`, the longcallD-shaped `pre_process_noisy_regs` port):
     - low-complexity extension,
     - merge by configured distance,
     - read-support-based filtering.
-26. Initial category classification runs (`classify_cand_vars`-shaped path):
+27. Initial category classification runs (`classify_cand_vars`-shaped path):
     - `LOW_COV`, ONT-only `STRAND_BIAS`, `LOW_AF`, `CLEAN_HOM`, repeat/noisy classes, clean het classes.
-27. Dense/repeat evidence can add loci back to noisy regions.
-28. Post-processing extends/merges noisy intervals around eligible nearby candidates.
-29. Non-ONT final containment filter marks contained candidates as `NON_VAR` when applicable.
-30. Large noisy/repeat candidates can be promoted to `NOISY_RESOLVED` by size rules.
+28. Dense/repeat evidence can add loci back to noisy regions.
+29. Post-processing extends/merges noisy intervals around eligible nearby candidates.
+30. Final containment filter marks contained candidates as `NON_VAR` when applicable.
+31. `LOW_COV`, `STRAND_BIAS`, and `NON_VAR` candidates are pruned from the retained candidate table.
+32. The reserved `NOISY_RESOLVED` category is not assigned by a separate large-event promotion pass in the current implementation.
 
 ### 26.10 Step 3.1 Read Profiling
 
 **Code path:** `collect_var.cpp::collect_read_var_profile`.
 
-31. `collect_read_var_profile` builds per-read sparse allele vectors over candidate index ranges.
-32. Matching behavior follows longcallD parity:
+33. `collect_read_var_profile` builds per-read sparse allele vectors over candidate index ranges.
+34. Matching behavior follows longcallD parity:
     - overlap check by `ovlp_var_site(...)`,
     - strict candidate identity by `exact_comp_var_site(...)`.
-33. `read_var_cr` interval index is built for fast “reads covering variant i” overlap queries.
+35. `read_var_cr` interval index is built for fast “reads covering variant i” overlap queries.
 
 ### 26.11 Step 3.2 Initial K-Means Haplotype Assignment
 
 **Code path:** `collect_phase.cpp::assign_hap_based_on_germline_het_vars_kmeans`.
 
-34. K-means-style hap assignment (`assign_hap_based_on_germline_het_vars_kmeans`) runs on clean germline categories.
-35. Iterative updates assign read hap labels, variant consensus alleles, and phase-set anchors.
-36. Candidate `hap_alt`/`hap_ref` are projected from `hap_to_cons_alle` with longcallD parity (`cons_alle != 0` means ALT).
+36. K-means-style hap assignment (`assign_hap_based_on_germline_het_vars_kmeans`) runs on clean germline categories.
+37. Iterative updates assign read hap labels, variant consensus alleles, and phase-set anchors.
+38. Candidate `hap_alt`/`hap_ref` are projected from `hap_to_cons_alle` with longcallD parity (`cons_alle != 0` means ALT).
 
 ### 26.12 Step 4 Noisy-Region MSA Recall and Integration
 
 **Code path:** `collect_phase_noisy.cpp` + `align.cpp` (noisy-region read collection, MSA/alignment strings, candidate merge/update).
 
-37. For each finalized noisy region, Step 4 path collects clipped reference and reads.
-38. Region coordinates are converted to longcallD start semantics on entry (`noisy_reg_beg = reg.beg - 1`).
-39. Noisy alignment strings are generated via PS-aware path when both hap groups exist; otherwise no-PS path is used.
-40. MSA/BALN-derived noisy candidates are generated and merged into chunk candidates.
-41. Noisy profile/depth fields are updated (`total_cov` incremented per full-cover read; longcallD parity).
-42. If Step 4 adds variants, read profiling and k-means are rerun with `kCandGermlineVarCate`.
+39. For each finalized noisy region, Step 4 path collects clipped reference and reads.
+40. Region coordinates already carry the longcallD `cr_start` semantics from the post-merge noisy-region conversion, so entry uses `noisy_reg_beg = reg.beg`.
+41. Noisy alignment strings are generated via PS-aware path when both hap groups exist; otherwise no-PS path is used.
+42. MSA/BALN-derived noisy candidates are generated and merged into chunk candidates.
+43. Noisy profile/depth fields are updated (`total_cov` incremented per full-cover read; longcallD parity).
+44. If Step 4 adds variants, read profiling and k-means are rerun with `kCandGermlineVarCate`.
 
 ### 26.13 Mid-Free Memory Reduction
 
 **Code path:** `collect_var.cpp::mid_free_chunk`.
 
-43. `mid_free_chunk` releases heavy intermediates (digars, noisy trees, etc.) while preserving data required for boundary stitching.
-44. This mirrors longcallD `bam_chunk_mid_free` memory discipline for multi-chunk contig processing.
+45. `mid_free_chunk` releases heavy intermediates (digars, noisy trees, etc.) while preserving data required for boundary stitching.
+46. This mirrors longcallD `bam_chunk_mid_free` memory discipline for multi-chunk contig processing.
 
 ### 26.14 Contig-Level Boundary Stitching
 
-**Code path:** `collect_phase.cpp::stitch_chunk_haps` / `flip_chunk_hap`.
+**Code path:** `collect_phase.cpp::stitch_chunk_haps` / `flip_chunk_hap`, with optional `collect_phase_pgbam.cpp` sidecar helpers.
 
-45. After all chunks in a contig batch finish, `stitch_chunk_haps` runs sequentially left-to-right.
-46. **Common-read path (primary):** boundary-spanning reads vote for flip/no-flip orientation. If `flip_score != 0`, orientation is resolved and `apply_chunk_flip_and_merge` is called immediately.
-47. **pgbam fallback (secondary):** when `flip_score == 0` and `--pgbam-file` is set, the boundary phase blocks are compared with a 2x2 hap concordance matrix over hap-unique graph thread sets. Orientation is resolved if the winning side has ≥ 2 shared hap-unique threads and neither side ties; otherwise the boundary is left unstitched.
-48. `apply_chunk_flip_and_merge` updates both candidate-level state (`hap_to_cons_alle[1/2]` swap for `phase_set == min_cur_ps`) and read-level state (`haps` flipped via `3 - hap`; `phase_sets` rewritten from `min_cur_ps` to `max_pre_ps`).
+47. After all chunks in a contig batch finish, `stitch_chunk_haps` runs sequentially left-to-right.
+48. **Optional pgbam within-chunk pass:** when `--pgbam-file` is set, `stitch_phase_blocks_with_pgbam` first merges adjacent phase blocks inside each chunk using `hs` tag thread evidence.
+49. **Common-read path (primary):** boundary-spanning reads vote for no-flip/flip orientation. If `flip_score < 0`, the boundary is stitched without a hap swap; if `flip_score > 0`, it is stitched with a hap swap. In both non-zero cases candidate phase anchors are merged when anchors are finite.
+50. **pgbam fallback (secondary):** when `flip_chunk_hap` returns false and `--pgbam-file` is set, the boundary phase blocks are compared with a 2x2 hap concordance matrix over hap-unique graph thread sets. Orientation is resolved if the winning side has ≥ 2 shared hap-unique threads and neither side ties; otherwise the boundary is left unstitched.
+51. Common-read stitching updates candidate `hap_to_cons_alle` and phase-set state, and updates read hap/phase-set state when phased alignment output is active. The pgbam merge helper updates both candidate and read state because it needs live read phase blocks for later sidecar merges.
 
 ### 26.15 Ordered Emission
 
-**Code path:** `collect_pipeline.cpp` batch concat + `collect_output.cpp` writers.
+**Code path:** `collect_pipeline.cpp` batch merge + `collect_output.cpp` writers.
 
-48. Chunk candidate tables are concatenated in deterministic chunk order.
-49. TSV rows are emitted for all retained candidates (including filtered categories).
-50. Optional projected VCF/phased VCF outputs emit longcallD-parity call rows only.
-51. Optional read-support rows are emitted from the same candidate/read evidence state.
+52. Chunk candidate tables are merged in deterministic chunk order with exact-site duplicate handling and active-region-passing duplicate preference.
+53. TSV rows are emitted for all retained candidates after not-candidate pruning.
+54. Optional projected VCF/phased VCF outputs emit longcallD-parity call rows only.
+55. Optional read-support rows are emitted from the pre-pruning allele-count observation state.
+56. Optional phase-read rows and phased alignment records are emitted from the stitched `BamChunk` state.
 
 ### 26.16 Completion and Guarantees
 
 **Code path:** `collect_pipeline.cpp` stream finalization and run-summary logging.
 
-52. Streams are closed, counters/statistics are finalized, and execution returns.
-53. Deterministic sorting + fixed worker slot write-back guarantees stable output ordering across thread counts.
-54. The overall design keeps candidate evidence transparent (TSV) while producing longcallD-parity projected VCF outputs for downstream interoperability.
+57. Streams are closed, counters/statistics are finalized, refined alignment output is coordinate-sorted if requested, BAM/CRAM output is indexed, and execution returns.
+58. Deterministic sorting + fixed worker slot write-back guarantees stable output ordering across thread counts.
+59. The overall design keeps candidate evidence transparent (TSV) while producing longcallD-parity projected VCF outputs for downstream interoperability.
 
-**Source documentation:** The `collect_*` and `collect_phase` translation units (`collect_pipeline`, `collect_var`, `collect_phase`, `collect_output`, `collect_types`) carry Doxygen-style `@file` / `@brief` / `@param` / `@return` comments so behavior matches this document at the symbol level. The introduction’s **Vendored `cgranges`** subsection explains the longcallD fork and why it is vendored; **§8** documents parity for the per-read noisy sliding window (`bam_digar` vs longcallD `xid_queue_t`); **§18.1** documents `mid_free_chunk` field-by-field parity with longcallD `bam_chunk_mid_free`; **§19** documents `stitch_chunk_haps` / `flip_chunk_hap` parity with longcallD `stitch_var_main` / `flip_variant_hap`. Re-vendor `src/cgranges.{c,h}` only after an intentional diff against longcallD if upstream changes.
+**Source documentation:** The `collect_*` and `collect_phase` translation units (`collect_pipeline`, `collect_var`, `collect_phase`, `collect_phase_pgbam`, `collect_output`, `collect_types`) carry Doxygen-style `@file` / `@brief` / `@param` / `@return` comments so behavior matches this document at the symbol level. The introduction’s **Vendored `cgranges`** subsection explains the longcallD fork and why it is vendored; **§8** documents parity for the per-read noisy sliding window (`bam_digar` vs longcallD `xid_queue_t`); **§18.1** documents `mid_free_chunk` field-by-field parity with longcallD `bam_chunk_mid_free`; **§19** documents `stitch_chunk_haps` / `flip_chunk_hap` parity with longcallD `stitch_var_main` / `flip_variant_hap` plus optional `.pgbam` sidecar stitching. Re-vendor `src/cgranges.{c,h}` only after an intentional diff against longcallD if upstream changes.
 
 ## 27. 2026 Strict Parity Change Log (Cross-Reference to Sections)
 
@@ -2333,18 +2376,26 @@ pipeline sections above; this log maps each fix class to those sections.
 
 - `collect_noisy_vars1` call order now matches longcallD:
   1) clip region via `collect_reg_ref_bseq`, then 2) collect noisy-region reads.
-- Final Step 4 coordinate parity fix:
-  `collect_noisy_vars1` now enters noisy calling with longcallD start semantics (`cr_start`), which in
-  this C++ interval representation corresponds to `noisy_reg_beg = reg.beg - 1`.
-- This removed the remaining 1 bp ONT drift (`1435486` vs `1435485`) in no-PS noisy calling.
+- Final Step 4 coordinate parity fix: finalized chunk noisy regions now use the dedicated
+  `intervals_from_cr_lcd_chunk_noisy_post_merge` / `intervals_to_cr_lcd_chunk_noisy_post_merge`
+  conversions, preserving longcallD `cr_start` semantics through post-processing.
+- `collect_noisy_vars1` therefore enters noisy calling with `noisy_reg_beg = reg.beg`; adding another
+  `-1` or `+1` at this point reintroduces 1 bp insertion-anchor drift.
+- End-clip noisy-region intervals in `bam_digar.cpp` now choose `Interval` starts so the later
+  `intervals_to_cr` conversion produces the same `cr_add(..., pos-1, ...)` starts as longcallD.
 - Main text: §12.4, §18 Step 4, §26.12.
 
 ### 27.7 VCF Projection and Emission Contract Parity
 
 - Optional VCF outputs are now longcallD-style projected callsets, not candidate dumps.
-- Candidate-only rows (`NON_VAR`, `LOW_COV`, `LOW_AF`, `STRAND_BIAS`) are retained in TSV but excluded
-  from projected VCF call emission.
+- `NON_VAR`, `LOW_COV`, and `STRAND_BIAS` are pruned before TSV/VCF emission; retained candidate-only rows
+  such as `LOW_AF` and `REP_HET_INDEL` remain TSV-only and are excluded from projected
+  VCF call emission.
 - FILTER/INFO semantics were aligned to longcallD call output behavior, including `CAT` and `CLEAN`.
+- The VCF depth gate uses `total_cov` for `DP/min_depth` and `alt_cov` for `min_alt_depth`; `low_qual_cov`
+  remains separate and is not added to VCF `DP`.
+- Noisy indel anchors use `alt_ref_base` exactly like longcallD `make_variants`, including rejecting invalid
+  non-ACGT anchor bytes before VCF output.
 - Left-normalization/rotation was not retained in writer output because longcallD does not do this in
   its VCF writer path.
 - Main text: §22, §22.1, §26.15.
@@ -2357,7 +2408,35 @@ pipeline sections above; this log maps each fix class to those sections.
   collapsed comparisons at shared positions.
 - Main text: §24.
 
-### 27.9 Current Parity Status (Fixtures)
+### 27.9 HiFi Chr20 Strict-Parity Fixes
+
+- VCF projection depth gates now use `total_cov` alone for `min_depth`, while classification still uses
+  `total_cov + low_qual_cov` for `LOW_COV`, matching longcallD's split between `classify_var_cate` and
+  `write_var_to_vcf`.
+- Candidate depth sweeping now skips only `DigarType::Equal` and compares non-equal digars through a
+  longcallD-shaped merge-site comparator, matching `update_cand_vars_from_digar` / `exact_comp_var_site_ins`
+  behavior for non-standard digar events.
+- Noisy MSA allele matching now compares `n_eq >= len * cons_sim_thres` without truncating the floating-point
+  threshold to an integer.
+- Final hap projection resets `hap_alt` / `hap_ref` before recomputing from `hap_to_cons_alle`, matching
+  longcallD `make_variants` local-variable behavior.
+- Exact duplicate candidate keys across chunks prefer rows that pass `lcd_make_variants_region_pass`, so an
+  active-region CLEAN candidate is not shadowed by a neighboring noisy duplicate.
+- Main text: §12.4, §18 Step 3.2, §18 Step 4, §20, §22, §26.8–§26.15.
+
+### 27.10 Annotated-BAM / `.pgbam` Sidecar Stitching
+
+- The sidecar stitching implementation now lives in `collect_phase_pgbam.cpp` / `.hpp`.
+- When `--pgbam-file` is provided, the regular longcallD-shaped per-chunk collection and k-means phasing run
+  first. The sidecar path then merges phase blocks within each chunk and acts as a fallback for adjacent
+  chunks whenever `flip_chunk_hap` returns false, while non-zero common-read boundary votes still take
+  precedence.
+- The sidecar path parses `hs` BAM tags, maps set IDs to graph thread IDs through `PgbamSidecarData`, scores
+  adjacent phase blocks by hap-unique thread intersections, and applies flip/merge operations to candidate and
+  read phase state.
+- Main text: §1, §18.1, §19, §19.7, §19.8, §26.14.
+
+### 27.11 Current Parity Status (Fixtures)
 
 Using the repository parity script and test fixtures:
 
