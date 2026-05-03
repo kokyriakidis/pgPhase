@@ -204,6 +204,14 @@ struct Options {
     std::string phase_read_tsv;
     /** Optional pgbam sidecar file used for fallback chunk stitching when overlap reads have no signal. */
     std::string pgbam_file;
+    int pgbam_primary_polarity_margin = 2;
+    int pgbam_primary_min_winning_threads = 2;
+    bool pgbam_cleanup_pass = true;
+    int pgbam_cleanup_polarity_margin = 2;
+    int pgbam_cleanup_min_winning_threads = 1;
+    bool pgbam_relaxed_cleanup_pass = true;
+    int pgbam_relaxed_cleanup_polarity_margin = 1;
+    int pgbam_relaxed_cleanup_min_winning_threads = 1;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
     /** CLI command string used for PG:CL header field in phased SAM/BAM/CRAM output. */
     std::string command_line;

@@ -877,6 +877,14 @@ enum LongOption {
     kPhaseReadTsvOption,
     kPhasedVcfOutputOption,
     kPgbamFileOption,
+    kPgbamPrimaryMarginOption,
+    kPgbamPrimaryMinWinningOption,
+    kNoPgbamCleanupPassOption,
+    kPgbamCleanupMarginOption,
+    kPgbamCleanupMinWinningOption,
+    kNoPgbamRelaxedCleanupPassOption,
+    kPgbamRelaxedCleanupMarginOption,
+    kPgbamRelaxedCleanupMinWinningOption,
     kAmbBaseOption
 };
 
@@ -938,6 +946,15 @@ static void print_collect_help() {
         << "      --read-support FILE       Per-read ref/alt observations at candidates (for phasing)\n"
         << "      --phase-read-tsv FILE     Per-read HAP / PHASE_SET after k-means phasing\n"
         << "      --pgbam-file FILE         Optional .pgbam sidecar for fallback chunk stitching when common-read signal is absent\n"
+        << "      --pgbam-primary-margin INT         Thread polarity margin for primary .pgbam stitching [2]\n"
+        << "      --pgbam-primary-min-winning INT    Winning shared polarized threads for primary .pgbam stitching [2]\n"
+        << "      --no-pgbam-cleanup-pass            Disable final .pgbam cleanup pass with margin/min [2/1]\n"
+        << "      --pgbam-cleanup-margin INT         Thread polarity margin for final cleanup pass [2]\n"
+        << "      --pgbam-cleanup-min-winning INT    Winning shared polarized threads for final cleanup pass [1]\n"
+        << "      --no-pgbam-relaxed-cleanup-pass    Disable relaxed .pgbam cleanup pass with margin/min [1/1]\n"
+        << "      --pgbam-relaxed-cleanup-margin INT Thread polarity margin for relaxed cleanup pass [1]\n"
+        << "      --pgbam-relaxed-cleanup-min-winning INT\n"
+        << "                                      Winning shared polarized threads for relaxed cleanup pass [1]\n"
         << "      --chunk-size INT          Region chunk size in bp [500000]\n"
         << "      --noisy-merge-dis INT     Max distance (bp) to merge noisy/SV windows [500]\n"
         << "      --min-sv-len INT          min_sv_len for noisy-region cgranges merge [30]\n"
@@ -1006,6 +1023,14 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"read-support",              required_argument, nullptr, kReadSupportOption},
         {"phase-read-tsv",            required_argument, nullptr, kPhaseReadTsvOption},
         {"pgbam-file",                required_argument, nullptr, kPgbamFileOption},
+        {"pgbam-primary-margin",      required_argument, nullptr, kPgbamPrimaryMarginOption},
+        {"pgbam-primary-min-winning", required_argument, nullptr, kPgbamPrimaryMinWinningOption},
+        {"no-pgbam-cleanup-pass",     no_argument,       nullptr, kNoPgbamCleanupPassOption},
+        {"pgbam-cleanup-margin",      required_argument, nullptr, kPgbamCleanupMarginOption},
+        {"pgbam-cleanup-min-winning", required_argument, nullptr, kPgbamCleanupMinWinningOption},
+        {"no-pgbam-relaxed-cleanup-pass", no_argument,   nullptr, kNoPgbamRelaxedCleanupPassOption},
+        {"pgbam-relaxed-cleanup-margin", required_argument, nullptr, kPgbamRelaxedCleanupMarginOption},
+        {"pgbam-relaxed-cleanup-min-winning", required_argument, nullptr, kPgbamRelaxedCleanupMinWinningOption},
         {"chunk-size",                required_argument, nullptr, kChunkSizeOption},
         {"noisy-merge-dis",           required_argument, nullptr, kNoisyRegMergeDisOption},
         {"min-sv-len",                required_argument, nullptr, kMinSvLenOption},
@@ -1073,6 +1098,14 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kReadSupportOption:    opts.read_support_tsv = optarg; break;
             case kPhaseReadTsvOption:   opts.phase_read_tsv = optarg; break;
             case kPgbamFileOption:      opts.pgbam_file = optarg; break;
+            case kPgbamPrimaryMarginOption: opts.pgbam_primary_polarity_margin = std::stoi(optarg); break;
+            case kPgbamPrimaryMinWinningOption: opts.pgbam_primary_min_winning_threads = std::stoi(optarg); break;
+            case kNoPgbamCleanupPassOption: opts.pgbam_cleanup_pass = false; break;
+            case kPgbamCleanupMarginOption: opts.pgbam_cleanup_polarity_margin = std::stoi(optarg); break;
+            case kPgbamCleanupMinWinningOption: opts.pgbam_cleanup_min_winning_threads = std::stoi(optarg); break;
+            case kNoPgbamRelaxedCleanupPassOption: opts.pgbam_relaxed_cleanup_pass = false; break;
+            case kPgbamRelaxedCleanupMarginOption: opts.pgbam_relaxed_cleanup_polarity_margin = std::stoi(optarg); break;
+            case kPgbamRelaxedCleanupMinWinningOption: opts.pgbam_relaxed_cleanup_min_winning_threads = std::stoi(optarg); break;
             case kChunkSizeOption:      opts.chunk_size = std::stoll(optarg); break;
             case kNoisyRegMergeDisOption: opts.noisy_reg_merge_dis = std::stoi(optarg); break;
             case kMinSvLenOption:       opts.min_sv_len = std::stoi(optarg); break;
@@ -1100,7 +1133,10 @@ int collect_bam_variation(int argc, char* argv[]) {
         opts.strand_bias_pval < 0.0 || opts.strand_bias_pval > 1.0 ||
         opts.max_var_ratio_per_read < 0.0 || opts.max_noisy_frac_per_read < 0.0 ||
         opts.noisy_reg_max_xgaps < 0 || opts.min_noisy_reg_total_depth < 0 ||
-        opts.noisy_reg_slide_win < -1 || opts.verbose < 0) {
+        opts.noisy_reg_slide_win < -1 || opts.verbose < 0 ||
+        opts.pgbam_primary_polarity_margin < 1 || opts.pgbam_primary_min_winning_threads < 1 ||
+        opts.pgbam_cleanup_polarity_margin < 1 || opts.pgbam_cleanup_min_winning_threads < 1 ||
+        opts.pgbam_relaxed_cleanup_polarity_margin < 1 || opts.pgbam_relaxed_cleanup_min_winning_threads < 1) {
         std::cerr << "Error: numeric thresholds are invalid\n";
         return 1;
     }

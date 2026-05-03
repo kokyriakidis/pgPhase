@@ -744,13 +744,34 @@ void stitch_chunk_haps(std::vector<BamChunk>& chunks,
                        const PgbamSidecarData* pgbam_sidecar) {
     const bool use_pgbam = opts != nullptr && pgbam_sidecar != nullptr && !opts->pgbam_file.empty();
     if (use_pgbam) {
-        for (BamChunk& chunk : chunks) stitch_phase_blocks_with_pgbam(chunk, *pgbam_sidecar);
+        for (BamChunk& chunk : chunks) {
+            stitch_phase_blocks_with_pgbam(chunk,
+                                          *pgbam_sidecar,
+                                          opts->pgbam_primary_min_winning_threads,
+                                          opts->pgbam_primary_polarity_margin);
+        }
     }
     for (size_t ii = 1; ii < chunks.size(); ++ii) {
         const bool stitched = flip_chunk_hap(chunks[ii - 1], chunks[ii], opts);
         if (!stitched && use_pgbam) {
-            stitch_adjacent_chunks_with_pgbam(chunks[ii - 1], chunks[ii], *pgbam_sidecar);
+            stitch_adjacent_chunks_with_pgbam(chunks[ii - 1],
+                                             chunks[ii],
+                                             *pgbam_sidecar,
+                                             opts->pgbam_primary_min_winning_threads,
+                                             opts->pgbam_primary_polarity_margin);
         }
+    }
+    if (use_pgbam && opts->pgbam_cleanup_pass) {
+        stitch_phase_blocks_with_pgbam(chunks,
+                                      *pgbam_sidecar,
+                                      opts->pgbam_cleanup_min_winning_threads,
+                                      opts->pgbam_cleanup_polarity_margin);
+    }
+    if (use_pgbam && opts->pgbam_relaxed_cleanup_pass) {
+        stitch_phase_blocks_with_pgbam(chunks,
+                                      *pgbam_sidecar,
+                                      opts->pgbam_relaxed_cleanup_min_winning_threads,
+                                      opts->pgbam_relaxed_cleanup_polarity_margin);
     }
 }
 
