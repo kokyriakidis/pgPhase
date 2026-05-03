@@ -149,6 +149,18 @@ Only one of --hifi, --ont, and --short-reads may be supplied.
   k-means phasing: first to merge phase blocks within each chunk, then as a
   fallback for adjacent chunk boundaries where common-read voting has no
   decisive signal. Has no effect when absent.
+
+--pgbam-primary-margin INT / --pgbam-primary-min-winning INT
+  Control the primary pgbam scorer used by within-chunk pgbam stitching and
+  adjacent-chunk pgbam fallback. Defaults are margin 2 and minimum winner 2.
+
+--no-pgbam-cleanup-pass / --pgbam-cleanup-margin INT / --pgbam-cleanup-min-winning INT
+  Control the first final contig-level pgbam cleanup pass. Defaults are enabled,
+  margin 2, and minimum winner 1.
+
+--no-pgbam-relaxed-cleanup-pass / --pgbam-relaxed-cleanup-margin INT / --pgbam-relaxed-cleanup-min-winning INT
+  Control the second final contig-level pgbam cleanup pass. Defaults are enabled,
+  margin 1, and minimum winner 1.
 ```
 
 The command supports explicit region restriction:
@@ -1467,6 +1479,18 @@ pass 2 — cross-chunk:
         flip_chunk_hap(chunk[i-1], chunk[i], opts)      ← longcallD common-read path
         if common-read path returns false and pgbam is active:
             stitch_adjacent_chunks_with_pgbam(chunk[i-1], chunk[i], sidecar)
+
+pass 3 — optional final contig cleanup:
+    if --no-pgbam-cleanup-pass is not set:
+        stitch_phase_blocks_with_pgbam(chunks, sidecar,
+                                       --pgbam-cleanup-min-winning,
+                                       --pgbam-cleanup-margin)
+
+pass 4 — optional relaxed final contig cleanup:
+    if --no-pgbam-relaxed-cleanup-pass is not set:
+        stitch_phase_blocks_with_pgbam(chunks, sidecar,
+                                       --pgbam-relaxed-cleanup-min-winning,
+                                       --pgbam-relaxed-cleanup-margin)
 ```
 
 Within-chunk stitching runs first so that by the time the cross-chunk pass reaches a boundary, each chunk already has its internal phase blocks oriented consistently. The cross-chunk pass then draws thread signal from the full merged read population of the boundary-adjacent phase block rather than from a single small block.
@@ -1512,13 +1536,13 @@ This provides **orientation evidence across gaps** that the common-read path can
 | Common-read precedence | adjacent-chunk pgbam stitching runs only when `flip_chunk_hap` returns false | Non-zero common-read evidence always takes precedence across chunk boundaries; pgbam cannot override an existing boundary vote |
 | Unweighted intersection | Support = raw thread-ID intersection count, not coverage-weighted | Thread IDs are already haplotype-resolved; weighting by coverage would conflate depth with haplotype identity |
 | 2x2 hap concordance | Adjacent blocks are compared as hap1/hap2 thread-set intersections (`s11`, `s12`, `s21`, `s22`) | The signal is block-local orientation evidence, not accumulated historical vote totals |
-| Hap-unique support | Threads present on both hap sides within the same block are removed before scoring | Ambiguous graph threads do not make a block look artificially concordant with both orientations |
+| Polarized thread support | Each graph thread keeps hap1/hap2 read-support counts; a thread contributes to one hap only when the count difference reaches the configured polarity margin | Repeated read support can rescue useful hap-specific signal without treating every thread seen on both haps as ambiguous |
 | Live merged state | A successful within-chunk merge carries forward oriented hap-thread sets, not old pairwise scores | Large merged blocks contribute their accumulated hap identity without letting previous merge decisions inflate later scores |
 | Read-thread cache | Within-chunk stitching resolves each read's `hs` tag once before the sweep | Many small short-read phase blocks do not repeatedly parse the same BAM aux tags |
-| Cached hap-unique sets | `hap_unique_threads[1/2]` are stored in `PhaseBlockThreadState` and refreshed only on state creation/merge | Comparisons against a large merged block do not repeatedly recompute `hap1 - hap2` and `hap2 - hap1` |
+| Cached polarized sets | `hap_polarized_threads[1/2]` are stored in `PhaseBlockThreadState` and refreshed only on state creation/merge | Comparisons against a large merged block do not repeatedly re-polarize every thread |
 | Temporary stitch memory | Cached read-thread and phase-block states live only inside `stitch_phase_blocks_with_pgbam` | RAM increases during the within-chunk pgbam sweep, but the cache is released before moving to the next chunk |
-| Min winner support ≥ 2 | Orientation call requires the winning side to have at least 2 shared hap-unique threads | Screens out single-thread noise without coverage-weighting by read depth |
-| Graceful degradation | Tied score or fewer than 2 winner intersections → return false, boundary left unstitched | No worse than baseline; incorrect orientation is actively avoided |
+| Configurable winner support | Orientation call requires the winning side to reach the configured minimum shared polarized threads | The default primary pass screens out single-thread noise; cleanup passes can be enabled or disabled and tuned from the CLI |
+| Graceful degradation | Tied score or too few winner intersections → return false, boundary left unstitched | No worse than baseline; incorrect orientation is actively avoided |
 | Read-skip on unresolved `hs` | Reads with no `hs` tag or unmapped set IDs are skipped, not counted | Partial sidecar coverage is tolerated; only positively resolved reads contribute signal |
 
 #### Algorithm
@@ -1539,71 +1563,68 @@ This cache is then reused to initialize the phase-block states. It avoids the pr
 
 The read-thread cache is temporary. It is allocated inside the within-chunk stitch call for one chunk, used to seed the starting `PhaseBlockThreadState` objects, and then released when the function returns. It is not stored on `BamChunk` and does not persist into output emission.
 
-**Thread-set collection — `collect_thread_set_for_group`.** For each of the four boundary haplotype groups (A.h1, A.h2, B.h1, B.h2), the function scans the relevant chunk for reads matching the specified hap index and phase_set anchor:
+**Thread collection.** For each phased read in the relevant phase block, the pgbam module resolves graph-thread IDs from the read:
 
 1. `extract_hs_set_ids` parses the BAM `hs` auxiliary array tag (type `B`, subtypes `I`/`i` 4-byte, `S`/`s` 2-byte, `C`/`c` 1-byte) and returns a `uint32_t` vector of set IDs.
 2. Each set ID is looked up in `PgbamSidecarData::set_to_threads`. All resolved thread IDs are appended to a `std::vector<uint64_t>` for that group.
 3. Reads with no `hs` tag, an empty tag, or set IDs absent from the sidecar are skipped. If no reads contribute, the resulting thread vector stays empty and the later concordance scorer naturally lacks support for that hap/block side.
-4. After all reads are scanned the vector is sorted and deduplicated (`std::sort` + `std::unique`) so that `intersection_size` can use a linear merge.
+4. Per-read thread IDs are sorted and deduplicated. Phase-block state keeps read-level occurrences so repeated support can polarize a thread toward one haplotype.
 
 **Phase block state.** Each block carries a compact live state:
 
 ```cpp
 struct PhaseBlockThreadState {
     hts_pos_t anchor;
-    std::array<std::vector<uint64_t>, 3> hap_threads;
-    std::array<std::vector<uint64_t>, 3> hap_unique_threads;
+    std::array<std::vector<uint64_t>, 3> hap_read_threads;
+    std::vector<ThreadSupport> thread_support;
+    std::array<std::vector<uint64_t>, 3> hap_polarized_threads;
 };
 ```
 
-Only indexes 1 and 2 are used. For a starting phase block, `hap_threads[1]` and `hap_threads[2]` are the sorted unique union of all graph threads from reads assigned to that hap and phase-set anchor. For a merged phase block, they are the union of all already-oriented child blocks. `hap_unique_threads[1]` and `hap_unique_threads[2]` cache the hap-specific set differences used by the next concordance test, so the same large merged block does not recompute hap-unique sets on every comparison.
+Only indexes 1 and 2 are used. For a starting phase block, `hap_read_threads[1]` and `hap_read_threads[2]` accumulate the per-read graph threads from reads assigned to that hap and phase-set anchor. `thread_support` stores one row per graph thread with `hap1_count` and `hap2_count`. `hap_polarized_threads[1]` and `[2]` cache the threads whose support difference reaches the active polarity margin.
 
 The two families of vectors have different roles:
 
 ```text
-hap_threads         = full evidence carried forward for future merges
-hap_unique_threads  = comparison-ready evidence used directly by the 2x2 scorer
+thread_support          = full counted evidence carried forward for future merges
+hap_polarized_threads   = comparison-ready evidence used directly by the 2x2 scorer
 ```
 
-Keeping both costs extra temporary memory, but avoids repeatedly deriving unique sets from a growing merged block. This is useful for short-read data, where many small initial phase blocks can merge into a large left block and then be compared to many subsequent neighbors.
+Keeping both costs extra temporary memory, but avoids repeatedly re-counting and re-polarizing threads from a growing merged block. This is useful for short-read data, where many small initial phase blocks can merge into a large left block and then be compared to many subsequent neighbors.
 
-**Reference thread sets.** The two blocks being compared are called A and B below. Their hap thread sets are built unconditionally. Whenever a block state is built or merged, `refresh_phase_block_unique_threads` computes the hap-unique evidence:
+**Reference thread sets.** The two blocks being compared are called A and B below. Whenever a block state is built or merged, `refresh_phase_block_polarized_threads` computes the comparison-ready evidence using the active polarity margin:
 
 ```text
-A1_unique = A.h1_threads - A.h2_threads
-A2_unique = A.h2_threads - A.h1_threads
-B1_unique = B.h1_threads - B.h2_threads
-B2_unique = B.h2_threads - B.h1_threads
+A1_polarized = threads where A.hap1_count - A.hap2_count >= margin
+A2_polarized = threads where A.hap2_count - A.hap1_count >= margin
+B1_polarized = threads where B.hap1_count - B.hap2_count >= margin
+B2_polarized = threads where B.hap2_count - B.hap1_count >= margin
 ```
 
-**2x2 hap concordance.** Orientation is scored by intersecting the adjacent blocks' hap-unique thread sets:
+**2x2 hap concordance.** Orientation is scored by intersecting the adjacent blocks' polarized thread sets:
 
 ```text
-s11 = |A1_unique ∩ B1_unique|
-s12 = |A1_unique ∩ B2_unique|
-s21 = |A2_unique ∩ B1_unique|
-s22 = |A2_unique ∩ B2_unique|
+s11 = |A1_polarized ∩ B1_polarized|
+s12 = |A1_polarized ∩ B2_polarized|
+s21 = |A2_polarized ∩ B1_polarized|
+s22 = |A2_polarized ∩ B2_polarized|
 
 score_nonflip = s11 + s22
 score_flip    = s12 + s21
 ```
 
-Within a chunk, `stitch_phase_blocks_with_pgbam` caches each read's resolved thread IDs once, builds one `PhaseBlockThreadState` per starting phase-set anchor, and then sweeps anchors left to right. On a successful merge, the right block's state is first oriented according to the flip decision and then unioned into the left block's hap-thread state. The next comparison therefore uses all hap-thread evidence from the merged phase block, while old pairwise scores are discarded.
+Within a chunk, `stitch_phase_blocks_with_pgbam` caches each read's resolved thread IDs once, builds one `PhaseBlockThreadState` per starting phase-set anchor, and then sweeps anchors left to right. On a successful merge, the right block's `ThreadSupport` counts are first oriented according to the flip decision and then added into the left block's counts. The next comparison therefore uses all counted thread evidence from the merged phase block, while old pairwise scores are discarded.
 
 **Merge-state update.** The cached state update mirrors the real read/candidate update performed by the pgbam-sidecar merge helper:
 
 ```text
 if do_flip:
-    oriented_B.h1_threads = B.h2_threads
-    oriented_B.h2_threads = B.h1_threads
+    swap B.hap1_count and B.hap2_count for every thread
 else:
-    oriented_B.h1_threads = B.h1_threads
-    oriented_B.h2_threads = B.h2_threads
+    keep B.hap1_count and B.hap2_count
 
-AB.h1_threads = union(A.h1_threads, oriented_B.h1_threads)
-AB.h2_threads = union(A.h2_threads, oriented_B.h2_threads)
-AB.h1_unique_threads = AB.h1_threads - AB.h2_threads
-AB.h2_unique_threads = AB.h2_threads - AB.h1_threads
+AB.thread_support = per-thread sum of A counts and oriented B counts
+AB.hap_polarized_threads = re-polarize AB.thread_support with the active margin
 AB.anchor = A.anchor
 ```
 
@@ -1613,12 +1634,13 @@ This means a large merged block carries all of its hap-thread support into the n
 
 ```text
 if score_nonflip == score_flip          → leave unstitched (tied)
-if max(score_nonflip, score_flip) < 2  → leave unstitched (insufficient signal)
+if max(score_nonflip, score_flip) < min_winning_threads
+                                      → leave unstitched (insufficient signal)
 if score_flip > score_nonflip           → do_flip = true
 else                                    → do_flip = false
 ```
 
-The minimum winner support of 2 is the only threshold. A single shared hap-unique thread with no opposition could be noise; two or more shared hap-unique threads with fewer opposing intersections constitute a call.
+The winner threshold is configurable per pgbam stage. The default primary path uses `min_winning_threads = 2`; the final cleanup stages default to `1`.
 
 **Apply.** The pgbam path applies the fallback-derived `do_flip`, `max_pre_ps`, and `min_cur_ps` through `apply_pgbam_phase_merge`, which flips and/or renames both candidate phase state and read hap/phase-set state.
 
@@ -1626,9 +1648,9 @@ The minimum winner support of 2 is the only threshold. A single shared hap-uniqu
 
 **Cross-chunk application.** For cross-chunk fallback, the same `decide_phase_block_concordance` scorer is used, but the state is collected on demand for the boundary-adjacent phase blocks: `max_pre_ps` in the previous chunk and `min_cur_ps` in the current chunk. Cross-chunk stitching still mutates only the current chunk, rewriting `min_cur_ps` to `max_pre_ps` and optionally flipping its haps.
 
-**Complexity and memory.** Within a chunk, `hs` parsing is `O(reads)` once. Initial block construction appends each cached thread set to one block/hap bucket and sorts/deduplicates each bucket. Hap-unique vectors are computed only when a block state is created or after a successful merge. Each stitch comparison then intersects four already-prepared sorted hap-unique vectors by linear merge. Successful merges union two sorted hap-thread vectors and refresh the two hap-unique vectors. This avoids the previous repeated full-chunk read scans and repeated hap-unique recomputation for every adjacent phase-block boundary, which is important when short reads create many small phase blocks.
+**Complexity and memory.** Within a chunk, `hs` parsing is `O(reads)` once. Initial block construction appends each cached read-thread set to one block/hap bucket and sorts/counts each bucket into `ThreadSupport`. Polarized vectors are computed only when a block state is created or after a successful merge. Each stitch comparison then intersects four already-prepared sorted polarized vectors by linear merge. Successful merges sum two sorted `ThreadSupport` vectors and refresh the two polarized vectors. This avoids the previous repeated full-chunk read scans and repeated polarization for every adjacent phase-block boundary, which is important when short reads create many small phase blocks.
 
-The RAM cost is an intentional temporary cache: during one within-chunk pgbam sweep, the implementation holds per-read resolved thread vectors, per-block full hap-thread vectors, and per-block hap-unique vectors. In the worst case, `hap_unique_threads` can approach another copy of the full hap-thread vectors. The cache is scoped to one chunk's within-chunk stitch pass and is released before the next chunk is processed, so it does not change the long-lived `BamChunk` memory model.
+The RAM cost is an intentional temporary cache: during one within-chunk pgbam sweep, the implementation holds per-read resolved thread vectors, per-block counted thread support, and per-block polarized vectors. The cache is scoped to one chunk's within-chunk stitch pass and is released before the next chunk is processed, so it does not change the long-lived `BamChunk` memory model.
 
 **Data model.** `PgbamSidecarData` (declared in `collect_types.hpp`) holds the sidecar map:
 
@@ -2297,18 +2319,19 @@ from CLI entry to final outputs.
 47. After all chunks in a contig batch finish, `stitch_chunk_haps` runs sequentially left-to-right.
 48. **Optional pgbam within-chunk pass:** when `--pgbam-file` is set, `stitch_phase_blocks_with_pgbam` first merges adjacent phase blocks inside each chunk using `hs` tag thread evidence.
 49. **Common-read path (primary):** boundary-spanning reads vote for no-flip/flip orientation. If `flip_score < 0`, the boundary is stitched without a hap swap; if `flip_score > 0`, it is stitched with a hap swap. In both non-zero cases candidate phase anchors are merged when anchors are finite.
-50. **pgbam fallback (secondary):** when `flip_chunk_hap` returns false and `--pgbam-file` is set, the boundary phase blocks are compared with a 2x2 hap concordance matrix over hap-unique graph thread sets. Orientation is resolved if the winning side has ≥ 2 shared hap-unique threads and neither side ties; otherwise the boundary is left unstitched.
-51. Common-read stitching updates candidate `hap_to_cons_alle` and phase-set state, and updates read hap/phase-set state when phased alignment output is active. The pgbam merge helper updates both candidate and read state because it needs live read phase blocks for later sidecar merges.
+50. **pgbam fallback (secondary):** when `flip_chunk_hap` returns false and `--pgbam-file` is set, the boundary phase blocks are compared with a 2x2 hap concordance matrix over polarized graph-thread support. Orientation is resolved if the winning side reaches the configured primary minimum winner threshold and neither side ties; otherwise the boundary is left unstitched.
+51. **pgbam final cleanup passes:** after the common-read/pgbam adjacent sweep, optional contig-level cleanup passes can rescore all remaining phase blocks. Defaults are a margin-2/min-winner-1 cleanup followed by a relaxed margin-1/min-winner-1 cleanup; either pass and all thresholds are CLI-configurable.
+52. Common-read stitching updates candidate `hap_to_cons_alle` and phase-set state, and updates read hap/phase-set state when phased alignment output is active. The pgbam merge helper updates both candidate and read state because it needs live read phase blocks for later sidecar merges.
 
 ### 26.15 Ordered Emission
 
 **Code path:** `collect_pipeline.cpp` batch merge + `collect_output.cpp` writers.
 
-52. Chunk candidate tables are merged in deterministic chunk order with exact-site duplicate handling and active-region-passing duplicate preference.
-53. TSV rows are emitted for all retained candidates after not-candidate pruning.
-54. Optional projected VCF/phased VCF outputs emit longcallD-parity call rows only.
-55. Optional read-support rows are emitted from the pre-pruning allele-count observation state.
-56. Optional phase-read rows and phased alignment records are emitted from the stitched `BamChunk` state.
+53. Chunk candidate tables are merged in deterministic chunk order with exact-site duplicate handling and active-region-passing duplicate preference.
+54. TSV rows are emitted for all retained candidates after not-candidate pruning.
+55. Optional projected VCF/phased VCF outputs emit longcallD-parity call rows only.
+56. Optional read-support rows are emitted from the pre-pruning allele-count observation state.
+57. Optional phase-read rows and phased alignment records are emitted from the stitched `BamChunk` state.
 
 ### 26.16 Completion and Guarantees
 
@@ -2432,8 +2455,8 @@ pipeline sections above; this log maps each fix class to those sections.
   chunks whenever `flip_chunk_hap` returns false, while non-zero common-read boundary votes still take
   precedence.
 - The sidecar path parses `hs` BAM tags, maps set IDs to graph thread IDs through `PgbamSidecarData`, scores
-  adjacent phase blocks by hap-unique thread intersections, and applies flip/merge operations to candidate and
-  read phase state.
+  adjacent phase blocks by polarized per-thread hap support, and applies flip/merge operations to candidate and
+  read phase state. Primary and cleanup pass margins/min-winner thresholds are configurable from the CLI.
 - Main text: §1, §18.1, §19, §19.7, §19.8, §26.14.
 
 ### 27.11 Current Parity Status (Fixtures)
