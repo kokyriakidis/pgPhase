@@ -739,6 +739,38 @@ static bool flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
     return true;
 }
 
+// The phased-alignment writer emits upstream-overlap reads from the previous chunk.
+// Copy only already-decided downstream HP/PS onto an unphased upstream owner.
+static void propagate_overlap_read_phase_to_output_owner(BamChunk& pre, const BamChunk& cur) {
+    if (pre.region.tid != cur.region.tid) return;
+    const size_t n_bams = std::min(pre.down_ovlp_read_i.size(), cur.up_ovlp_read_i.size());
+    for (size_t bi = 0; bi < n_bams; ++bi) {
+        const std::vector<int>& pre_list = pre.down_ovlp_read_i[bi];
+        const std::vector<int>& cur_list = cur.up_ovlp_read_i[bi];
+        if (pre_list.size() != cur_list.size()) {
+            throw std::runtime_error("overlap read count mismatch between adjacent chunks");
+        }
+        for (size_t j = 0; j < pre_list.size(); ++j) {
+            const int pre_read_i = pre_list[j];
+            const int cur_read_i = cur_list[j];
+            if (pre_read_i < 0 || static_cast<size_t>(pre_read_i) >= pre.reads.size() ||
+                cur_read_i < 0 || static_cast<size_t>(cur_read_i) >= cur.reads.size()) {
+                throw std::runtime_error("overlap read index out of bounds during output phase propagation");
+            }
+            if (pre.reads[static_cast<size_t>(pre_read_i)].is_skipped ||
+                cur.reads[static_cast<size_t>(cur_read_i)].is_skipped) {
+                continue;
+            }
+            if (pre.haps[static_cast<size_t>(pre_read_i)] != 0) continue;
+            const int cur_hap = cur.haps[static_cast<size_t>(cur_read_i)];
+            const hts_pos_t cur_ps = cur.phase_sets[static_cast<size_t>(cur_read_i)];
+            if (cur_hap == 0 || cur_ps <= 0) continue;
+            pre.haps[static_cast<size_t>(pre_read_i)] = cur_hap;
+            pre.phase_sets[static_cast<size_t>(pre_read_i)] = cur_ps;
+        }
+    }
+}
+
 void stitch_chunk_haps(std::vector<BamChunk>& chunks,
                        const Options* opts,
                        const PgbamSidecarData* pgbam_sidecar) {
@@ -772,6 +804,11 @@ void stitch_chunk_haps(std::vector<BamChunk>& chunks,
                                       *pgbam_sidecar,
                                       opts->pgbam_relaxed_cleanup_min_winning_threads,
                                       opts->pgbam_relaxed_cleanup_polarity_margin);
+    }
+    if (opts != nullptr && !opts->output_aln.empty()) {
+        for (size_t ii = chunks.size(); ii > 1; --ii) {
+            propagate_overlap_read_phase_to_output_owner(chunks[ii - 2], chunks[ii - 1]);
+        }
     }
 }
 
