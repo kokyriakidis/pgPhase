@@ -1431,7 +1431,55 @@ C1 reads with ps=500000:
 Result: C1 labels are coherent with C0; both in one phase block anchored at 450000.
 ```
 
-### 19.5 Pairing Semantics and Error Guards
+### 19.5 Minority-Outlier HP-Tag Conflicts
+
+The majority-vote flip decision is decisive by definition, but a minority of boundary reads will have voted against it. These reads end up with inconsistent HP tags across chunks.
+
+#### What "inconsistent HP tag" means
+
+Consider a three-read boundary where two reads are inconsistent (pre_hap ≠ cur_hap) and one is consistent (pre_hap == cur_hap):
+
+```text
+flip_score = +1 + 1 - 1 = +1   →   do_flip = true
+
+Reads and their vote:
+  readA: pre_hap=1, cur_hap=2  →  voted FOR flip  (inconsistent, +1)
+  readB: pre_hap=1, cur_hap=2  →  voted FOR flip  (inconsistent, +1)
+  readC: pre_hap=1, cur_hap=1  →  voted AGAINST flip (consistent, -1)
+```
+
+After `apply_chunk_flip_and_merge` applies `do_flip = true`:
+- readA: hap in cur chunk becomes 1 (was 2, flipped) → matches pre_hap=1. Consistent.
+- readB: hap in cur chunk becomes 1 (was 2, flipped) → matches pre_hap=1. Consistent.
+- readC: hap in cur chunk becomes 2 (was 1, flipped) → conflicts with pre_hap=1. **Inconsistent.**
+
+readC is the minority-outlier read: it agreed with the pre-chunk orientation, but the flip was applied globally to all cur-chunk reads, so its cur-chunk HP tag was involuntarily changed.
+
+#### What HP tag the read gets in the output BAM
+
+The HP tag in the output BAM is written from the **owning chunk's** `haps[]` array. A read is owned by the chunk in which it was first phased — whichever chunk's k-means assigned it. The owning chunk's `haps[]` is the source for BAM output; the overlap list only transfers phase to reads not yet assigned (those with `hap == 0`).
+
+`propagate_overlap_read_phase_to_output_owner` (called in `stitch_chunk_haps`) only fills in reads where `pre.haps[read] == 0` — it does **not** resolve conflicts where the pre-chunk already assigned a non-zero hap:
+
+```cpp
+// collect_phase.cpp — propagate_overlap_read_phase_to_output_owner
+if (pre.haps[static_cast<size_t>(pre_read_i)] != 0) continue;  // skip already-phased
+pre.haps[pre_read_i] = cur.haps[cur_read_i];  // only fills in unphased
+```
+
+So:
+- Reads owned by `cur` get the post-flip cur-chunk HP tag (the flipped value).
+- Reads owned by `pre` keep the pre-chunk HP tag unchanged.
+- A minority-outlier read owned by `pre` keeps its pre-chunk tag, even though its cur-chunk hap was flipped away from that value.
+- A minority-outlier read owned by `cur` gets the post-flip cur-chunk tag, even though its pre-chunk tag pointed the other way.
+
+#### Expected behavior
+
+This is the expected behavior, matching longcallD's majority-vote stitching model. longcallD's `flip_variant_hap` applies the same global flip to the entire chunk based on the majority of boundary reads, with no per-read arbitration for outliers. The minority-outlier reads' HP tags reflect their owning chunk's orientation after the flip — they are not retroactively corrected.
+
+The fraction of such reads is bounded by the vote margin: if `flip_score = N_inconsistent - N_consistent`, then `N_consistent < N_inconsistent`, so fewer than half of the boundary reads are minority outliers. In practice, when phasing signal is strong, this fraction is very small.
+
+### 19.6 Pairing Semantics and Error Guards
 
 The implementation uses longcallD-style j-th index pairing between `pre.down_ovlp_read_i` and
 `cur.up_ovlp_read_i`. It includes explicit runtime guards:
@@ -1443,7 +1491,7 @@ The implementation uses longcallD-style j-th index pairing between `pre.down_ovl
 These guards make stitching failures explicit instead of silently continuing with inconsistent
 boundary read pairing.
 
-### 19.6 Pipeline Architecture and Threading Model
+### 19.7 Pipeline Architecture and Threading Model
 
 #### Per-contig batch loop
 
@@ -1507,7 +1555,7 @@ This matches longcallD's `stitch_var_main`, which is also a sequential left-to-r
 
 Stitching holds every `BamChunk` of the contig in memory simultaneously. `mid_free_chunk` (called inside each parallel worker, §18.1) releases the heavy per-chunk intermediates — read variant profiles, noisy region interval trees, candidate depth tallies — beforehand, keeping only what stitching and output require: `reads[].alignment` (needed by `bam_aux_get("hs")` in the pgbam path and by phased-BAM output), `haps[]`, `phase_sets[]`, and `candidates[]`.
 
-### 19.7 pgbam Phase-Block Stitching
+### 19.8 pgbam Phase-Block Stitching
 
 When a pgbam sidecar is loaded, `stitch_chunk_haps` invokes the sidecar module in two places. First, it runs `stitch_phase_blocks_with_pgbam` inside each chunk to merge local phase blocks that share graph-thread evidence. Second, if `flip_chunk_hap(pre, cur, opts)` returns `false`, it calls `stitch_adjacent_chunks_with_pgbam` as a **pangenome-graph thread intersection** fallback.
 
