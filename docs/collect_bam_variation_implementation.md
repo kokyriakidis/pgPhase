@@ -1304,6 +1304,99 @@ After the clean-category k-means pass, pgPhase mirrors longcallD step 4 on final
 
 Step 4 re-phasing can modify pre-existing within-chunk hap assignments and phase-set structure, not only phase newly recovered sites.
 
+#### Step 4 Co-Iterative Outer Loop (`collect_noisy_vars_step4`)
+
+The outer loop is not a single linear pass. It retries undone regions until no further progress is possible:
+
+```
+while true:
+    for each undone noisy region:
+        ret = collect_noisy_vars1(...)
+        if ret >= 0: mark done; if ret > 0: any_new_var = true
+        if ret < 0:  leave undone (MSA could not separate reads — retry later)
+    if any_new_var:
+        assign_hap_based_on_germline_het_vars_kmeans(kCandGermlineVarCate)
+        ← re-assigns ALL reads using clean + noisy candidates found so far
+    if no region made progress this pass: break
+```
+
+A region returns `-1` when `collect_phase_set_with_both_haps` cannot find a phase set with sufficient reads on both haplotypes — the clean-site assignments did not reach this region with enough depth. Once another region succeeds and its new candidates trigger a k-means re-run, some previously-unphased reads may acquire hap assignments. The retry then finds enough phased reads to run the MSA. This handles dependency chains where adjacent noisy regions cannot bootstrap independently but together resolve each other.
+
+#### How Reads Are Split Before abPOA (`collect_phase_set_with_both_haps`)
+
+The clean-site k-means pass (Step 3.2) assigns each read a `hap` (1 or 2) and a `phase_set`. Step 4 uses those assignments directly — it does **not** re-run clustering from scratch inside the noisy region.
+
+`collect_phase_set_with_both_haps` scans all reads in the noisy window and finds the phase set that has the best representation of **both** haplotypes among fully-spanning reads (`min_hap_full_reads` threshold) and among all reads including partial-cover (`min_hap_reads` threshold). It picks the phase set that maximises `min(n_full_hap1, n_full_hap2)` — the minority side.
+
+If a qualifying phase set is found (`ps > 0`), the **PS-aware path** runs (`wfa_collect_noisy_aln_str_with_ps_hap`). If not, the **no-PS fallback** runs (`wfa_collect_noisy_aln_str_no_ps_hap`), which uses abPOA's internal k-means clustering to split reads without prior phase information.
+
+#### abPOA Runs Separately Per Haplotype — Reference Is Not Inside abPOA
+
+In the PS-aware path, reads are separated by haplotype **before** abPOA is called. abPOA is invoked twice, once per haplotype:
+
+```
+hap1 reads ──→ abpoa_partial_aln_msa_cons ──→ consensus₁ + per-read MSA rows
+hap2 reads ──→ abpoa_partial_aln_msa_cons ──→ consensus₂ + per-read MSA rows
+```
+
+The reference sequence is **not** an input to abPOA. After both abPOA calls complete, the reference is aligned to each haplotype's consensus independently via a separate WFA pairwise alignment:
+
+```cpp
+// align.cpp — after abPOA, for each haplotype ci:
+wfa_collect_aln_str(opts, ref_seq, ref_seq_len,
+                    cons_seqs[ci].data(), cons_lens[ci], ...
+                    aln_strs[ci][0]);  // [0] = ref-vs-cons alignment string
+```
+
+The result is a per-haplotype `aln_strs[ci][0]` (ref-vs-consensus) plus one per-read alignment string (read-vs-consensus row from abPOA MSA). These are the two coordinate systems needed to place each variant in reference coordinates and score each read's allele at that variant.
+
+#### Variant Candidate Generation: Sorted Merge of Two Ref-Diff Lists
+
+Each haplotype's consensus is independently diffed against the reference by `make_cand_vars_from_msa`, producing two position-sorted variant lists:
+
+```
+ref ↔ consensus₁  →  hap1_vars  (sorted by position + alt)
+ref ↔ consensus₂  →  hap2_vars  (sorted by position + alt)
+```
+
+These two lists are then merged in a single sorted walk (`update_cand_var_profile_from_cons_aln_str2`) using `exact_comp_var_site` at each step. `exact_comp_var_site` requires identical position **and** identical alt sequence — 28-T and 29-T at the same position are **not** equal and remain separate candidates.
+
+The three-way outcome of each comparison determines the variant's category and `var_from_cons_idx` bitmask:
+
+| Comparison result | `var_from_cons_idx` | Category | Meaning |
+|---|---|---|---|
+| hap1 has variant, hap2 does not (or different alt) | `1` | `NoisyCandHet` | variant in hap1 consensus only |
+| hap2 has variant, hap1 does not (or different alt) | `2` | `NoisyCandHet` | variant in hap2 consensus only |
+| both have identical variant at same position | `3` | `NoisyCandHom` | variant in both consensuses |
+
+Any remaining entries in either list after the walk completes are appended as `NoisyCandHet` with the appropriate index (1 or 2).
+
+#### Per-Read Allele Assignment (`update_cand_var_profile_from_cons_aln_str21`)
+
+After the merged variant list is built, each read gets its allele at each variant site evaluated from its **own MSA row** — not inherited from the consensus. The consensus only establishes where the variant is; the read's actual sequence at that MSA column determines the allele.
+
+For a hap1 read at a variant site with `var_from_cons_idx = 1`:
+
+```cpp
+if (var_from_cons_idx[i] & clu_idx) {       // this cluster's variant
+    allele_i = get_var_allele_i_from_cons_aln_str(
+                   cons_aln_str,             // read's own MSA row vs consensus
+                   var, alt_pos, cons_sim_thres, &full_cover);
+} else {                                     // other cluster's variant
+    allele_i = 0;                            // forced REF by construction
+}
+```
+
+`cons_sim_thres = 0.9`: the read must match the ALT sequence at ≥90% of the variant's MSA columns to receive `allele=1`. Below that threshold the read gets `allele=0`.
+
+The per-read allele outcomes for a `NoisyCandHet` with `var_from_cons_idx=1`:
+- **hap1 read, covers site, matches ALT** → `allele=1`
+- **hap1 read, covers site, has REF** → `allele=0` (lost the consensus vote at this column)
+- **hap1 read, does not span site** → `full_cover=0`, nothing recorded
+- **hap2 read (any)** → `allele=0` forced by `var_from_cons_idx & clu_idx == 0`
+
+This means a read that contributed to consensus₁ is not automatically assigned ALT — its own sequence content determines its allele. A minority of hap1 reads carrying REF at a site will get `allele=0` even though the consensus went ALT.
+
 Implementation details aligned to longcallD:
 
 - **Call order parity:** `collect_reg_ref_bseq` runs before `collect_noisy_reg_reads` so read extraction uses the clipped noisy boundaries.
