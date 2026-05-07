@@ -4,8 +4,21 @@ THIRD_PARTY ?= $(abspath third_party)
 WFA2_ROOT ?= $(THIRD_PARTY)/WFA2-lib
 ABPOA_ROOT ?= $(THIRD_PARTY)/abPOA
 EDLIB_ROOT ?= $(abspath ../longcallD/edlib)
+GBZ_BASE_ROOT ?= $(THIRD_PARTY)/gbz-base
+# Prefer the rustup-managed toolchain over any system-installed rustc/cargo.
+CARGO       ?= $(firstword $(wildcard $(HOME)/.cargo/bin/cargo) cargo)
+CARGO_RUSTC ?= $(firstword $(wildcard $(HOME)/.cargo/bin/rustc) rustc)
+
+GBZ_QUERY_BIN = $(GBZ_BASE_ROOT)/target/release/query
+GAF2DB_BIN    = $(GBZ_BASE_ROOT)/target/release/gaf2db
+GBZ2DB_BIN    = $(GBZ_BASE_ROOT)/target/release/gbz2db
+
+GBZ_QUERY_DEFAULT ?= $(GBZ_BASE_ROOT)/target/release/query
+GAF2DB_DEFAULT    ?= $(GBZ_BASE_ROOT)/target/release/gaf2db
 
 CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -MMD -MP
+CXXFLAGS += -DGBZ_QUERY_DEFAULT='"$(GBZ_QUERY_DEFAULT)"' \
+            -DGAF2DB_DEFAULT='"$(GAF2DB_DEFAULT)"'
 WFA_CPPFLAGS = -I$(WFA2_ROOT)
 AB_CPPFLAGS = -I$(ABPOA_ROOT)/include
 EDLIB_CPPFLAGS = -I$(EDLIB_ROOT)/include
@@ -17,6 +30,9 @@ ABPOA_LIB = $(ABPOA_ROOT)/lib/libabpoa.a
 
 SOURCES_CXX = src/main.cpp \
 	src/collect_pipeline.cpp \
+	src/build_catalog.cpp \
+	src/graph_collect.cpp \
+	src/graph_pipeline.cpp \
 	src/bam_digar.cpp \
 	src/collect_var.cpp \
 	src/collect_phase.cpp \
@@ -24,7 +40,10 @@ SOURCES_CXX = src/main.cpp \
 	src/collect_phase_noisy.cpp \
 	src/align.cpp \
 	src/collect_bam_output.cpp \
-	src/collect_output.cpp
+	src/collect_output.cpp \
+	src/graph_bam_adapter.cpp \
+	src/graph_sites.cpp \
+	src/graph_query.cpp
 SOURCES_C = src/sdust.c src/cgranges.c src/kalloc.c
 
 OBJS = $(SOURCES_CXX:.cpp=.o) $(SOURCES_C:.c=.o)
@@ -35,12 +54,18 @@ LDFLAGS ?= -lhts -lm -lz -lpthread
 
 -include $(patsubst %.cpp,%.d,$(SOURCES_CXX))
 
-.PHONY: all clean check third-party-libs portable-bundle release release-strict
+.PHONY: all clean check unit-tests third-party-libs gbz-base portable-bundle release release-strict
 
 all: pgphase
 
 check: pgphase
 	bash scripts/validate_collect_gates.sh
+
+unit-tests: test_phase_block_stitch test_graph_sites test_graph_phase test_graph_bam_adapter
+	./test_phase_block_stitch
+	./test_graph_sites
+	./test_graph_phase
+	./test_graph_bam_adapter
 
 portable-bundle: pgphase
 	bash scripts/make_portable_bundle.sh
@@ -62,6 +87,11 @@ src/align.o: src/align.cpp
 
 third-party-libs: $(WFA2_LIB) $(ABPOA_LIB)
 
+gbz-base: $(GBZ_QUERY_BIN) $(GAF2DB_BIN)
+
+$(GBZ_QUERY_BIN) $(GAF2DB_BIN) $(GBZ2DB_BIN):
+	cd $(GBZ_BASE_ROOT) && RUSTC=$(CARGO_RUSTC) $(CARGO) build --release --bin query --bin gaf2db --bin gbz2db
+
 $(WFA2_LIB):
 	$(MAKE) -C "$(WFA2_ROOT)" setup
 	$(MAKE) -C "$(WFA2_ROOT)" lib_wfa
@@ -75,5 +105,14 @@ $(EDLIB_OBJ): $(EDLIB_ROOT)/src/edlib.cpp
 pgphase: $(OBJS) $(WFA2_LIB) $(ABPOA_LIB)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
 
+test_graph_sites: src/test_graph_sites.cpp src/graph_sites.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+test_graph_phase: src/test_graph_phase.cpp src/graph_phase.o src/phase_engine.o src/graph_sites.o src/graph_query.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
+test_graph_bam_adapter: src/test_graph_bam_adapter.cpp src/graph_bam_adapter.o src/graph_sites.o src/graph_query.o src/collect_phase.o src/collect_phase_pgbam.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ src/cgranges.o src/kalloc.o $(LDFLAGS)
+
 clean:
-	rm -f pgphase src/*.o src/*.d
+	rm -f pgphase test_graph_sites test_graph_phase test_graph_bam_adapter src/*.o src/*.d

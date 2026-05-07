@@ -212,6 +212,36 @@ struct Options {
     bool pgbam_relaxed_cleanup_pass = true;
     int pgbam_relaxed_cleanup_polarity_margin = 1;
     int pgbam_relaxed_cleanup_min_winning_threads = 1;
+    /** Reference sample name for GBZ interval queries (e.g. "CHM13"; auto-derived from FASTA if empty). */
+    std::string graph_sample;
+    /** Optional GBZ-base database for future graph-native snarl/read queries. */
+    std::string gbz_db;
+    /** Optional raw GAF alignments for future graph-native read traversal support. */
+    std::string gaf_file;
+    /** Optional GAF-base database/cache for graph-native ReadSet queries. */
+    std::string gaf_db;
+    /** Optional precomputed vg deconstruct VCF used as a development/debug graph-site catalog. */
+    std::string graph_sites_vcf;
+    /** Optional diagnostic dump of the parsed graph-site catalog. */
+    std::string graph_sites_tsv;
+    /** Optional diagnostic dump of exact read->graph-site allele observations. */
+    std::string graph_read_support_tsv;
+    /** Optional diagnostic dump of per-graph-site allele counts from exact read support. */
+    std::string graph_site_counts_tsv;
+    /** Optional diagnostic dump of sparse per-read graph-site allele profiles. */
+    std::string graph_read_profile_tsv;
+    /** Optional experimental graph-site hap consensus output after graph-only phasing. */
+    std::string graph_phase_sites_tsv;
+    /** Optional experimental graph read HAP/PHASE_SET output after graph-only phasing. */
+    std::string graph_phase_reads_tsv;
+    /** GBZ-base query binary. */
+#ifndef GBZ_QUERY_DEFAULT
+#define GBZ_QUERY_DEFAULT "query"
+#endif
+    std::string gbz_query_bin = GBZ_QUERY_DEFAULT;
+    /** GAF-base construction binary. */
+    std::string gaf2db_bin = "gaf2db";
+    int graph_between_limit_nodes = 100000;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
     /** CLI command string used for PG:CL header field in phased SAM/BAM/CRAM output. */
     std::string command_line;

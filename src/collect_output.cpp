@@ -193,7 +193,20 @@ void write_variants_tsv_records(std::ostream& out,
         std::string alt_seq = key.alt.empty() ? "." : key.alt;
 
         if (key.type == VariantType::Snp) {
-            ref_seq = std::string(1, ref.base(key.tid, key.pos, header));
+            // ref_len=1 for true SNP; ref_len>1 for MNP/complex equal-length substitution.
+            if (key.ref_len <= 1) {
+                ref_seq = std::string(1, ref.base(key.tid, key.pos, header));
+            } else {
+                ref_seq = ref.subseq(key.tid, key.pos, key.ref_len, header);
+            }
+        } else if (key.type == VariantType::Insertion) {
+            // ref_len=0: left-anchored — anchor base sits one position before key.pos.
+            // ref_len>0: complex/unanchored insertion — full ref span at key.pos.
+            if (key.ref_len == 0) {
+                ref_seq = std::string(1, ref.base(key.tid, key.pos - 1, header));
+            } else {
+                ref_seq = ref.subseq(key.tid, key.pos, key.ref_len, header);
+            }
         } else if (key.type == VariantType::Deletion) {
             ref_seq = ref.subseq(key.tid, key.pos, key.ref_len, header);
         }
