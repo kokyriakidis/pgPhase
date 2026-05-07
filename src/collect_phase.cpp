@@ -732,7 +732,8 @@ static bool flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
 
     const bool touch_read_phase =
         opts != nullptr &&
-        (!opts->output_aln.empty() ||
+        (opts->touch_read_phase ||
+         !opts->output_aln.empty() ||
          !opts->phase_read_tsv.empty() ||
          !opts->graph_phase_reads_tsv.empty());
     apply_chunk_flip_and_merge(cur,

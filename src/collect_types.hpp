@@ -234,6 +234,8 @@ struct Options {
     std::string graph_phase_sites_tsv;
     /** Optional experimental graph read HAP/PHASE_SET output after graph-only phasing. */
     std::string graph_phase_reads_tsv;
+    /** When true, chunk stitching flips per-read hap assignments (not just candidates). */
+    bool touch_read_phase = false;
     /** GBZ-base query binary. */
 #ifndef GBZ_QUERY_DEFAULT
 #define GBZ_QUERY_DEFAULT "query"

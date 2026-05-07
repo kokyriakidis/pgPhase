@@ -138,6 +138,7 @@ struct GraphOptions {
     std::string graph_read_profile_tsv;
     std::string graph_phase_sites_tsv = "graph_phase_sites.tsv";
     std::string graph_phase_reads_tsv = "graph_phase_reads.tsv";
+    std::string graph_phase_bam;
     std::string graph_filtered_sites_tsv;
     std::string graph_contig;
     hts_pos_t graph_interval_beg = -1;
@@ -157,6 +158,7 @@ enum LongOption {
     kGraphPhaseSitesTsvOption,
     kGraphPhaseReadsTsvOption,
     kGraphFilteredSitesTsvOption,
+    kGraphPhaseBamOption,
     kGraphContigOption,
     kGraphIntervalOption,
     kGraphChunkSizeOption,
@@ -177,6 +179,7 @@ void print_help() {
         << "      --chunk-size INT          Phasing chunk size in bp [500000]\n"
         << "      --graph-phase-sites FILE  Output: graph-site hap consensus TSV [graph_phase_sites.tsv]\n"
         << "      --graph-phase-reads FILE  Output: read HAP / PHASE_SET TSV [graph_phase_reads.tsv]\n"
+        << "      --graph-phase-bam FILE    Output: unaligned BAM with HP/PS tags per read\n"
         << "      --graph-sites-tsv FILE    Diagnostic: parsed graph-site catalog\n"
         << "      --graph-read-support FILE Diagnostic: read->site allele support TSV\n"
         << "      --graph-site-counts FILE  Diagnostic: site allele depth/count TSV\n"
@@ -353,9 +356,9 @@ void write_required_outputs(const GraphOptions& opts,
         if (!out) throw std::runtime_error("failed to open graph phase-site output: " + opts.graph_phase_sites_tsv);
         write_graph_bam_variants_tsv(out, graph_chunks, catalog);
     }
-    {
-        // Fast second pass: collect every read name that passed the MAPQ filter,
-        // so reads with no site observations can be emitted as hap=0.
+    if (!opts.graph_phase_reads_tsv.empty() || !opts.graph_phase_bam.empty()) {
+        // Collect every read name that passed the MAPQ filter so reads with no
+        // site observations are also included as unphased (HP=0) in the output.
         std::vector<std::string> all_read_names;
         {
             std::ifstream gaf(opts.gaf_file);
@@ -383,9 +386,14 @@ void write_required_outputs(const GraphOptions& opts,
                 std::unique(all_read_names.begin(), all_read_names.end()),
                 all_read_names.end());
         }
-        std::ofstream out(opts.graph_phase_reads_tsv);
-        if (!out) throw std::runtime_error("failed to open graph phase-read output: " + opts.graph_phase_reads_tsv);
-        write_graph_bam_phase_reads_tsv(out, graph_chunks, all_read_names);
+        if (!opts.graph_phase_reads_tsv.empty()) {
+            std::ofstream out(opts.graph_phase_reads_tsv);
+            if (!out) throw std::runtime_error("failed to open graph phase-read output: " + opts.graph_phase_reads_tsv);
+            write_graph_bam_phase_reads_tsv(out, graph_chunks, all_read_names);
+        }
+        if (!opts.graph_phase_bam.empty()) {
+            write_graph_bam_phase_bam(opts.graph_phase_bam, graph_chunks, all_read_names);
+        }
     }
 }
 
@@ -414,6 +422,7 @@ int phase_graph(int argc, char* argv[]) {
         {"graph-phase-sites",   required_argument, nullptr, kGraphPhaseSitesTsvOption},
         {"graph-phase-reads",   required_argument, nullptr, kGraphPhaseReadsTsvOption},
         {"graph-filtered-sites",required_argument, nullptr, kGraphFilteredSitesTsvOption},
+        {"graph-phase-bam",     required_argument, nullptr, kGraphPhaseBamOption},
         {"contig",              required_argument, nullptr, kGraphContigOption},
         {"interval",            required_argument, nullptr, kGraphIntervalOption},
         {"chunk-size",          required_argument, nullptr, kGraphChunkSizeOption},
@@ -437,6 +446,7 @@ int phase_graph(int argc, char* argv[]) {
             case kGraphPhaseSitesTsvOption: opts.graph_phase_sites_tsv = optarg; break;
             case kGraphPhaseReadsTsvOption:      opts.graph_phase_reads_tsv = optarg; break;
             case kGraphFilteredSitesTsvOption:   opts.graph_filtered_sites_tsv = optarg; break;
+            case kGraphPhaseBamOption:           opts.graph_phase_bam = optarg; break;
             case kGraphContigOption:        opts.graph_contig = optarg; break;
             case kGraphIntervalOption:
                 if (!parse_half_open_interval(optarg, opts.graph_interval_beg, opts.graph_interval_end)) {
@@ -470,6 +480,7 @@ int phase_graph(int argc, char* argv[]) {
     try {
         pgphase_collect::Options filter_opts;
         filter_opts.verbose = opts.verbose;
+        filter_opts.touch_read_phase = true;
 
         GraphSiteCatalog catalog;
         std::vector<GraphBamChunkBuildResult> graph_chunks;
