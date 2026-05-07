@@ -16,6 +16,7 @@
 #include <string>
 #include <cstring>
 #include <list>
+#include <optional>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <thread>
@@ -223,19 +224,22 @@ struct GraphChunkWorkResult {
 };
 
 // VCF+GAF fast path: catalogs are pre-sliced; rows are loaded per-chunk from disk shards.
-// Each worker loads only the rows for the chunk it is currently building, keeping
-// peak RAM proportional to (n_workers × one_chunk_rows) instead of all rows at once.
+// Processes the half-open index range [batch_beg, batch_end) in parallel, returning
+// results[0..batch_size-1] corresponding to chunk indices [batch_beg..batch_end-1].
+// Peak RAM = n_workers × one_chunk_rows (shard data) + batch_size × BamChunk.
 static std::vector<GraphChunkWorkResult> run_vcf_gaf_chunks_parallel(
     const std::vector<pgphase_collect::GraphSiteCatalog>& chunk_catalogs,
     const ChunkRowShard& shard,
     const std::vector<std::pair<hts_pos_t, hts_pos_t>>& intervals,
+    size_t batch_beg,
+    size_t batch_end,
     int n_threads,
     const std::string& contig,
     const pgphase_collect::Options& filter_opts) {
     using namespace pgphase_collect;
-    const size_t n = intervals.size();
-    std::vector<GraphChunkWorkResult> results(n);
-    const size_t n_workers = std::min<size_t>(static_cast<size_t>(n_threads), n);
+    const size_t batch_size = batch_end - batch_beg;
+    std::vector<GraphChunkWorkResult> results(batch_size);
+    const size_t n_workers = std::min<size_t>(static_cast<size_t>(n_threads), batch_size);
     std::atomic<size_t> next{0};
     std::exception_ptr first_error;
     std::mutex err_mutex;
@@ -245,14 +249,15 @@ static std::vector<GraphChunkWorkResult> run_vcf_gaf_chunks_parallel(
         workers.emplace_back([&]() {
             try {
                 while (true) {
-                    const size_t i = next.fetch_add(1);
-                    if (i >= n) break;
+                    const size_t offset = next.fetch_add(1);
+                    if (offset >= batch_size) break;
+                    const size_t i = batch_beg + offset;
                     const std::vector<GraphReadAllele> chunk_rows = shard.load_chunk(i);
-                    results[i].build_result = build_graph_bam_chunk(
+                    results[offset].build_result = build_graph_bam_chunk(
                         chunk_catalogs[i], chunk_rows, contig,
                         intervals[i].first, intervals[i].second,
                         static_cast<int>(i), filter_opts);
-                    results[i].catalog = chunk_catalogs[i];
+                    results[offset].catalog = chunk_catalogs[i];
                 }
             } catch (...) {
                 std::lock_guard<std::mutex> lock(err_mutex);
@@ -312,89 +317,31 @@ static std::vector<GraphChunkWorkResult> run_gbz_chunks_parallel(
     return results;
 }
 
-void write_required_outputs(const GraphOptions& opts,
-                            const pgphase_collect::GraphSiteCatalog& catalog,
-                            const ChunkRowShard& shard,
-                            const std::vector<pgphase_collect::GraphBamChunkBuildResult>& graph_chunks,
-                            int min_mapq) {
-    using namespace pgphase_collect;
-
-    if (!opts.graph_sites_tsv.empty()) {
-        std::ofstream out(opts.graph_sites_tsv);
-        if (!out) throw std::runtime_error("failed to open graph-site output: " + opts.graph_sites_tsv);
-        write_graph_site_catalog_tsv(out, catalog);
-    }
-    if (!opts.graph_read_support_tsv.empty()) {
-        std::ofstream out(opts.graph_read_support_tsv);
-        if (!out) throw std::runtime_error("failed to open graph read-support output: " + opts.graph_read_support_tsv);
-        std::vector<GraphReadAllele> all_rows;
-        const size_t n_chunks = shard.paths.empty() ? 0 : shard.paths[0].size();
-        for (size_t ci = 0; ci < n_chunks; ++ci) {
-            const std::vector<GraphReadAllele> chunk_rows = shard.load_chunk(ci);
-            all_rows.insert(all_rows.end(), chunk_rows.begin(), chunk_rows.end());
+// Collect unique, MAPQ-filtered read names from the GAF file.
+static std::vector<std::string> collect_gaf_read_names(const std::string& gaf_file, int min_mapq) {
+    std::vector<std::string> names;
+    std::ifstream gaf(gaf_file);
+    std::string line;
+    while (std::getline(gaf, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        size_t pos = 0, field = 0;
+        int mapq = 255;
+        std::string read_name;
+        while (true) {
+            const size_t tab = line.find('\t', pos);
+            const size_t len = (tab == std::string::npos) ? line.size() - pos : tab - pos;
+            if (field == 0) read_name.assign(line, pos, len);
+            else if (field == 11) { mapq = std::atoi(line.c_str() + pos); break; }
+            if (tab == std::string::npos) break;
+            pos = tab + 1;
+            ++field;
         }
-        write_graph_read_alleles_tsv(out, all_rows);
+        if (mapq >= min_mapq && !read_name.empty())
+            names.push_back(std::move(read_name));
     }
-    if (!opts.graph_site_counts_tsv.empty()) {
-        std::ofstream out(opts.graph_site_counts_tsv);
-        if (!out) throw std::runtime_error("failed to open graph site-count output: " + opts.graph_site_counts_tsv);
-        write_graph_bam_site_counts_tsv(out, graph_chunks);
-    }
-    if (!opts.graph_read_profile_tsv.empty()) {
-        std::ofstream out(opts.graph_read_profile_tsv);
-        if (!out) throw std::runtime_error("failed to open graph read-profile output: " + opts.graph_read_profile_tsv);
-        write_graph_bam_read_profiles_tsv(out, graph_chunks);
-    }
-    if (!opts.graph_filtered_sites_tsv.empty()) {
-        std::ofstream out(opts.graph_filtered_sites_tsv);
-        if (!out) throw std::runtime_error("failed to open graph filtered-sites output: " + opts.graph_filtered_sites_tsv);
-        write_graph_bam_filtered_sites_tsv(out, graph_chunks);
-    }
-
-    {
-        std::ofstream out(opts.graph_phase_sites_tsv);
-        if (!out) throw std::runtime_error("failed to open graph phase-site output: " + opts.graph_phase_sites_tsv);
-        write_graph_bam_variants_tsv(out, graph_chunks, catalog);
-    }
-    if (!opts.graph_phase_reads_tsv.empty() || !opts.graph_phase_bam.empty()) {
-        // Collect every read name that passed the MAPQ filter so reads with no
-        // site observations are also included as unphased (HP=0) in the output.
-        std::vector<std::string> all_read_names;
-        {
-            std::ifstream gaf(opts.gaf_file);
-            std::string line;
-            while (std::getline(gaf, line)) {
-                if (line.empty() || line[0] == '#') continue;
-                // GAF col 0 = read name, col 11 (0-indexed) = MAPQ.
-                size_t pos = 0, field = 0;
-                int mapq = 255;
-                std::string read_name;
-                while (true) {
-                    const size_t tab = line.find('\t', pos);
-                    const size_t len = (tab == std::string::npos) ? line.size() - pos : tab - pos;
-                    if (field == 0) read_name.assign(line, pos, len);
-                    else if (field == 11) { mapq = std::atoi(line.c_str() + pos); break; }
-                    if (tab == std::string::npos) break;
-                    pos = tab + 1;
-                    ++field;
-                }
-                if (mapq >= min_mapq && !read_name.empty())
-                    all_read_names.push_back(std::move(read_name));
-            }
-            std::sort(all_read_names.begin(), all_read_names.end());
-            all_read_names.erase(
-                std::unique(all_read_names.begin(), all_read_names.end()),
-                all_read_names.end());
-        }
-        if (!opts.graph_phase_reads_tsv.empty()) {
-            std::ofstream out(opts.graph_phase_reads_tsv);
-            if (!out) throw std::runtime_error("failed to open graph phase-read output: " + opts.graph_phase_reads_tsv);
-            write_graph_bam_phase_reads_tsv(out, graph_chunks, all_read_names);
-        }
-        if (!opts.graph_phase_bam.empty()) {
-            write_graph_bam_phase_bam(opts.graph_phase_bam, graph_chunks, all_read_names);
-        }
-    }
+    std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
+    return names;
 }
 
 hts_pos_t catalog_end_bound(const pgphase_collect::GraphSiteCatalog& catalog) {
@@ -482,8 +429,8 @@ int phase_graph(int argc, char* argv[]) {
         filter_opts.verbose = opts.verbose;
         filter_opts.touch_read_phase = true;
 
+        // Accumulates the contig/interval-filtered sites for graph_sites_tsv diagnostic output.
         GraphSiteCatalog catalog;
-        std::vector<GraphBamChunkBuildResult> graph_chunks;
 
         // Load catalog; split into chunk-size intervals; pre-route GAF rows per chunk.
         GraphSiteCatalog full_catalog = load_graph_site_catalog_from_vcf(opts.graph_sites_vcf);
@@ -577,26 +524,125 @@ int phase_graph(int argc, char* argv[]) {
         if (opts.verbose >= 1)
             std::cerr << "GAF scan produced " << total_rows << " read-allele rows\n";
 
-        auto results = run_vcf_gaf_chunks_parallel(chunk_catalogs, shard, intervals,
-                                                   opts.threads, opts.graph_contig, filter_opts);
-        graph_chunks.reserve(results.size());
-        for (auto& r : results) {
-            append_catalog(catalog, r.catalog);
-            graph_chunks.push_back(std::move(r.build_result));
-        }
-
         Options phase_opts;
         phase_opts.read_technology = ReadTechnology::Hifi;
         phase_opts.output_aln = "graph";
         phase_opts.verbose = opts.verbose;
-        phase_graph_bam_chunks(graph_chunks, phase_opts);
-        write_required_outputs(opts, catalog, shard, graph_chunks, filter_opts.min_mapq);
+
+        // Build site_id → GraphSite* lookup once; reused for all chunks.
+        std::unordered_map<std::string, const GraphSite*> site_map;
+        site_map.reserve(full_catalog.sites.size());
+        for (const GraphSite& site : full_catalog.sites) {
+            if (!site.id.empty() && site.id != ".")
+                site_map.emplace(site.id, &site);
+        }
+
+        // Open streaming output files early so bad paths fail before the expensive build.
+        auto open_out = [](const std::string& path) -> std::ofstream {
+            if (path.empty()) return {};
+            std::ofstream f(path);
+            if (!f) throw std::runtime_error("failed to open output: " + path);
+            return f;
+        };
+        std::ofstream variants_out    = open_out(opts.graph_phase_sites_tsv);
+        std::ofstream site_counts_out = open_out(opts.graph_site_counts_tsv);
+        std::ofstream profiles_out    = open_out(opts.graph_read_profile_tsv);
+        std::ofstream filtered_out    = open_out(opts.graph_filtered_sites_tsv);
+
+        // Write per-file headers once.
+        if (variants_out)    write_graph_bam_variants_tsv_header(variants_out);
+        if (site_counts_out) write_graph_bam_site_counts_tsv_header(site_counts_out);
+        if (profiles_out)    write_graph_bam_read_profiles_tsv_header(profiles_out);
+        if (filtered_out)    write_graph_bam_filtered_sites_tsv_header(filtered_out);
+
+        // Streaming batch loop — mirrors the BAM path's reg_chunk_i batching.
+        // Build n_per_batch chunks in parallel → assign hap → stitch pair-by-pair →
+        // emit finalized chunks immediately → accumulate compact read assignments.
+        // Peak BamChunk RAM = O(n_per_batch × one_chunk) instead of O(all_chunks).
+        const size_t n_per_batch = static_cast<size_t>(std::max(1, opts.threads));
+        std::optional<GraphBamChunkBuildResult> prev_chunk;
+        std::unordered_map<std::string, PhaseReadOutputRow> rows_by_read;
+
+        for (size_t batch_beg = 0; batch_beg < n; batch_beg += n_per_batch) {
+            const size_t batch_end = std::min(batch_beg + n_per_batch, n);
+            auto results = run_vcf_gaf_chunks_parallel(
+                chunk_catalogs, shard, intervals,
+                batch_beg, batch_end,
+                opts.threads, opts.graph_contig, filter_opts);
+
+            for (size_t bi = 0; bi < results.size(); ++bi) {
+                append_catalog(catalog, results[bi].catalog);
+                GraphBamChunkBuildResult cur = std::move(results[bi].build_result);
+
+                assign_graph_chunk_hap(cur, phase_opts);
+
+                // Build-time outputs: written before stitch (don't need phasing).
+                if (site_counts_out) write_graph_bam_site_counts_tsv_rows(site_counts_out, cur);
+                if (profiles_out)    write_graph_bam_read_profiles_tsv_rows(profiles_out, cur);
+                if (filtered_out)    write_graph_bam_filtered_sites_tsv_rows(filtered_out, cur);
+
+                // Stitch cur with prev; prev becomes fully finalized.
+                if (prev_chunk.has_value()) {
+                    stitch_graph_chunk_pair(*prev_chunk, cur, phase_opts);
+                    // Stitch-time outputs for the now-finalized prev chunk.
+                    if (variants_out) write_graph_bam_variants_tsv_rows(variants_out, *prev_chunk, site_map);
+                    merge_graph_chunk_into_read_rows(rows_by_read, *prev_chunk);
+                }
+
+                // cur becomes the new prev; old prev is freed here.
+                prev_chunk = std::move(cur);
+            }
+        }
+
+        // Finalize the last chunk (no following chunk to stitch with).
+        if (prev_chunk.has_value()) {
+            if (variants_out) write_graph_bam_variants_tsv_rows(variants_out, *prev_chunk, site_map);
+            merge_graph_chunk_into_read_rows(rows_by_read, *prev_chunk);
+            prev_chunk.reset();
+        }
+
+        // graph_sites_tsv: write once after building the filtered catalog.
+        if (!opts.graph_sites_tsv.empty()) {
+            std::ofstream out(opts.graph_sites_tsv);
+            if (!out) throw std::runtime_error("failed to open graph-site output: " + opts.graph_sites_tsv);
+            write_graph_site_catalog_tsv(out, catalog);
+        }
+
+        // graph_read_support_tsv: re-scan shards (diagnostic, raw rows, no phasing needed).
+        if (!opts.graph_read_support_tsv.empty()) {
+            std::ofstream out(opts.graph_read_support_tsv);
+            if (!out) throw std::runtime_error("failed to open graph read-support output: " + opts.graph_read_support_tsv);
+            const size_t n_shards = shard.paths.empty() ? 0 : shard.paths[0].size();
+            std::vector<GraphReadAllele> all_rows;
+            for (size_t ci = 0; ci < n_shards; ++ci) {
+                const auto chunk_rows = shard.load_chunk(ci);
+                all_rows.insert(all_rows.end(), chunk_rows.begin(), chunk_rows.end());
+            }
+            write_graph_read_alleles_tsv(out, all_rows);
+        }
+
+        // Phase BAM / reads TSV: write from the accumulated per-read map.
+        if (!opts.graph_phase_reads_tsv.empty() || !opts.graph_phase_bam.empty()) {
+            // Second GAF pass: collect all MAPQ-passing read names so reads with
+            // no site observations are included as unphased in the output.
+            const auto all_read_names =
+                collect_gaf_read_names(opts.gaf_file, filter_opts.min_mapq);
+
+            if (!opts.graph_phase_reads_tsv.empty()) {
+                std::ofstream out(opts.graph_phase_reads_tsv);
+                if (!out) throw std::runtime_error("failed to open graph phase-read output: " + opts.graph_phase_reads_tsv);
+                write_graph_bam_phase_reads_tsv_from_rows(out, rows_by_read, all_read_names);
+            }
+            if (!opts.graph_phase_bam.empty()) {
+                write_graph_bam_phase_bam_from_rows(opts.graph_phase_bam, rows_by_read, all_read_names);
+            }
+        }
 
         if (opts.verbose >= 1) {
             std::cerr << "Graph phasing used " << catalog.sites.size()
                       << " graph sites, " << total_rows
                       << " exact read-allele rows, and "
-                      << graph_chunks.size() << " graph chunk(s)\n";
+                      << n << " graph chunk(s)\n";
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
