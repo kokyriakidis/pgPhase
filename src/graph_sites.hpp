@@ -60,6 +60,14 @@ GraphSiteCatalog load_graph_site_catalog_from_vcf(
     const std::vector<RegionFilter>& filters = {},
     bool keep_allele_traversal_strings = true);
 
+// Returns the ordered list of distinct reference-contig names present in a VCF.
+// For bgzipped+indexed VCFs, reads the tabix/csi sequence name table (fast, no
+// data scan).  For plain-text VCFs, streams all data lines (linear time).
+// Names are normalised: pangenome prefixes like "CHM13#0#chr20" → "chr20".
+// Deduplication preserves VCF-header order for indexed files and uses lexicographic
+// order for the streaming fallback.
+std::vector<std::string> load_graph_site_contig_names(const std::string& vcf_path);
+
 GraphSiteCatalog load_graph_site_catalog_from_gfa_text(const std::string& gfa_text,
                                                        const std::string& reference_sample,
                                                        const std::string& contig);
