@@ -111,7 +111,7 @@ test_graph_sites: src/test_graph_sites.cpp src/graph_sites.o
 test_graph_phase: src/test_graph_phase.cpp src/graph_phase.o src/phase_engine.o src/graph_sites.o src/graph_query.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-test_graph_bam_adapter: src/test_graph_bam_adapter.cpp src/graph_bam_adapter.o src/graph_sites.o src/graph_query.o src/collect_phase.o src/collect_phase_pgbam.o
+test_graph_bam_adapter: src/test_graph_bam_adapter.cpp src/graph_bam_adapter.o src/graph_sites.o src/graph_query.o src/collect_phase.o src/collect_phase_pgbam.o src/collect_output.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ src/cgranges.o src/kalloc.o $(LDFLAGS)
 
 clean:

@@ -3,6 +3,8 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 using namespace pgphase_collect;
 
@@ -324,6 +326,73 @@ int main() {
     write_graph_bam_phase_reads_tsv(reads, chunks);
     ok &= check(reads.str().find("read_a") != std::string::npos,
                 "BAM-derived graph phase read output");
+
+    {
+        auto make_phase_read_chunk = [](int chunk_id,
+                                        int hap,
+                                        hts_pos_t phase_set,
+                                        const std::vector<std::pair<std::string, int>>& obs) {
+            GraphBamChunkBuildResult out;
+            out.chunk.region.chunk_id = chunk_id;
+            ReadRecord read;
+            read.qname = "dup_read";
+            out.chunk.reads.push_back(std::move(read));
+            out.chunk.haps = {hap};
+            out.chunk.phase_sets = {phase_set};
+            for (const auto& item : obs) {
+                out.site_ids.push_back(item.first);
+                CandidateVariant cand;
+                cand.phase_set = phase_set;
+                out.chunk.candidates.push_back(cand);
+            }
+            ReadVariantProfile profile;
+            profile.read_id = 0;
+            profile.start_var_idx = 0;
+            profile.end_var_idx = static_cast<int>(obs.size()) - 1;
+            for (const auto& item : obs) profile.alleles.push_back(item.second);
+            out.chunk.read_var_profile.push_back(std::move(profile));
+            return out;
+        };
+
+        std::ostringstream dedup_reads;
+        std::vector<GraphBamChunkBuildResult> dedup_chunks;
+        dedup_chunks.push_back(make_phase_read_chunk(0, 1, 100, {{"left_site", 1}}));
+        dedup_chunks.push_back(make_phase_read_chunk(1, 1, 100, {{"right_site", 0}}));
+        write_graph_bam_phase_reads_tsv(dedup_reads, dedup_chunks);
+        const std::string dedup = dedup_reads.str();
+        const size_t first = dedup.find("\tdup_read\t");
+        const size_t second = first == std::string::npos
+                                  ? std::string::npos
+                                  : dedup.find("\tdup_read\t", first + 1);
+        ok &= check(first != std::string::npos && second == std::string::npos,
+                    "phase read output: boundary read emitted once");
+        ok &= check(dedup.find("-1\tdup_read\t1\t100\t2\t") != std::string::npos,
+                    "phase read output: agreeing boundary copies keep final hap");
+
+        std::ostringstream conflict_reads;
+        std::vector<GraphBamChunkBuildResult> conflict_chunks;
+        conflict_chunks.push_back(make_phase_read_chunk(0, 1, 100, {{"left_site", 1}, {"left_site2", 0}}));
+        conflict_chunks.push_back(make_phase_read_chunk(1, 2, 100, {{"right_site", 0}}));
+        write_graph_bam_phase_reads_tsv(conflict_reads, conflict_chunks);
+        ok &= check(conflict_reads.str().find("-1\tdup_read\t1\t100\t3\t") != std::string::npos,
+                    "phase read output: local copy conflict keeps best stitched k-means side");
+
+        std::ostringstream tied_reads;
+        std::vector<GraphBamChunkBuildResult> tied_chunks;
+        tied_chunks.push_back(make_phase_read_chunk(0, 1, 100, {{"left_site", 1}}));
+        tied_chunks.push_back(make_phase_read_chunk(1, 2, 100, {{"right_site", 1}}));
+        write_graph_bam_phase_reads_tsv(tied_reads, tied_chunks);
+        ok &= check(tied_reads.str().find("-1\tdup_read\t1\t100\t2\t") != std::string::npos,
+                    "phase read output: tied local copy conflict keeps earlier stitched side");
+
+        std::ostringstream unphased_reads;
+        std::vector<GraphBamChunkBuildResult> unphased_chunks;
+        unphased_chunks.push_back(make_phase_read_chunk(0, 0, -1, {{"left_site", 1}}));
+        unphased_chunks.push_back(make_phase_read_chunk(1, 0, -1, {{"right_site", 1}}));
+        write_graph_bam_phase_reads_tsv(unphased_reads, unphased_chunks);
+        ok &= check(unphased_reads.str().find("-1\tdup_read\t0\t-1\t2\t") != std::string::npos,
+                    "phase read output: no stitched k-means side remains unphased");
+    }
 
     if (ok) {
         std::cout << "ALL PASS\n";

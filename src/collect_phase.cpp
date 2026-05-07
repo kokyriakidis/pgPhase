@@ -730,7 +730,11 @@ static bool flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
 
     if (flip_hap_score == 0) return false;
 
-    const bool touch_read_phase = opts != nullptr && !opts->output_aln.empty();
+    const bool touch_read_phase =
+        opts != nullptr &&
+        (!opts->output_aln.empty() ||
+         !opts->phase_read_tsv.empty() ||
+         !opts->graph_phase_reads_tsv.empty());
     apply_chunk_flip_and_merge(cur,
                                flip_hap_score > 0,
                                max_pre_read_ps,
@@ -805,7 +809,10 @@ void stitch_chunk_haps(std::vector<BamChunk>& chunks,
                                       opts->pgbam_relaxed_cleanup_min_winning_threads,
                                       opts->pgbam_relaxed_cleanup_polarity_margin);
     }
-    if (opts != nullptr && !opts->output_aln.empty()) {
+    if (opts != nullptr &&
+        (!opts->output_aln.empty() ||
+         !opts->phase_read_tsv.empty() ||
+         !opts->graph_phase_reads_tsv.empty())) {
         for (size_t ii = chunks.size(); ii > 1; --ii) {
             propagate_overlap_read_phase_to_output_owner(chunks[ii - 2], chunks[ii - 1]);
         }

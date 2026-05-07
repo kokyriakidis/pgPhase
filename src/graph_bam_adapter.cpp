@@ -4,6 +4,7 @@
 #include "collect_phase.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -148,6 +149,49 @@ void write_observations(std::ostream& out,
         first = false;
         const std::string& site_id = graph_chunk.site_ids[static_cast<size_t>(site_i)];
         out << site_id << ':' << allele;
+    }
+}
+
+struct PhaseReadOutputRow {
+    std::string read_name;
+    int chunk_id = -1;
+    int hap = 0;
+    hts_pos_t phase_set = -1;
+    bool has_phased_assignment = false;
+    int copies = 0;
+    int best_assignment_obs = -1;
+    int assignment_chunk_id = std::numeric_limits<int>::max();
+    std::unordered_map<std::string, int> allele_by_site;
+};
+
+void merge_phase_read_observation(PhaseReadOutputRow& row,
+                                  const std::string& site_id,
+                                  int allele) {
+    auto [it, inserted] = row.allele_by_site.emplace(site_id, allele);
+    if (!inserted && it->second != allele) it->second = -1;
+}
+
+void merge_phase_read_assignment(PhaseReadOutputRow& row,
+                                 int chunk_id,
+                                 int hap,
+                                 hts_pos_t phase_set,
+                                 int n_obs) {
+    if (row.copies == 0) {
+        row.chunk_id = chunk_id;
+    } else if (row.chunk_id != chunk_id) {
+        row.chunk_id = -1;
+    }
+    ++row.copies;
+
+    if ((hap != 1 && hap != 2) || phase_set < 0) return;
+    if (!row.has_phased_assignment ||
+        n_obs > row.best_assignment_obs ||
+        (n_obs == row.best_assignment_obs && chunk_id < row.assignment_chunk_id)) {
+        row.hap = hap;
+        row.phase_set = phase_set;
+        row.has_phased_assignment = true;
+        row.best_assignment_obs = n_obs;
+        row.assignment_chunk_id = chunk_id;
     }
 }
 
@@ -715,30 +759,73 @@ void write_graph_bam_phase_reads_tsv(std::ostream& out,
                                      const std::vector<GraphBamChunkBuildResult>& graph_chunks,
                                      const std::vector<std::string>& all_read_names) {
     out << "CHUNK_ID\tREAD\tHAP\tPHASE_SET\tN_OBS\tOBS\n";
-    std::unordered_set<std::string> written;
+
+    std::unordered_map<std::string, PhaseReadOutputRow> rows_by_read;
     for (const GraphBamChunkBuildResult& graph_chunk : graph_chunks) {
         const BamChunk& chunk = graph_chunk.chunk;
         for (const ReadVariantProfile& profile : chunk.read_var_profile) {
             const size_t read_i = static_cast<size_t>(profile.read_id);
             const ReadRecord& read = chunk.reads[read_i];
+            PhaseReadOutputRow& row = rows_by_read[read.qname];
+            if (row.read_name.empty()) row.read_name = read.qname;
+
+            const int hap = read_i < chunk.haps.size() ? chunk.haps[read_i] : 0;
+            const hts_pos_t phase_set =
+                read_i < chunk.phase_sets.size()
+                    ? chunk.phase_sets[read_i]
+                    : static_cast<hts_pos_t>(-1);
+
             int n_obs = 0;
-            for (int allele : profile.alleles) {
-                if (allele >= 0) ++n_obs;
+            for (int site_i = profile.start_var_idx; site_i <= profile.end_var_idx; ++site_i) {
+                const int offset = site_i - profile.start_var_idx;
+                if (offset < 0 || static_cast<size_t>(offset) >= profile.alleles.size()) continue;
+                const int allele = profile.alleles[static_cast<size_t>(offset)];
+                if (allele < 0) continue;
+                ++n_obs;
+                if (site_i < 0 || static_cast<size_t>(site_i) >= graph_chunk.site_ids.size()) continue;
+                merge_phase_read_observation(row,
+                                             graph_chunk.site_ids[static_cast<size_t>(site_i)],
+                                             allele);
             }
-            out << chunk.region.chunk_id << '\t'
-                << read.qname << '\t'
-                << (read_i < chunk.haps.size() ? chunk.haps[read_i] : 0) << '\t'
-                << (read_i < chunk.phase_sets.size() ? chunk.phase_sets[read_i] : static_cast<hts_pos_t>(-1)) << '\t'
-                << n_obs << '\t';
-            write_observations(out, graph_chunk, profile);
-            out << '\n';
-            written.insert(read.qname);
+            merge_phase_read_assignment(row, chunk.region.chunk_id, hap, phase_set, n_obs);
         }
     }
-    // Reads that had no observations at any surviving site: emit as unassigned.
+
     for (const std::string& name : all_read_names) {
-        if (written.count(name)) continue;
-        out << -1 << '\t' << name << '\t' << 0 << '\t' << -1 << '\t' << 0 << '\t' << '\n';
+        auto [it, inserted] = rows_by_read.emplace(name, PhaseReadOutputRow{});
+        if (inserted) it->second.read_name = name;
+    }
+
+    std::vector<std::string> read_names;
+    read_names.reserve(rows_by_read.size());
+    for (const auto& item : rows_by_read) read_names.push_back(item.first);
+    std::sort(read_names.begin(), read_names.end());
+
+    for (const std::string& read_name : read_names) {
+        PhaseReadOutputRow& row = rows_by_read[read_name];
+        if (!row.has_phased_assignment) {
+            row.hap = 0;
+            row.phase_set = -1;
+        }
+
+        std::vector<std::string> obs_keys;
+        obs_keys.reserve(row.allele_by_site.size());
+        for (const auto& obs : row.allele_by_site) {
+            if (obs.second >= 0) obs_keys.push_back(obs.first);
+        }
+        std::sort(obs_keys.begin(), obs_keys.end());
+
+        out << row.chunk_id << '\t'
+            << read_name << '\t'
+            << row.hap << '\t'
+            << row.phase_set << '\t'
+            << obs_keys.size() << '\t';
+        for (size_t i = 0; i < obs_keys.size(); ++i) {
+            if (i > 0) out << ',';
+            const std::string& site_id = obs_keys[i];
+            out << site_id << ':' << row.allele_by_site[site_id];
+        }
+        out << '\n';
     }
 }
 
