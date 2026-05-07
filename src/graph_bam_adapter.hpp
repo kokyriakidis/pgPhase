@@ -63,6 +63,13 @@ void write_graph_bam_phase_reads_tsv(std::ostream& out,
                                      const std::vector<GraphBamChunkBuildResult>& graph_chunks,
                                      const std::vector<std::string>& all_read_names = {});
 
+// Writes an unaligned BAM (name-sorted) with HP and PS aux tags per read.
+// Reads with no phased assignment get no HP/PS tag. Mirrors the HP/PS tagging
+// of the BAM phasing path but without requiring alignment coordinates.
+void write_graph_bam_phase_bam(const std::string& out_path,
+                               const std::vector<GraphBamChunkBuildResult>& graph_chunks,
+                               const std::vector<std::string>& all_read_names = {});
+
 void write_graph_bam_filtered_sites_tsv(std::ostream& out,
                                         const std::vector<GraphBamChunkBuildResult>& graph_chunks);
 

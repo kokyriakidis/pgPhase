@@ -10,9 +10,11 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 extern "C" {
 #include "cgranges.h"
+#include "htslib/sam.h"
 }
 
 namespace pgphase_collect {
@@ -755,11 +757,9 @@ void write_graph_bam_variants_tsv(std::ostream& out,
     }
 }
 
-void write_graph_bam_phase_reads_tsv(std::ostream& out,
-                                     const std::vector<GraphBamChunkBuildResult>& graph_chunks,
-                                     const std::vector<std::string>& all_read_names) {
-    out << "CHUNK_ID\tREAD\tHAP\tPHASE_SET\tN_OBS\tOBS\n";
-
+static std::unordered_map<std::string, PhaseReadOutputRow>
+collect_phased_read_rows(const std::vector<GraphBamChunkBuildResult>& graph_chunks,
+                         const std::vector<std::string>& all_read_names) {
     std::unordered_map<std::string, PhaseReadOutputRow> rows_by_read;
     for (const GraphBamChunkBuildResult& graph_chunk : graph_chunks) {
         const BamChunk& chunk = graph_chunk.chunk;
@@ -790,11 +790,19 @@ void write_graph_bam_phase_reads_tsv(std::ostream& out,
             merge_phase_read_assignment(row, chunk.region.chunk_id, hap, phase_set, n_obs);
         }
     }
-
     for (const std::string& name : all_read_names) {
         auto [it, inserted] = rows_by_read.emplace(name, PhaseReadOutputRow{});
         if (inserted) it->second.read_name = name;
     }
+    return rows_by_read;
+}
+
+void write_graph_bam_phase_reads_tsv(std::ostream& out,
+                                     const std::vector<GraphBamChunkBuildResult>& graph_chunks,
+                                     const std::vector<std::string>& all_read_names) {
+    out << "CHUNK_ID\tREAD\tHAP\tPHASE_SET\tN_OBS\tOBS\n";
+
+    auto rows_by_read = collect_phased_read_rows(graph_chunks, all_read_names);
 
     std::vector<std::string> read_names;
     read_names.reserve(rows_by_read.size());
@@ -826,6 +834,61 @@ void write_graph_bam_phase_reads_tsv(std::ostream& out,
             out << site_id << ':' << row.allele_by_site[site_id];
         }
         out << '\n';
+    }
+}
+
+void write_graph_bam_phase_bam(const std::string& out_path,
+                               const std::vector<GraphBamChunkBuildResult>& graph_chunks,
+                               const std::vector<std::string>& all_read_names) {
+    auto rows_by_read = collect_phased_read_rows(graph_chunks, all_read_names);
+
+    std::vector<std::string> read_names;
+    read_names.reserve(rows_by_read.size());
+    for (const auto& item : rows_by_read) read_names.push_back(item.first);
+    std::sort(read_names.begin(), read_names.end());
+
+    samFile* out_sam = hts_open(out_path.c_str(), "wb");
+    if (!out_sam) throw std::runtime_error("failed to open output BAM: " + out_path);
+    struct SamGuard { samFile* f; ~SamGuard() { hts_close(f); } } sg{out_sam};
+
+    sam_hdr_t* hdr = sam_hdr_init();
+    if (!hdr) throw std::runtime_error("failed to allocate BAM header");
+    struct HdrGuard { sam_hdr_t* h; ~HdrGuard() { sam_hdr_destroy(h); } } hg{hdr};
+    sam_hdr_add_line(hdr, "HD", "VN", "1.6", "SO", "queryname", nullptr);
+    if (sam_hdr_write(out_sam, hdr) < 0)
+        throw std::runtime_error("failed to write BAM header: " + out_path);
+
+    for (const std::string& name : read_names) {
+        const PhaseReadOutputRow& row = rows_by_read[name];
+        const int hap = row.has_phased_assignment ? row.hap : 0;
+        const hts_pos_t ps = row.has_phased_assignment ? row.phase_set : static_cast<hts_pos_t>(-1);
+
+        bam1_t* rec = bam_init1();
+        if (!rec) throw std::runtime_error("bam_init1 failed");
+        struct RecGuard { bam1_t* r; ~RecGuard() { bam_destroy1(r); } } rg{rec};
+
+        if (bam_set_qname(rec, name.c_str()) < 0)
+            throw std::runtime_error("bam_set_qname failed for: " + name);
+        rec->core.flag = BAM_FUNMAP;
+        rec->core.tid   = -1;
+        rec->core.pos   = -1;
+        rec->core.mtid  = -1;
+        rec->core.mpos  = -1;
+        rec->core.qual  = 255;
+
+        if (hap > 0) {
+            const int32_t h = static_cast<int32_t>(hap);
+            bam_aux_append(rec, "HP", 'i', sizeof(int32_t),
+                           reinterpret_cast<const uint8_t*>(&h));
+        }
+        if (ps >= 0) {
+            const int32_t p = static_cast<int32_t>(ps);
+            bam_aux_append(rec, "PS", 'i', sizeof(int32_t),
+                           reinterpret_cast<const uint8_t*>(&p));
+        }
+
+        if (sam_write1(out_sam, hdr, rec) < 0)
+            throw std::runtime_error("failed to write BAM record for: " + name);
     }
 }
 
