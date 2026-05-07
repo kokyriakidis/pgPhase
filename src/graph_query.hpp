@@ -96,6 +96,9 @@ std::string query_gbz_interval_gfa(const GraphQueryConfig& config,
                                    hts_pos_t end,
                                    bool extend_snarls);
 
+void write_graph_read_alleles_tsv_header(std::ostream& out);
+void write_graph_read_alleles_tsv_rows(std::ostream& out,
+                                       const std::vector<GraphReadAllele>& rows);
 void write_graph_read_alleles_tsv(std::ostream& out,
                                   const std::vector<GraphReadAllele>& rows);
 

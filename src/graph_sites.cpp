@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <memory>
@@ -388,6 +389,53 @@ GraphSiteCatalog load_graph_site_catalog_from_vcf(
         site.eligible = site.skip_reason.empty();
     }
     return catalog;
+}
+
+std::vector<std::string> load_graph_site_contig_names(const std::string& vcf_path) {
+    auto normalize = [](const std::string& s) -> std::string {
+        const size_t h = s.rfind('#');
+        return h == std::string::npos ? s : s.substr(h + 1);
+    };
+
+    // Fast path: tabix index present → read seqnames without scanning data.
+    {
+        struct TbxDeleter { void operator()(tbx_t* p) const { tbx_destroy(p); } };
+        std::unique_ptr<tbx_t, TbxDeleter> tbx(tbx_index_load(vcf_path.c_str()));
+        if (tbx) {
+            int n = 0;
+            const char** seqs = tbx_seqnames(tbx.get(), &n);
+            std::vector<std::string> result;
+            std::unordered_set<std::string> seen;
+            result.reserve(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i) {
+                std::string norm = normalize(std::string(seqs[i]));
+                if (seen.insert(norm).second)
+                    result.push_back(std::move(norm));
+            }
+            free(seqs);
+            return result;
+        }
+    }
+
+    // Slow path: stream all data lines and collect distinct CHROM values.
+    {
+        struct HtsFileDeleter { void operator()(htsFile* p) const { hts_close(p); } };
+        std::unique_ptr<htsFile, HtsFileDeleter> fp(hts_open(vcf_path.c_str(), "r"));
+        if (!fp) throw std::runtime_error("failed to open VCF: " + vcf_path);
+        std::vector<std::string> result;
+        std::unordered_set<std::string> seen;
+        kstring_t str = KS_INITIALIZE;
+        while (hts_getline(fp.get(), '\n', &str) >= 0) {
+            if (str.l == 0 || str.s[0] == '#') continue;
+            const char* t = static_cast<const char*>(memchr(str.s, '\t', str.l));
+            if (!t) continue;
+            std::string norm = normalize(std::string(str.s, static_cast<size_t>(t - str.s)));
+            if (seen.insert(norm).second) result.push_back(std::move(norm));
+        }
+        ks_free(&str);
+        std::sort(result.begin(), result.end());
+        return result;
+    }
 }
 
 GraphSiteCatalog load_graph_site_catalog_from_gfa_text(const std::string& gfa_text,

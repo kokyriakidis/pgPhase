@@ -771,9 +771,12 @@ std::string query_gbz_interval_gfa(const GraphQueryConfig& config,
     return run_command_capture_stdout(cmd);
 }
 
-void write_graph_read_alleles_tsv(std::ostream& out,
-                                  const std::vector<GraphReadAllele>& rows) {
+void write_graph_read_alleles_tsv_header(std::ostream& out) {
     out << "SITE_ID\tCHROM\tPOS\tREAD\tMAPQ\tALLELE\tWALK\n";
+}
+
+void write_graph_read_alleles_tsv_rows(std::ostream& out,
+                                       const std::vector<GraphReadAllele>& rows) {
     for (const GraphReadAllele& row : rows) {
         out << row.site_id << '\t'
             << row.chrom << '\t'
@@ -783,6 +786,12 @@ void write_graph_read_alleles_tsv(std::ostream& out,
             << row.allele << '\t'
             << row.walk << '\n';
     }
+}
+
+void write_graph_read_alleles_tsv(std::ostream& out,
+                                  const std::vector<GraphReadAllele>& rows) {
+    write_graph_read_alleles_tsv_header(out);
+    write_graph_read_alleles_tsv_rows(out, rows);
 }
 
 } // namespace pgphase_collect
