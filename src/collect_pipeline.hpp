@@ -44,6 +44,13 @@ std::vector<RegionChunk> build_region_chunks(const Options& opts,
                                              const bam_hdr_t* header,
                                              const faidx_t* fai);
 
+// Overload that uses pre-built filters instead of re-parsing opts.regions.
+// Used by the graph path to pass contig-resolved filters.
+std::vector<RegionChunk> build_region_chunks(const Options& opts,
+                                             const bam_hdr_t* header,
+                                             const faidx_t* fai,
+                                             const std::vector<RegionFilter>& filters);
+
 /**
  * @brief Opens primary BAM + reference index and returns chunks from `build_region_chunks`.
  * @param opts Must set `primary_bam_file()`, `ref_fasta`, and region fields.

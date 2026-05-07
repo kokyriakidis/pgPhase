@@ -2,6 +2,9 @@
 /pgphase
 /pgphase_*
 /test_phase_block_stitch
+/test_graph_sites
+/test_graph_phase
+/test_graph_bam_adapter
 /dist/
 /release/
 *.tar

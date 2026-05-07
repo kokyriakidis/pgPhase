@@ -4,3 +4,6 @@
 [submodule "third_party/abPOA"]
 	path = third_party/abPOA
 	url = /home/kokyriakidis/Downloads/longcallD/abPOA
+[submodule "third_party/gbz-base"]
+	path = third_party/gbz-base
+	url = https://github.com/kokyriakidis/gbz-base.git
