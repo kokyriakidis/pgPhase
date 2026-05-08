@@ -633,27 +633,23 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
 /**
  * @brief Stitch one pair of adjacent chunks (strict longcallD flip_variant_hap).
  *
- * Mirrors longcallD `update_chunk_var_hap_phase_set1` + conditional
- * `update_chunk_read_hap_phase_set1` from collect_var.c lines 1593–1695:
- * candidate hap swap + candidate/read PS rename always matches the var half; read hap flip
- * + read PS rename run only when \p touch_read_phase matches `opt->out_aln_fp != NULL`.
+ * Mirrors the candidate phase-set merge and keeps read HP/PS in sync with the
+ * final stitched phase sets. We update read-side assignments unconditionally so
+ * every downstream output sees the same in-memory phasing.
  */
 static void apply_chunk_flip_and_merge(BamChunk& cur,
                                        bool do_flip,
                                        hts_pos_t max_pre_ps,
-                                       hts_pos_t min_cur_ps,
-                                       bool touch_read_phase) {
+                                       hts_pos_t min_cur_ps) {
     // Mirrors collect_var.c: hap flip iff flip_hap && flip_cur_PS != -1.
     if (do_flip && min_cur_ps != INT64_MAX && min_cur_ps != static_cast<hts_pos_t>(-1)) {
         for (CandidateVariant& v : cur.candidates) {
             if (v.phase_set != min_cur_ps) continue;
             std::swap(v.hap_to_cons_alle[1], v.hap_to_cons_alle[2]);
         }
-        if (touch_read_phase) {
-            for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
-                if (cur.reads[read_i].is_skipped || cur.haps[read_i] == 0) continue;
-                if (cur.phase_sets[read_i] == min_cur_ps) cur.haps[read_i] = 3 - cur.haps[read_i];
-            }
+        for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
+            if (cur.reads[read_i].is_skipped || cur.haps[read_i] == 0) continue;
+            if (cur.phase_sets[read_i] == min_cur_ps) cur.haps[read_i] = 3 - cur.haps[read_i];
         }
     }
     if (max_pre_ps != -1 && min_cur_ps != INT64_MAX) {
@@ -661,20 +657,19 @@ static void apply_chunk_flip_and_merge(BamChunk& cur,
             if (v.phase_set == -1) continue;
             if (v.phase_set == min_cur_ps) v.phase_set = max_pre_ps;
         }
-        if (touch_read_phase) {
-            for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
-                if (cur.phase_sets[read_i] == -1) continue;
-                if (cur.phase_sets[read_i] == min_cur_ps) cur.phase_sets[read_i] = max_pre_ps;
-            }
+        for (size_t read_i = 0; read_i < cur.reads.size(); ++read_i) {
+            if (cur.phase_sets[read_i] == -1) continue;
+            if (cur.phase_sets[read_i] == min_cur_ps) cur.phase_sets[read_i] = max_pre_ps;
         }
     }
 }
 
 /**
- * Mirrors longcallD `flip_variant_hap` (collect_var.c): same guard order and early exits;
- * only overlapping-read voting + `update_chunk_var_hap_phase_set1` (+ optional read updates).
+ * Mirrors longcallD `flip_variant_hap` guard order and overlap-read voting,
+ * then updates candidate and read phase assignments together.
  */
 static bool flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
+    (void)opts;
     if (pre.region.tid != cur.region.tid) return false;
 
     int n_cur_ovlp_reads = 0;
@@ -730,17 +725,10 @@ static bool flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
 
     if (flip_hap_score == 0) return false;
 
-    const bool touch_read_phase =
-        opts != nullptr &&
-        (opts->touch_read_phase ||
-         !opts->output_aln.empty() ||
-         !opts->phase_read_tsv.empty() ||
-         !opts->graph_phase_reads_tsv.empty());
     apply_chunk_flip_and_merge(cur,
                                flip_hap_score > 0,
                                max_pre_read_ps,
-                               min_cur_read_ps,
-                               touch_read_phase);
+                               min_cur_read_ps);
     return true;
 }
 
@@ -810,13 +798,8 @@ void stitch_chunk_haps(std::vector<BamChunk>& chunks,
                                       opts->pgbam_relaxed_cleanup_min_winning_threads,
                                       opts->pgbam_relaxed_cleanup_polarity_margin);
     }
-    if (opts != nullptr &&
-        (!opts->output_aln.empty() ||
-         !opts->phase_read_tsv.empty() ||
-         !opts->graph_phase_reads_tsv.empty())) {
-        for (size_t ii = chunks.size(); ii > 1; --ii) {
-            propagate_overlap_read_phase_to_output_owner(chunks[ii - 2], chunks[ii - 1]);
-        }
+    for (size_t ii = chunks.size(); ii > 1; --ii) {
+        propagate_overlap_read_phase_to_output_owner(chunks[ii - 2], chunks[ii - 1]);
     }
 }
 
