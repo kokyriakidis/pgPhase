@@ -531,7 +531,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
                         opts);
 
                     assign_hap_based_on_germline_het_vars_kmeans(
-                        graph_chunks[offset].chunk, opts, kCandHetVarCate);
+                        graph_chunks[offset].chunk, opts, kCandGermlineClean);
                 }
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);
@@ -601,7 +601,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_from_obse
                         opts);
 
                     assign_hap_based_on_germline_het_vars_kmeans(
-                        graph_chunks[offset].chunk, opts, kCandHetVarCate);
+                        graph_chunks[offset].chunk, opts, kCandGermlineClean);
                 }
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);

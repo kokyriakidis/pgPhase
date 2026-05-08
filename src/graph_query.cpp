@@ -720,6 +720,17 @@ size_t scan_gaf_for_catalog_emit_parallel_releasing_walks(
         gaf_file, catalog, min_mapq, threads, true, emit);
 }
 
+// pggaf coordinate-indexed GAF tabix often names sequences by reference suffix ("chr20")
+// while graph-site VCFs use pangenome paths ("CHM13#0#chr20"). Mirrors graph_sites
+// chrom_suffix matching so tabix queries succeed without a separate FAI map.
+static int tbx_seq_tid_with_pangenome_fallback(tbx_t* tbx, const std::string& contig) {
+    int tid = tbx_name2id(tbx, contig.c_str());
+    if (tid >= 0) return tid;
+    const size_t h = contig.rfind('#');
+    if (h == std::string::npos) return -1;
+    return tbx_name2id(tbx, contig.substr(h + 1).c_str());
+}
+
 void require_indexed_gaf(const std::string& indexed_gaf_file) {
     htsFile* fp = hts_open(indexed_gaf_file.c_str(), "r");
     if (fp == nullptr) {
@@ -771,7 +782,7 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
         ~TbxGuard() { if (tbx != nullptr) tbx_destroy(tbx); }
     } tbx_guard{raw_tbx};
 
-    const int tid = tbx_name2id(raw_tbx, contig.c_str());
+    const int tid = tbx_seq_tid_with_pangenome_fallback(raw_tbx, contig);
     if (tid < 0) return {};
 
     hts_itr_t* raw_itr = tbx_itr_queryi(raw_tbx, tid, beg, end);

@@ -8,8 +8,10 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_set>
 
+#include <htslib/hts.h>
 #include <htslib/kstring.h>
 #include <htslib/tbx.h>
 
@@ -96,6 +98,161 @@ std::vector<GraphWalk> parse_allele_walks(const std::vector<std::string>& traver
 
 bool contains_spanning_deletion(const std::vector<std::string>& alts) {
     return std::find(alts.begin(), alts.end(), "*") != alts.end();
+}
+
+std::string chrom_suffix_match_key(const std::string& s) {
+    const size_t h = s.rfind('#');
+    return h == std::string::npos ? s : s.substr(h + 1);
+}
+
+bool chrom_names_match_vcf(const std::string& a, const std::string& b) {
+    return a == b || chrom_suffix_match_key(a) == chrom_suffix_match_key(b);
+}
+
+void finalize_graph_site_catalog_inplace(GraphSiteCatalog& catalog) {
+    std::stable_sort(catalog.sites.begin(), catalog.sites.end(),
+                     [](const GraphSite& lhs, const GraphSite& rhs) {
+                         if (lhs.chrom != rhs.chrom) return lhs.chrom < rhs.chrom;
+                         if (lhs.pos != rhs.pos) return lhs.pos < rhs.pos;
+                         return lhs.id < rhs.id;
+                     });
+    for (GraphSite& site : catalog.sites) {
+        site.skip_reason = graph_site_validation_skip_reason(site);
+        site.eligible = site.skip_reason.empty();
+    }
+}
+
+void append_graph_site_from_vcf_data_line(const char* buf,
+                                          size_t len,
+                                          GraphSiteCatalog& catalog,
+                                          bool keep_allele_traversal_strings) {
+    if (len == 0 || buf[0] == '#') return;
+    const std::string line(buf, len);
+    std::vector<std::string> fields = split_char(line, '\t');
+    if (fields.size() < 8) return;
+
+    GraphSite site;
+    site.chrom = fields[0];
+    const auto hash_pos = fields[0].rfind('#');
+    site.ref_contig = (hash_pos != std::string::npos)
+                      ? fields[0].substr(hash_pos + 1)
+                      : fields[0];
+    site.pos = static_cast<hts_pos_t>(std::stoll(fields[1]));
+    site.id = fields[2];
+    site.ref = fields[3];
+    if (fields[4] != ".") site.alts = split_char(fields[4], ',');
+    site.info = parse_info(fields[7]);
+    site.allele_traversals = parse_allele_traversals(site.info);
+    bool malformed_walk = false;
+    site.allele_walks = parse_allele_walks(site.allele_traversals, malformed_walk);
+    site.level = parse_optional_int(site.info, "LV");
+    site.parent = find_first_info_value(site.info, {"PS", "PARENT", "Parent"});
+    site.root = find_first_info_value(site.info, {"RS", "ROOT", "Root"});
+    const std::string rc_value = find_first_info_value(site.info, {"RC", "REF_CONTIG", "RefContig"});
+    if (!rc_value.empty()) {
+        const auto hp = rc_value.rfind('#');
+        site.ref_contig = (hp != std::string::npos) ? rc_value.substr(hp + 1) : rc_value;
+    }
+    site.ref_beg = site.pos;
+    site.ref_end = site.pos;
+    const std::string end_value = find_first_info_value(site.info, {"END"});
+    if (!end_value.empty()) site.ref_end = static_cast<hts_pos_t>(std::stoll(end_value));
+    site.conditional_parent_alleles =
+        parse_optional_int_list(site.info, {"PA", "PARENT_ALLELE", "PARENT_ALLELES"});
+    site.has_spanning_deletion = contains_spanning_deletion(site.alts);
+    if (malformed_walk) {
+        site.eligible = false;
+        site.skip_reason = "malformed_allele_traversal";
+    } else {
+        site.skip_reason = graph_site_validation_skip_reason(site);
+        site.eligible = site.skip_reason.empty();
+    }
+    std::unordered_map<std::string, std::string>().swap(site.info);
+    if (!keep_allele_traversal_strings) {
+        std::vector<std::string>().swap(site.allele_traversals);
+    }
+    catalog.sites.push_back(std::move(site));
+}
+
+void append_graph_sites_tabix_filtered(htsFile* fp,
+                                       tbx_t* tbx,
+                                       const std::vector<RegionFilter>& filters,
+                                       GraphSiteCatalog& catalog,
+                                       bool keep_allele_traversal_strings) {
+    struct HtsItrDeleter {
+        void operator()(hts_itr_t* p) const {
+            if (p) hts_itr_destroy(p);
+        }
+    };
+
+    int n_vcf_seqs = 0;
+    const char** vcf_seqs = tbx_seqnames(tbx, &n_vcf_seqs);
+    std::unordered_map<std::string, std::string> filter_to_vcf_chrom;
+    for (const RegionFilter& filter : filters) {
+        if (!filter.enabled || filter_to_vcf_chrom.count(filter.chrom)) continue;
+        if (tbx_name2id(tbx, filter.chrom.c_str()) >= 0) {
+            filter_to_vcf_chrom[filter.chrom] = filter.chrom;
+        } else {
+            for (int si = 0; si < n_vcf_seqs; ++si) {
+                if (chrom_names_match_vcf(filter.chrom, std::string(vcf_seqs[si]))) {
+                    filter_to_vcf_chrom[filter.chrom] = vcf_seqs[si];
+                    break;
+                }
+            }
+        }
+    }
+    free(vcf_seqs);
+
+    kstring_t str = KS_INITIALIZE;
+    struct KsGuard {
+        kstring_t* s;
+        ~KsGuard() {
+            if (s) ks_free(s);
+        }
+    } ks_guard{&str};
+
+    auto make_rstr = [](const std::string& chrom, hts_pos_t beg, hts_pos_t end) {
+        std::string s = chrom;
+        if (beg > 0) {
+            s += ":" + std::to_string(beg);
+            if (end > 0) s += "-" + std::to_string(end);
+        }
+        return s;
+    };
+
+    for (const RegionFilter& filter : filters) {
+        if (!filter.enabled) continue;
+        auto it = filter_to_vcf_chrom.find(filter.chrom);
+        if (it == filter_to_vcf_chrom.end()) continue;
+        std::unique_ptr<hts_itr_t, HtsItrDeleter> itr(
+            tbx_itr_querys(tbx,
+                           make_rstr(it->second, filter.beg, filter.end).c_str()));
+        if (!itr) continue;
+        while (tbx_itr_next(fp, tbx, itr.get(), &str) >= 0) {
+            if (str.l > 0)
+                append_graph_site_from_vcf_data_line(str.s, str.l, catalog,
+                                                     keep_allele_traversal_strings);
+        }
+    }
+}
+
+// Phase-graph: one chunk interval [beg0,end0) in 0-based half-open tiling coordinates.
+GraphSiteCatalog load_half_open_tabix_catalog(htsFile* fp,
+                                              tbx_t* tbx,
+                                              const std::string& logical_chrom,
+                                              hts_pos_t beg0,
+                                              hts_pos_t end0,
+                                              bool keep_allele_traversal_strings) {
+    GraphSiteCatalog catalog;
+    if (!fp || !tbx || end0 <= beg0) return catalog;
+    RegionFilter f;
+    f.enabled = true;
+    f.chrom = logical_chrom;
+    f.beg = beg0 + 1;
+    f.end = end0;
+    append_graph_sites_tabix_filtered(fp, tbx, {f}, catalog, keep_allele_traversal_strings);
+    finalize_graph_site_catalog_inplace(catalog);
+    return catalog;
 }
 
 struct GfaWalkRecord {
@@ -205,80 +362,10 @@ GraphSiteCatalog load_graph_site_catalog_from_vcf(
 {
     GraphSiteCatalog catalog;
 
-    // Parse one tab-delimited VCF data line into a GraphSite and append to catalog.
-    auto parse_line = [&](const char* buf, size_t len) {
-        if (len == 0 || buf[0] == '#') return;
-        const std::string line(buf, len);
-        std::vector<std::string> fields = split_char(line, '\t');
-        if (fields.size() < 8) return; // silently skip malformed lines
-
-        GraphSite site;
-        site.chrom = fields[0];
-        // vg deconstruct CHROM is "sample#hap#contig"; normalise to just the contig name.
-        const auto hash_pos = fields[0].rfind('#');
-        site.ref_contig = (hash_pos != std::string::npos)
-                          ? fields[0].substr(hash_pos + 1)
-                          : fields[0];
-        site.pos = static_cast<hts_pos_t>(std::stoll(fields[1]));
-        site.id = fields[2];
-        site.ref = fields[3];
-        if (fields[4] != ".") site.alts = split_char(fields[4], ',');
-        site.info = parse_info(fields[7]);
-        site.allele_traversals = parse_allele_traversals(site.info);
-        bool malformed_walk = false;
-        site.allele_walks = parse_allele_walks(site.allele_traversals, malformed_walk);
-        site.level = parse_optional_int(site.info, "LV");
-        site.parent = find_first_info_value(site.info, {"PS", "PARENT", "Parent"});
-        site.root = find_first_info_value(site.info, {"RS", "ROOT", "Root"});
-        const std::string rc_value = find_first_info_value(site.info, {"RC", "REF_CONTIG", "RefContig"});
-        if (!rc_value.empty()) {
-            const auto hp = rc_value.rfind('#');
-            site.ref_contig = (hp != std::string::npos) ? rc_value.substr(hp + 1) : rc_value;
-        }
-        site.ref_beg = site.pos;
-        site.ref_end = site.pos;
-        const std::string end_value = find_first_info_value(site.info, {"END"});
-        if (!end_value.empty()) site.ref_end = static_cast<hts_pos_t>(std::stoll(end_value));
-        site.conditional_parent_alleles =
-            parse_optional_int_list(site.info, {"PA", "PARENT_ALLELE", "PARENT_ALLELES"});
-        site.has_spanning_deletion = contains_spanning_deletion(site.alts);
-        if (malformed_walk) {
-            site.eligible = false;
-            site.skip_reason = "malformed_allele_traversal";
-        } else {
-            site.skip_reason = graph_site_validation_skip_reason(site);
-            site.eligible = site.skip_reason.empty();
-        }
-        // All INFO-derived fields needed downstream have been copied into typed
-        // GraphSite members above. Keeping the full INFO map would retain a second
-        // copy of very large AT traversal strings for decomposed graph VCFs.
-        std::unordered_map<std::string, std::string>().swap(site.info);
-        if (!keep_allele_traversal_strings) {
-            std::vector<std::string>().swap(site.allele_traversals);
-        }
-        catalog.sites.push_back(std::move(site));
-    };
-
-    // Returns the suffix after the last '#', or the whole string if no '#'.
-    // Used to normalise pangenome contig names ("CHM13#0#chr20" → "chr20").
-    auto chrom_suffix = [](const std::string& s) -> std::string {
-        const size_t h = s.rfind('#');
-        return h == std::string::npos ? s : s.substr(h + 1);
-    };
-
-    // Returns true if two contig names refer to the same chromosome, regardless of
-    // whether either uses a pangenome prefix.  Handles all four combinations:
-    //   exact match, filter-full/vcf-short, filter-short/vcf-full, both-full.
-    auto chroms_match = [&](const std::string& a, const std::string& b) -> bool {
-        return a == b || chrom_suffix(a) == chrom_suffix(b);
-    };
-
-    // Returns true if (chrom, pos) overlaps any enabled filter.
-    // Used for the plain-text fallback when no tabix index is available.
     auto passes_any_filter = [&](const std::string& chrom, hts_pos_t pos) -> bool {
         for (const RegionFilter& f : filters) {
             if (!f.enabled) continue;
-            if (!chroms_match(f.chrom, chrom)) continue;
+            if (!chrom_names_match_vcf(f.chrom, chrom)) continue;
             if (pos < f.beg) continue;
             if (f.end >= 0 && pos > f.end) continue;
             return true;
@@ -286,72 +373,26 @@ GraphSiteCatalog load_graph_site_catalog_from_vcf(
         return false;
     };
 
-    // Collect enabled filters for use in tabix / streaming paths.
     bool has_filters = false;
     for (const RegionFilter& f : filters) {
         if (f.enabled) { has_filters = true; break; }
     }
 
-    // Tabix path: works for bgzipped VCFs with a .tbi or .csi index.
     if (has_filters) {
         struct TbxDeleter { void operator()(tbx_t* p) const { tbx_destroy(p); } };
         struct HtsFileDeleter { void operator()(htsFile* p) const { hts_close(p); } };
-        struct HtsItrDeleter { void operator()(hts_itr_t* p) const { hts_itr_destroy(p); } };
 
         std::unique_ptr<tbx_t, TbxDeleter> tbx(tbx_index_load(path.c_str()));
         if (tbx) {
             std::unique_ptr<htsFile, HtsFileDeleter> fp(hts_open(path.c_str(), "r"));
             if (!fp) throw std::runtime_error("failed to open graph site VCF: " + path);
-
-            // Build filter-chrom → VCF-index-chrom map once, using suffix matching.
-            // Handles "CHM13#0#chr20"→"chr20" and "chr20"→"CHM13#0#chr20" alike.
-            int n_vcf_seqs = 0;
-            const char** vcf_seqs = tbx_seqnames(tbx.get(), &n_vcf_seqs);
-            std::unordered_map<std::string, std::string> filter_to_vcf_chrom;
-            for (const RegionFilter& filter : filters) {
-                if (!filter.enabled || filter_to_vcf_chrom.count(filter.chrom)) continue;
-                if (tbx_name2id(tbx.get(), filter.chrom.c_str()) >= 0) {
-                    filter_to_vcf_chrom[filter.chrom] = filter.chrom;
-                } else {
-                    for (int si = 0; si < n_vcf_seqs; ++si) {
-                        if (chroms_match(filter.chrom, std::string(vcf_seqs[si]))) {
-                            filter_to_vcf_chrom[filter.chrom] = vcf_seqs[si];
-                            break;
-                        }
-                    }
-                }
-            }
-            free(vcf_seqs);
-
-            kstring_t str = KS_INITIALIZE;
-            auto make_rstr = [](const std::string& chrom, hts_pos_t beg, hts_pos_t end) {
-                std::string s = chrom;
-                if (beg > 0) {
-                    s += ":" + std::to_string(beg);
-                    if (end > 0) s += "-" + std::to_string(end);
-                }
-                return s;
-            };
-            for (const RegionFilter& filter : filters) {
-                if (!filter.enabled) continue;
-                auto it = filter_to_vcf_chrom.find(filter.chrom);
-                if (it == filter_to_vcf_chrom.end()) continue;
-                std::unique_ptr<hts_itr_t, HtsItrDeleter> itr(
-                    tbx_itr_querys(tbx.get(),
-                                   make_rstr(it->second, filter.beg, filter.end).c_str()));
-                if (!itr) continue;
-                while (tbx_itr_next(fp.get(), tbx.get(), itr.get(), &str) >= 0) {
-                    if (str.l > 0) parse_line(str.s, str.l);
-                }
-            }
-            ks_free(&str);
-            // Fall through to sort + re-validate below.
-            goto finalize;
+            append_graph_sites_tabix_filtered(fp.get(), tbx.get(), filters, catalog,
+                                               keep_allele_traversal_strings);
+            finalize_graph_site_catalog_inplace(catalog);
+            return catalog;
         }
-        // No tabix index — fall through to streaming with per-line position check.
     }
 
-    // Streaming fallback: hts_open handles both plain-text and bgzipped VCFs.
     {
         struct HtsFileDeleter { void operator()(htsFile* p) const { hts_close(p); } };
         std::unique_ptr<htsFile, HtsFileDeleter> fp(hts_open(path.c_str(), "r"));
@@ -360,7 +401,6 @@ GraphSiteCatalog load_graph_site_catalog_from_vcf(
         while (hts_getline(fp.get(), '\n', &str) >= 0) {
             if (str.l == 0 || str.s[0] == '#') continue;
             if (has_filters) {
-                // Quick contig+position check before full parse.
                 const char* s = str.s;
                 const char* t1 = static_cast<const char*>(memchr(s, '\t', str.l));
                 if (!t1) continue;
@@ -372,23 +412,141 @@ GraphSiteCatalog load_graph_site_catalog_from_vcf(
                     static_cast<hts_pos_t>(std::stoll(std::string(t1 + 1, t2)));
                 if (!passes_any_filter(chrom, pos)) continue;
             }
-            parse_line(str.s, str.l);
+            append_graph_site_from_vcf_data_line(str.s, str.l, catalog,
+                                                 keep_allele_traversal_strings);
         }
         ks_free(&str);
     }
 
-    finalize:
-    std::stable_sort(catalog.sites.begin(), catalog.sites.end(),
-                     [](const GraphSite& lhs, const GraphSite& rhs) {
-                         if (lhs.chrom != rhs.chrom) return lhs.chrom < rhs.chrom;
-                         if (lhs.pos != rhs.pos) return lhs.pos < rhs.pos;
-                         return lhs.id < rhs.id;
-                     });
-    for (GraphSite& site : catalog.sites) {
-        site.skip_reason = graph_site_validation_skip_reason(site);
-        site.eligible = site.skip_reason.empty();
-    }
+    finalize_graph_site_catalog_inplace(catalog);
     return catalog;
+}
+
+bool graph_site_vcf_has_tabix_index(const std::string& path) {
+    tbx_t* tbx = tbx_index_load(path.c_str());
+    if (!tbx) return false;
+    tbx_destroy(tbx);
+    return true;
+}
+
+void require_graph_site_vcf_tabix_index(const std::string& path) {
+    if (graph_site_vcf_has_tabix_index(path)) return;
+    throw std::runtime_error(
+        "graph-site VCF must be bgzip-compressed with a tabix index (.tbi or .csi): " +
+        path);
+}
+
+hts_pos_t graph_site_contig_end_bp_from_vcf_header(const std::string& vcf_path,
+                                                   const std::string& logical_chrom) {
+    struct HtsFileDeleter {
+        void operator()(htsFile* p) const {
+            if (p) hts_close(p);
+        }
+    };
+    std::unique_ptr<htsFile, HtsFileDeleter> fp(hts_open(vcf_path.c_str(), "r"));
+    if (!fp) throw std::runtime_error("failed to open graph site VCF: " + vcf_path);
+
+    auto chrom_suffix_eq = [](const std::string& s) -> std::string {
+        const size_t h = s.rfind('#');
+        return h == std::string::npos ? s : s.substr(h + 1);
+    };
+    auto chrom_matches = [&](const std::string& a, const std::string& b) -> bool {
+        return a == b || chrom_suffix_eq(a) == chrom_suffix_eq(b);
+    };
+
+    kstring_t line = KS_INITIALIZE;
+    struct KsGuard {
+        kstring_t* p;
+        ~KsGuard() {
+            if (p) ks_free(p);
+        }
+    } ks_guard{&line};
+
+    hts_pos_t best = -1;
+    while (hts_getline(fp.get(), '\n', &line) >= 0) {
+        if (line.l == 0 || line.s[0] != '#') break;
+        constexpr char pref[] = "##contig=<";
+        constexpr size_t lp = sizeof(pref) - 1;
+        if (static_cast<size_t>(line.l) < lp || std::memcmp(line.s, pref, lp) != 0) continue;
+
+        std::string meta(line.s + lp, static_cast<size_t>(line.l) - lp);
+        if (!meta.empty() && meta.back() == '>') meta.pop_back();
+
+        std::string id_field;
+        hts_pos_t len_bp = -1;
+        size_t pos = 0;
+        while (pos < meta.size()) {
+            const size_t comma = meta.find(',', pos);
+            const std::string tok = meta.substr(pos, comma == std::string::npos
+                                                       ? std::string::npos
+                                                       : comma - pos);
+            pos = comma == std::string::npos ? meta.size() : comma + 1;
+            const size_t eq = tok.find('=');
+            if (eq == std::string::npos) continue;
+            std::string key = tok.substr(0, eq);
+            std::string val = tok.substr(eq + 1);
+            if (!val.empty() && val.front() == '"') {
+                val.erase(0, 1);
+                if (!val.empty() && val.back() == '"') val.pop_back();
+            }
+            if (key == "ID") id_field = val;
+            else if (key == "length") len_bp = static_cast<hts_pos_t>(std::stoll(val));
+        }
+        if (id_field.empty() || len_bp <= 0) continue;
+        if (!chrom_matches(logical_chrom, id_field)) continue;
+        best = std::max(best, len_bp);
+    }
+
+    if (best <= 0) {
+        throw std::runtime_error(
+            "cannot resolve reference length for contig \"" + logical_chrom +
+            "\" from ##contig headers in " + vcf_path +
+            "; use phase-graph --interval BEG..END or ensure ##contig=<...,length=...>");
+    }
+    return best;
+}
+
+struct GraphSitesTabixReader::Impl {
+    htsFile* fp = nullptr;
+    tbx_t* tbx = nullptr;
+};
+
+GraphSitesTabixReader::GraphSitesTabixReader(const std::string& vcf_path)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->fp = hts_open(vcf_path.c_str(), "r");
+    if (!impl_->fp)
+        throw std::runtime_error("failed to open graph site VCF: " + vcf_path);
+    impl_->tbx = tbx_index_load(vcf_path.c_str());
+    if (!impl_->tbx) {
+        hts_close(impl_->fp);
+        impl_->fp = nullptr;
+        throw std::runtime_error(
+            "graph-site VCF requires a tabix index (.tbi/.csi) for streaming loads: " +
+            vcf_path);
+    }
+}
+
+GraphSitesTabixReader::~GraphSitesTabixReader() {
+    if (!impl_) return;
+    if (impl_->tbx) {
+        tbx_destroy(impl_->tbx);
+        impl_->tbx = nullptr;
+    }
+    if (impl_->fp) {
+        hts_close(impl_->fp);
+        impl_->fp = nullptr;
+    }
+}
+
+GraphSitesTabixReader::GraphSitesTabixReader(GraphSitesTabixReader&&) noexcept = default;
+GraphSitesTabixReader& GraphSitesTabixReader::operator=(GraphSitesTabixReader&&) noexcept = default;
+
+GraphSiteCatalog GraphSitesTabixReader::load_half_open_interval(const std::string& logical_chrom,
+                                                               hts_pos_t beg0,
+                                                               hts_pos_t end0,
+                                                               bool keep_allele_traversal_strings) {
+    return load_half_open_tabix_catalog(impl_->fp, impl_->tbx, logical_chrom, beg0, end0,
+                                         keep_allele_traversal_strings);
 }
 
 std::vector<std::string> load_graph_site_contig_names(const std::string& vcf_path) {

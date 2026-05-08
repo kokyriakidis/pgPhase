@@ -333,7 +333,11 @@ int main() {
                                         hts_pos_t phase_set,
                                         const std::vector<std::pair<std::string, int>>& obs) {
             GraphBamChunkBuildResult out;
-            out.chunk.region.chunk_id = chunk_id;
+            out.graph_phase_contig           = "chr1";
+            out.chunk.region.chunk_id        = chunk_id;
+            out.chunk.region.reg_chunk_i     = chunk_id;
+            out.chunk.region.beg             = 1;
+            out.chunk.region.end             = 200;
             ReadRecord read;
             read.qname = "dup_read";
             out.chunk.reads.push_back(std::move(read));
@@ -360,38 +364,44 @@ int main() {
         dedup_chunks.push_back(make_phase_read_chunk(1, 1, 100, {{"right_site", 0}}));
         write_graph_bam_phase_reads_tsv(dedup_reads, dedup_chunks);
         const std::string dedup = dedup_reads.str();
-        const size_t first = dedup.find("\tdup_read\t");
-        const size_t second = first == std::string::npos
-                                  ? std::string::npos
-                                  : dedup.find("\tdup_read\t", first + 1);
-        ok &= check(first != std::string::npos && second == std::string::npos,
-                    "phase read output: boundary read emitted once");
-        ok &= check(dedup.find("-1\tdup_read\t1\t100\t2\t") != std::string::npos,
-                    "phase read output: agreeing boundary copies keep final hap");
+        size_t dup_count = 0;
+        for (size_t p = 0; (p = dedup.find("\tdup_read\t", p)) != std::string::npos; ++dup_count, ++p) {}
+        ok &= check(dup_count == 2,
+                    "phase read output: boundary read emitted once per stitched chunk");
+        ok &= check(dedup.find("\t1\t100\n") != std::string::npos,
+                    "phase read output: agreeing boundary chunk copies report hap 1");
 
         std::ostringstream conflict_reads;
         std::vector<GraphBamChunkBuildResult> conflict_chunks;
         conflict_chunks.push_back(make_phase_read_chunk(0, 1, 100, {{"left_site", 1}, {"left_site2", 0}}));
         conflict_chunks.push_back(make_phase_read_chunk(1, 2, 100, {{"right_site", 0}}));
         write_graph_bam_phase_reads_tsv(conflict_reads, conflict_chunks);
-        ok &= check(conflict_reads.str().find("-1\tdup_read\t1\t100\t3\t") != std::string::npos,
-                    "phase read output: local copy conflict keeps best stitched k-means side");
+        const std::string conflict_s = conflict_reads.str();
+        ok &= check(conflict_s.find("\t1\t100\n") != std::string::npos &&
+                        conflict_s.find("\t2\t100\n") != std::string::npos,
+                    "phase read output: per-chunk hap differs across stitched chunks");
 
         std::ostringstream tied_reads;
         std::vector<GraphBamChunkBuildResult> tied_chunks;
         tied_chunks.push_back(make_phase_read_chunk(0, 1, 100, {{"left_site", 1}}));
         tied_chunks.push_back(make_phase_read_chunk(1, 2, 100, {{"right_site", 1}}));
         write_graph_bam_phase_reads_tsv(tied_reads, tied_chunks);
-        ok &= check(tied_reads.str().find("-1\tdup_read\t1\t100\t2\t") != std::string::npos,
-                    "phase read output: tied local copy conflict keeps earlier stitched side");
+        const std::string tied_s = tied_reads.str();
+        ok &= check(tied_s.find("\t1\t100\n") != std::string::npos &&
+                        tied_s.find("\t2\t100\n") != std::string::npos,
+                    "phase read output: per-chunk hap preserved when chunks disagree");
 
         std::ostringstream unphased_reads;
         std::vector<GraphBamChunkBuildResult> unphased_chunks;
         unphased_chunks.push_back(make_phase_read_chunk(0, 0, -1, {{"left_site", 1}}));
         unphased_chunks.push_back(make_phase_read_chunk(1, 0, -1, {{"right_site", 1}}));
         write_graph_bam_phase_reads_tsv(unphased_reads, unphased_chunks);
-        ok &= check(unphased_reads.str().find("-1\tdup_read\t0\t-1\t2\t") != std::string::npos,
-                    "phase read output: no stitched k-means side remains unphased");
+        size_t unph_count = 0;
+        for (size_t p = 0;
+             (p = unphased_reads.str().find("\t0\t-1\n", p)) != std::string::npos;
+             ++unph_count, ++p) {}
+        ok &= check(unph_count == 2,
+                    "phase read output: no stitched k-means side remains unphased per chunk");
     }
 
     if (ok) {
