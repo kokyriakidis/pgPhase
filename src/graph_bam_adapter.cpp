@@ -164,8 +164,7 @@ void merge_phase_read_observation(PhaseReadOutputRow& row,
 void merge_phase_read_assignment(PhaseReadOutputRow& row,
                                  int chunk_id,
                                  int hap,
-                                 hts_pos_t phase_set,
-                                 int n_obs) {
+                                 hts_pos_t phase_set) {
     if (row.copies == 0) {
         row.chunk_id = chunk_id;
     } else if (row.chunk_id != chunk_id) {
@@ -173,16 +172,12 @@ void merge_phase_read_assignment(PhaseReadOutputRow& row,
     }
     ++row.copies;
 
-    if ((hap != 1 && hap != 2) || phase_set < 0) return;
-    if (!row.has_phased_assignment ||
-        n_obs > row.best_assignment_obs ||
-        (n_obs == row.best_assignment_obs && chunk_id < row.assignment_chunk_id)) {
-        row.hap = hap;
-        row.phase_set = phase_set;
-        row.has_phased_assignment = true;
-        row.best_assignment_obs = n_obs;
-        row.assignment_chunk_id = chunk_id;
-    }
+    // Match collect_bam_output PhasedAlignmentWriter::write_chunks: HP/PS come from the one chunk
+    // that owns the read at emission time. Overlap reads skip upstream chunks there; here we merge
+    // finalized chunks in order, so the latest visit matches downstream ownership / stitched state.
+    row.hap                   = hap;
+    row.phase_set             = phase_set;
+    row.has_phased_assignment = ((hap == 1 || hap == 2) && phase_set >= 0);
 }
 
 } // namespace
@@ -206,6 +201,7 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     const int chunk_tid = contig.empty() ? 0 : contig_tid(contig);
 
     GraphBamChunkBuildResult out;
+    out.graph_phase_contig = contig;
     out.chunk.region.chunk_id = chunk_id;
     out.chunk.region.reg_chunk_i = chunk_id;
     out.chunk.region.tid = chunk_tid;
@@ -227,21 +223,33 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     std::vector<std::vector<int>> allele_counts;
     std::vector<int> parent_candidate;
     std::vector<std::vector<int>> conditional_parent_alleles;
+    std::vector<size_t> catalog_site_idx_phase1;
     for (size_t site_i = 0; site_i < catalog.sites.size(); ++site_i) {
         const GraphSite& site = catalog.sites[site_i];
         if (!site_starts_in_interval(site, contig, beg, end)) continue;
+        const std::string sid = site_key(site, site_i);
+        if (!site.eligible) {
+            out.filtered_sites.push_back({sid, 0, 0, 0, 0.0, "precandidate_ineligible"});
+            continue;
+        }
         const bool released_walk_storage = graph_site_has_released_walk_storage(site);
-        if (!released_walk_storage && !graph_site_is_queryable(site)) continue;
-        const std::string key = site_key(site, site_i);
+        if (!released_walk_storage && !graph_site_is_queryable(site)) {
+            out.filtered_sites.push_back({sid, 0, 0, 0, 0.0, "precandidate_not_queryable"});
+            continue;
+        }
         const int n_alleles = static_cast<int>(site.allele_walks.size());
-        if (n_alleles < 2) continue;
-        site_to_candidate.emplace(key, static_cast<int>(out.chunk.candidates.size()));
+        if (n_alleles < 2) {
+            out.filtered_sites.push_back({sid, 0, 0, 0, 0.0, "precandidate_monoallelic"});
+            continue;
+        }
+        site_to_candidate.emplace(sid, static_cast<int>(out.chunk.candidates.size()));
         allele_counts.emplace_back(static_cast<size_t>(n_alleles), 0);
         parent_candidate.push_back(-1);
         conditional_parent_alleles.push_back(site.conditional_parent_alleles);
         const std::string& site_contig = site.ref_contig.empty() ? site.chrom : site.ref_contig;
         const int site_tid = site_contig.empty() ? chunk_tid : contig_tid(site_contig);
-        add_graph_candidate(out, site, key, allele_counts.back(), site_tid);
+        catalog_site_idx_phase1.push_back(site_i);
+        add_graph_candidate(out, site, sid, allele_counts.back(), site_tid);
     }
 
     for (size_t site_i = 0; site_i < catalog.sites.size(); ++site_i) {
@@ -555,6 +563,38 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     out.chunk.phase_sets.assign(out.chunk.reads.size(), -1);
     rebuild_read_var_cr(out.chunk);
     out.site_allele_orig_idx = std::move(allele_orig_idx);
+
+    constexpr size_t kNoPhase1 = std::numeric_limits<size_t>::max();
+    std::vector<size_t> final_to_phase1(out.chunk.candidates.size(), kNoPhase1);
+    for (size_t old_i = 0; old_i < old_site_to_pairs.size(); ++old_i) {
+        for (const auto& pe : old_site_to_pairs[old_i]) {
+            if (pe.new_idx >= 0 &&
+                static_cast<size_t>(pe.new_idx) < final_to_phase1.size())
+                final_to_phase1[static_cast<size_t>(pe.new_idx)] = old_i;
+        }
+    }
+
+    out.variant_emit_rows.assign(out.chunk.candidates.size(), {});
+    for (size_t ci = 0; ci < out.chunk.candidates.size(); ++ci) {
+        const size_t pi = final_to_phase1[ci];
+        if (pi == kNoPhase1 || pi >= catalog_site_idx_phase1.size()) continue;
+        const GraphSite& site = catalog.sites[catalog_site_idx_phase1[pi]];
+        GraphVariantEmitRow row;
+        row.chrom = site.ref_contig.empty() ? site.chrom : site.ref_contig;
+        row.pos = site.pos;
+        row.ref = site.ref;
+
+        int orig_walk_idx = 1;
+        if (ci < out.site_allele_orig_idx.size() &&
+            out.site_allele_orig_idx[ci].size() > 1) {
+            orig_walk_idx = out.site_allele_orig_idx[ci][1];
+        }
+        const int alt_seq_idx = orig_walk_idx - 1;
+        if (alt_seq_idx >= 0 && static_cast<size_t>(alt_seq_idx) < site.alts.size())
+            row.alt = site.alts[static_cast<size_t>(alt_seq_idx)];
+        out.variant_emit_rows[ci] = std::move(row);
+    }
+
     return out;
 }
 
@@ -616,7 +656,7 @@ void populate_graph_chunk_pair_overlaps(GraphBamChunkBuildResult& pre,
 }
 
 void assign_graph_chunk_hap(GraphBamChunkBuildResult& gc, const Options& opts) {
-    assign_hap_based_on_germline_het_vars_kmeans(gc.chunk, opts, kCandHetVarCate);
+    assign_hap_based_on_germline_het_vars_kmeans(gc.chunk, opts, kCandGermlineClean);
 }
 
 void stitch_graph_chunk_pair(GraphBamChunkBuildResult& pre,
@@ -635,7 +675,7 @@ void stitch_graph_chunk_pair(GraphBamChunkBuildResult& pre,
 void phase_graph_bam_chunks(std::vector<GraphBamChunkBuildResult>& graph_chunks,
                             const Options& opts) {
     for (GraphBamChunkBuildResult& graph_chunk : graph_chunks) {
-        assign_hap_based_on_germline_het_vars_kmeans(graph_chunk.chunk, opts, kCandHetVarCate);
+        assign_hap_based_on_germline_het_vars_kmeans(graph_chunk.chunk, opts, kCandGermlineClean);
     }
     populate_graph_chunk_overlaps(graph_chunks);
     std::vector<BamChunk> chunks;
@@ -665,19 +705,38 @@ void merge_graph_chunk_into_read_rows(
                 ? chunk.phase_sets[read_i]
                 : static_cast<hts_pos_t>(-1);
 
-        int n_obs = 0;
         for (int site_i = profile.start_var_idx; site_i <= profile.end_var_idx; ++site_i) {
             const int offset = site_i - profile.start_var_idx;
             if (offset < 0 || static_cast<size_t>(offset) >= profile.alleles.size()) continue;
             const int allele = profile.alleles[static_cast<size_t>(offset)];
             if (allele < 0) continue;
-            ++n_obs;
             if (site_i < 0 || static_cast<size_t>(site_i) >= gc.site_ids.size()) continue;
             merge_phase_read_observation(row,
                                          gc.site_ids[static_cast<size_t>(site_i)],
                                          allele);
         }
-        merge_phase_read_assignment(row, chunk.region.chunk_id, hap, phase_set, n_obs);
+        merge_phase_read_assignment(row, chunk.region.chunk_id, hap, phase_set);
+    }
+}
+
+void write_graph_bam_phase_reads_tsv_header(std::ostream& out) {
+    write_phase_read_tsv_header(out);
+}
+
+void write_graph_chunk_phase_read_tsv_rows(std::ostream& out,
+                                           const std::string& chunk_chrom,
+                                           const BamChunk& chunk) {
+    const RegionChunk& reg = chunk.region;
+    const std::string chunk_txt = chunk_chrom.empty() ? "." : chunk_chrom;
+    for (size_t i = 0; i < chunk.reads.size(); ++i) {
+        const ReadRecord& r = chunk.reads[i];
+        const int hap                = i < chunk.haps.size() ? chunk.haps[i] : 0;
+        const hts_pos_t ps =
+            i < chunk.phase_sets.size() ? chunk.phase_sets[i] : static_cast<hts_pos_t>(-1);
+        out << reg.chunk_id << '\t' << reg.reg_chunk_i << '\t' << chunk_txt << '\t' << reg.beg << '\t'
+            << reg.end << '\t' << r.qname << '\t' << chunk_txt << '\t' << r.input_index << '\t' << r.beg
+            << '\t' << r.end << '\t' << r.mapq << '\t' << (r.reverse ? 1 : 0) << '\t'
+            << (r.is_skipped ? 1 : 0) << '\t' << hap << '\t' << ps << '\n';
     }
 }
 
@@ -775,6 +834,63 @@ void write_graph_bam_variants_tsv_header(std::ostream& out) {
            "\tAF\tCATEGORY\tINIT_CAT\tPHASE_SET\tHAP_ALT\tHAP_REF\n";
 }
 
+static void write_graph_bam_variant_tsv_line(std::ostream& out,
+                                             const CandidateVariant& cand,
+                                             const std::string& chrom,
+                                             hts_pos_t pos,
+                                             const std::string& ref_seq,
+                                             const std::string& alt_seq) {
+    if (ref_seq.empty()) return;
+    if (alt_seq.empty() || alt_seq == "*") return;
+
+    VariantType vtype;
+    if (alt_seq.size() > ref_seq.size()) {
+        vtype = VariantType::Insertion;
+    } else if (ref_seq.size() > alt_seq.size()) {
+        vtype = VariantType::Deletion;
+    } else {
+        vtype = VariantType::Snp;
+    }
+
+    int h1 = cand.hap_to_cons_alle[1];
+    int h2 = cand.hap_to_cons_alle[2];
+    if (h1 == -1 && h2 == -1) h1 = h2 = cand.hap_to_cons_alle[0];
+    if (h1 < 0) h1 = 0;
+    if (h2 < 0) h2 = 0;
+
+    out << chrom << '\t' << pos << '\t' << type_name(vtype) << '\t'
+        << ref_seq << '\t' << alt_seq << '\t'
+        << cand.counts.total_cov << '\t' << cand.counts.ref_cov << '\t'
+        << cand.counts.alt_cov << '\t' << cand.counts.low_qual_cov << '\t'
+        << cand.counts.forward_ref << '\t' << cand.counts.reverse_ref << '\t'
+        << cand.counts.forward_alt << '\t' << cand.counts.reverse_alt << '\t'
+        << cand.counts.allele_fraction << '\t'
+        << category_name(cand.counts.category) << '\t'
+        << category_name(cand.counts.candvarcate_initial) << '\t'
+        << cand.phase_set << '\t'
+        << (h1 > 0 ? 1 : 0) << '\t' << (h2 > 0 ? 1 : 0) << '\n';
+}
+
+static void write_graph_bam_variant_one_row(std::ostream& out,
+                                            const CandidateVariant& cand,
+                                            const GraphSite& site,
+                                            const GraphBamChunkBuildResult& gc,
+                                            size_t ci) {
+    const std::string& chrom = site.ref_contig.empty() ? site.chrom : site.ref_contig;
+    const std::string& ref_seq = site.ref;
+    if (ref_seq.empty()) return;
+
+    int orig_walk_idx = 1;
+    if (ci < gc.site_allele_orig_idx.size() &&
+        gc.site_allele_orig_idx[ci].size() > 1) {
+        orig_walk_idx = gc.site_allele_orig_idx[ci][1];
+    }
+    const int alt_seq_idx = orig_walk_idx - 1;
+    if (alt_seq_idx < 0 || alt_seq_idx >= static_cast<int>(site.alts.size())) return;
+    const std::string& alt_seq = site.alts[static_cast<size_t>(alt_seq_idx)];
+    write_graph_bam_variant_tsv_line(out, cand, chrom, site.pos, ref_seq, alt_seq);
+}
+
 void write_graph_bam_variants_tsv_rows(
     std::ostream& out,
     const GraphBamChunkBuildResult& gc,
@@ -793,60 +909,50 @@ void write_graph_bam_variants_tsv_rows(
         }
         const GraphSite& site = *it->second;
 
-        const std::string& chrom = site.ref_contig.empty() ? site.chrom : site.ref_contig;
-        const std::string& ref_seq = site.ref;
-        if (ref_seq.empty()) continue;
+        write_graph_bam_variant_one_row(out, cand, site, gc, ci);
+    }
+}
 
-        int orig_walk_idx = 1;
-        if (ci < gc.site_allele_orig_idx.size() &&
-            gc.site_allele_orig_idx[ci].size() > 1) {
-            orig_walk_idx = gc.site_allele_orig_idx[ci][1];
+void write_graph_bam_variants_tsv_rows(
+    std::ostream& out,
+    const GraphBamChunkBuildResult& gc,
+    const std::unordered_map<std::string, GraphSite>& site_by_id) {
+    for (size_t ci = 0; ci < gc.chunk.candidates.size(); ++ci) {
+        const CandidateVariant& cand = gc.chunk.candidates[ci];
+        if (ci >= gc.site_ids.size()) continue;
+
+        const std::string& raw_id = gc.site_ids[ci];
+        auto it = site_by_id.find(raw_id);
+        if (it == site_by_id.end()) {
+            const auto colon_pos = raw_id.rfind(':');
+            if (colon_pos != std::string::npos)
+                it = site_by_id.find(raw_id.substr(0, colon_pos));
+            if (it == site_by_id.end()) continue;
         }
-        const int alt_seq_idx = orig_walk_idx - 1;
-        if (alt_seq_idx < 0 || alt_seq_idx >= static_cast<int>(site.alts.size())) continue;
-        const std::string& alt_seq = site.alts[static_cast<size_t>(alt_seq_idx)];
-        if (alt_seq.empty() || alt_seq == "*") continue;
+        const GraphSite& site = it->second;
+        write_graph_bam_variant_one_row(out, cand, site, gc, ci);
+    }
+}
 
-        VariantType vtype;
-        if (alt_seq.size() > ref_seq.size()) {
-            vtype = VariantType::Insertion;
-        } else if (ref_seq.size() > alt_seq.size()) {
-            vtype = VariantType::Deletion;
-        } else {
-            vtype = VariantType::Snp;
-        }
-
-        int h1 = cand.hap_to_cons_alle[1];
-        int h2 = cand.hap_to_cons_alle[2];
-        if (h1 == -1 && h2 == -1) h1 = h2 = cand.hap_to_cons_alle[0];
-        if (h1 < 0) h1 = 0;
-        if (h2 < 0) h2 = 0;
-
-        out << chrom << '\t' << site.pos << '\t' << type_name(vtype) << '\t'
-            << ref_seq << '\t' << alt_seq << '\t'
-            << cand.counts.total_cov << '\t' << cand.counts.ref_cov << '\t'
-            << cand.counts.alt_cov << '\t' << cand.counts.low_qual_cov << '\t'
-            << cand.counts.forward_ref << '\t' << cand.counts.reverse_ref << '\t'
-            << cand.counts.forward_alt << '\t' << cand.counts.reverse_alt << '\t'
-            << cand.counts.allele_fraction << '\t'
-            << category_name(cand.counts.category) << '\t'
-            << category_name(cand.counts.candvarcate_initial) << '\t'
-            << cand.phase_set << '\t'
-            << (h1 > 0 ? 1 : 0) << '\t' << (h2 > 0 ? 1 : 0) << '\n';
+void write_graph_bam_variants_tsv_rows(std::ostream& out,
+                                       const GraphBamChunkBuildResult& gc) {
+    if (gc.variant_emit_rows.size() != gc.chunk.candidates.size())
+        throw std::runtime_error(
+            "write_graph_bam_variants_tsv_rows: variant_emit_rows size mismatch");
+    for (size_t ci = 0; ci < gc.chunk.candidates.size(); ++ci) {
+        const GraphVariantEmitRow& row = gc.variant_emit_rows[ci];
+        write_graph_bam_variant_tsv_line(out, gc.chunk.candidates[ci],
+                                         row.chrom, row.pos, row.ref, row.alt);
     }
 }
 
 void write_graph_bam_variants_tsv(std::ostream& out,
                                   const std::vector<GraphBamChunkBuildResult>& graph_chunks,
                                   const GraphSiteCatalog& catalog) {
-    std::unordered_map<std::string, const GraphSite*> site_map;
-    for (const GraphSite& site : catalog.sites) {
-        if (!site.id.empty() && site.id != ".")
-            site_map.emplace(site.id, &site);
-    }
+    (void)catalog;
     write_graph_bam_variants_tsv_header(out);
     for (const auto& gc : graph_chunks)
-        write_graph_bam_variants_tsv_rows(out, gc, site_map);
+        write_graph_bam_variants_tsv_rows(out, gc);
 }
 
 // ── Shared BAM write helper ───────────────────────────────────────────────────
@@ -880,6 +986,53 @@ static void write_bam_record(samFile* out_sam, sam_hdr_t* hdr,
         throw std::runtime_error("failed to write BAM record for: " + name);
 }
 
+void flush_graph_phase_bam_after_merge(
+    samFile* phase_bam_out,
+    sam_hdr_t* phase_bam_hdr,
+    std::unordered_map<std::string, PhaseReadOutputRow>& rows_by_read,
+    const std::unordered_set<std::string>* next_chunk_qnames,
+    std::unordered_set<std::string>& emitted_read_names) {
+    std::vector<std::pair<std::string, PhaseReadOutputRow>> drained;
+    drained.reserve(rows_by_read.size());
+    for (auto it = rows_by_read.begin(); it != rows_by_read.end(); ) {
+        if (next_chunk_qnames && next_chunk_qnames->count(it->first)) {
+            ++it;
+            continue;
+        }
+        std::string key        = std::move(it->first);
+        PhaseReadOutputRow row = std::move(it->second);
+        it                     = rows_by_read.erase(it);
+        drained.emplace_back(std::move(key), std::move(row));
+    }
+    std::sort(drained.begin(), drained.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (auto& kv : drained) {
+        emitted_read_names.insert(kv.first);
+        if (phase_bam_out && phase_bam_hdr) {
+            const int hap =
+                kv.second.has_phased_assignment ? kv.second.hap : 0;
+            const hts_pos_t ps =
+                kv.second.has_phased_assignment
+                    ? kv.second.phase_set
+                    : static_cast<hts_pos_t>(-1);
+            write_bam_record(phase_bam_out, phase_bam_hdr, kv.first, hap, ps);
+        }
+    }
+}
+
+void write_graph_phase_bam_for_unobserved(
+    samFile* phase_bam_out,
+    sam_hdr_t* phase_bam_hdr,
+    const std::unordered_set<std::string>& emitted_read_names,
+    const std::vector<std::string>& all_read_names_sorted) {
+    for (const std::string& read_name : all_read_names_sorted) {
+        if (emitted_read_names.count(read_name)) continue;
+        if (phase_bam_out && phase_bam_hdr)
+            write_bam_record(phase_bam_out, phase_bam_hdr, read_name, 0,
+                             static_cast<hts_pos_t>(-1));
+    }
+}
+
 // Build sorted list of all read names: union of map keys and all_read_names.
 static std::vector<std::string> sorted_read_names(
     const std::unordered_map<std::string, PhaseReadOutputRow>& rows_by_read,
@@ -894,42 +1047,6 @@ static std::vector<std::string> sorted_read_names(
 }
 
 // ── End-of-run writers from pre-built rows_by_read ───────────────────────────
-
-void write_graph_bam_phase_reads_tsv_from_rows(
-    std::ostream& out,
-    const std::unordered_map<std::string, PhaseReadOutputRow>& rows_by_read,
-    const std::vector<std::string>& all_read_names) {
-    out << "CHUNK_ID\tREAD\tHAP\tPHASE_SET\tN_OBS\tOBS\n";
-
-    const auto read_names = sorted_read_names(rows_by_read, all_read_names);
-    for (const std::string& read_name : read_names) {
-        auto it = rows_by_read.find(read_name);
-        int hap = 0;
-        hts_pos_t ps = -1;
-        int chunk_id = -1;
-        std::vector<std::string> obs_keys;
-
-        if (it != rows_by_read.end()) {
-            const PhaseReadOutputRow& row = it->second;
-            if (row.has_phased_assignment) { hap = row.hap; ps = row.phase_set; }
-            chunk_id = row.chunk_id;
-            obs_keys.reserve(row.allele_by_site.size());
-            for (const auto& obs : row.allele_by_site) {
-                if (obs.second >= 0) obs_keys.push_back(obs.first);
-            }
-            std::sort(obs_keys.begin(), obs_keys.end());
-        }
-
-        out << chunk_id << '\t' << read_name << '\t' << hap << '\t' << ps << '\t'
-            << obs_keys.size() << '\t';
-        for (size_t i = 0; i < obs_keys.size(); ++i) {
-            if (i > 0) out << ',';
-            const std::string& sid = obs_keys[i];
-            out << sid << ':' << it->second.allele_by_site.at(sid);
-        }
-        out << '\n';
-    }
-}
 
 void write_graph_bam_phase_bam_from_rows(
     const std::string& out_path,
@@ -963,9 +1080,13 @@ void write_graph_bam_phase_bam_from_rows(
 void write_graph_bam_phase_reads_tsv(std::ostream& out,
                                      const std::vector<GraphBamChunkBuildResult>& graph_chunks,
                                      const std::vector<std::string>& all_read_names) {
-    std::unordered_map<std::string, PhaseReadOutputRow> rows_by_read;
-    for (const auto& gc : graph_chunks) merge_graph_chunk_into_read_rows(rows_by_read, gc);
-    write_graph_bam_phase_reads_tsv_from_rows(out, rows_by_read, all_read_names);
+    (void)all_read_names;
+    write_phase_read_tsv_header(out);
+    for (const auto& gc : graph_chunks) {
+        const std::string cc =
+            gc.graph_phase_contig.empty() ? std::string() : gc.graph_phase_contig;
+        write_graph_chunk_phase_read_tsv_rows(out, cc, gc.chunk);
+    }
 }
 
 void write_graph_bam_phase_bam(const std::string& out_path,

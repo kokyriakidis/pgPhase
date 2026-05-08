@@ -1,737 +1,322 @@
-# `phase-graph` Implementation Description
+# `phase-graph` implementation description
 
-This document describes the implementation of the `pgphase phase-graph` command from command-line
-input to final phased output. The command takes a decomposed graph-site VCF (produced by
-`build-snarl-catalog` / `vg deconstruct`) and a raw GAF alignment file and produces per-read
-haplotype assignments and phased graph-site calls without requiring a reference FASTA or coordinate-
-sorted BAM. It is the graph-native complement to `collect-bam-variation`: instead of calling
-candidates from BAM digars and phasing them, it reads pre-called snarl genotype candidates from the
-VCF, matches raw graph-walk alignments to those candidates, and runs the same k-means + chunk-
-stitching engine used by the BAM path.
+This document is an **in-depth** description of `pgphase phase-graph`: how tiled **tabix-indexed** graph-site VCF windows and **tabix-indexed pggaf GAF** ranges are joined into `BamChunk` scaffolds, how phasing and stitching reuse `collect_phase.cpp`, and how **streaming** outputs preserve bounded memory on whole-genome runs.
 
-The implementation spans the following source files:
-
-```text
-graph_pipeline.cpp    CLI parser, contig discovery, per-contig streaming orchestration,
-                      shard infrastructure, parallel GAF scan, parallel chunk build loop,
-                      streaming output coordination, final output writers.
-
-graph_bam_adapter.cpp Build GraphReadAllele rows into a BamChunk (allele filtering, depth/AF
-                      gating, read-profile construction); per-chunk hap assignment; overlap
-                      population; chunk-pair stitching; per-chunk and end-of-run output writers.
-
-graph_bam_adapter.hpp Public API for the adapter: GraphBamChunkBuildResult, PhaseReadOutputRow,
-                      FilteredGraphSite; streaming build/assign/stitch/merge/write functions;
-                      header writers and row writers for each output file.
-
-graph_sites.hpp/.cpp  GraphSite / GraphSiteCatalog data types; VCF catalog loader
-                      (load_graph_site_catalog_from_vcf, with tabix fast-path and streaming
-                      fallback); contig name discovery (load_graph_site_contig_names);
-                      walk parsing and string round-trip helpers.
-
-graph_query.hpp/.cpp  GraphReadAllele type; compact site index (CompactGraphSite,
-                      CompactGraphSiteIndex); node-handle encoding; GAF streaming and walk-
-                      match logic; scan_gaf_for_catalog_emit_parallel_releasing_walks; per-
-                      chunk and diagnostic row writers.
-
-collect_phase.cpp     Shared k-means hap assignment (assign_hap_based_on_germline_het_vars_kmeans)
-                      and chunk-boundary stitching (stitch_chunk_haps / flip_chunk_hap) used
-                      identically by both the BAM and graph paths.
-
-collect_types.hpp     Shared Options struct (including touch_read_phase), BamChunk, and other
-                      types consumed by collect_phase.cpp.
-```
-
-### Reading guide
-
-Sections §1–§14 describe the pipeline in execution order. §15 covers the memory model and the
-current I/O tradeoff between RAM and GAF scan count. §16 summarises the full pipeline.
-
-Coordinate conventions:
-
-- Graph VCF `POS` is **1-based** (standard VCF).
-- All interval arithmetic inside the pipeline uses **0-based half-open** positions derived from
-  `site.pos - 1` (or `site.ref_beg - 1` when `ref_beg` is set).
-- `chunk_size` is specified in base-pairs of reference coordinate space.
+For BAM alignment semantics shared with this path (k-means internals, `stitch_chunk_haps` voting/propagation), see **`docs/collect_bam_variation_implementation.md`**.
 
 ---
 
-## 1. Command-Line Configuration
+## 1. Goals and non-goals
 
-```text
-pgphase phase-graph [options]
-  --gaf FILE                Raw GAF graph alignments (required)
-  --graph-sites-vcf FILE    Decomposed graph-site VCF (required)
-  --contig NAME             Restrict to one reference contig
-  --interval BEG..END       0-based half-open bounds (with --contig only)
-  --chunk-size INT          Phasing chunk size in bp [500000]
-  --graph-phase-sites FILE  Phased graph-site calls TSV [graph_phase_sites.tsv]
-  --graph-phase-reads FILE  Per-read HAP/PHASE_SET TSV [graph_phase_reads.tsv]
-  --graph-phase-bam FILE    Unaligned BAM with HP/PS aux tags per read
-  --graph-sites-tsv FILE    Diagnostic: parsed graph-site catalog
-  --graph-read-support FILE Diagnostic: raw read→site allele observation TSV
-  --graph-site-counts FILE  Diagnostic: per-site allele depth counts TSV
-  --graph-read-profile FILE Diagnostic: sparse read×site allele profile TSV
-  --graph-filtered-sites FILE Diagnostic: sites removed by depth/AF filters
-  -t, --threads INT         Worker threads [1]
-  -V, --verbose INT         Verbosity level [0]
-```
+**Goals**
 
-Important defaults and semantics:
+- Tile each reference contig into half-open genomic intervals, load only overlapping VCF sites per tile, and scan only overlapping GAF records per tile.
+- Represent graph-supported alleles as **`CandidateVariant`** + **`ReadVariantProfile`** rows so **`assign_hap_based_on_germline_het_vars_kmeans`** and **`stitch_chunk_haps`** run **unchanged** from the alignment pipeline (modulo category bitmask).
+- Emit a **phased site scaffold TSV** (`PHASE_SET`, hap consensus alleles) and an **unaligned BAM** with optional **`HP` / `PS`** aux tags.
+- Record every site dropped before or during het filtering with an explicit **`filter_reason`** (optional TSV + stderr histogram).
 
-- `--chunk-size` follows the same tiling logic as `collect-bam-variation`: the genome is divided
-  into non-overlapping windows of this width and each window is processed as one `BamChunk`.
-  Adjacent chunks share overlap reads for boundary stitching (§12).
-- `--contig` restricts the entire run to a single named contig. Without it, all contigs present
-  in the VCF are processed in sequence (§3).
-- `--interval` is only valid when `--contig` is also supplied. It is silently ignored for multi-
-  contig runs.
-- `--graph-phase-sites` and `--graph-phase-reads` both default to non-empty paths, so phased
-  output is always produced unless explicitly redirected to `/dev/null`.
+**Non-goals**
+
+- `phase-graph` does **not** mirror all graph diagnostics on `collect-bam-variation` (catalog dump, read-profile TSV, variant-style phase dump as separate default outputs, etc.). Those live under **`collect_pipeline.cpp`** and related writers.
+- Indexed-GAF mode does **not** shell out to `query` / GBZ here; that subprocess path exists for other commands (`query_gbz_interval_gaf` in `graph_query.cpp`).
 
 ---
 
-## 2. Key Data Structures
+## 2. Entrypoint and global control flow
 
-### 2.1 `GraphSite` (`graph_sites.hpp`)
+**File:** `src/graph_pipeline.cpp`, function **`phase_graph`**.
 
-One decomposed snarl from the VCF:
+High-level loop:
 
-```cpp
-struct GraphSite {
-    std::string chrom;         // raw VCF CHROM (may be "CHM13#0#chr20")
-    std::string ref_contig;    // normalised contig ("chr20"), derived from CHROM or RC INFO
-    hts_pos_t   pos;           // 1-based VCF POS
-    std::string id;            // VCF ID (site key used in all shard routing)
-    std::string ref;           // REF allele sequence
-    std::vector<std::string> alts;
-    std::vector<std::string> allele_traversals; // raw AT strings (released after index build)
-    std::vector<GraphWalk>   allele_walks;       // parsed walk vectors (released after scan)
-    hts_pos_t ref_beg, ref_end;                  // from END= INFO field
-    int level;                                   // LV= nesting level
-    std::string parent, root;                    // PS=/RS= parent/root snarl IDs
-    std::vector<int> conditional_parent_alleles; // PA=
-    bool has_spanning_deletion;
-    bool eligible;
-    std::string skip_reason;
-};
-```
-
-`GraphWalk` is `std::vector<GraphWalkStep>` where each step holds a node ID string and an
-orientation flag. Walk index 0 is always the reference traversal; subsequent indices are alt
-traversals.
-
-### 2.2 `GraphReadAllele` (`graph_query.hpp`)
-
-One observation of a read traversing a site:
-
-```cpp
-struct GraphReadAllele {
-    std::string site_id;    // matches GraphSite::id (or constructed chrom:pos:ref key)
-    std::string chrom;
-    hts_pos_t   pos;
-    std::string read_name;
-    int         allele;     // 0 = ref, 1+ = alt index; kGraphAlleleMissing / kGraphAlleleAmbiguous
-    std::string walk;       // diagnostic only; empty in shard files
-    int         mapq;
-};
-```
-
-### 2.3 `GraphBamChunkBuildResult` (`graph_bam_adapter.hpp`)
-
-Output of one `build_graph_bam_chunk` call — wraps a fully-constructed `BamChunk` together with
-the site metadata needed for downstream writers:
-
-```cpp
-struct GraphBamChunkBuildResult {
-    BamChunk                    chunk;                // k-means input/output state
-    std::vector<std::string>    site_ids;             // sites present in this chunk
-    std::vector<std::vector<int>> site_allele_orig_idx; // surviving allele → original allele index
-    std::vector<FilteredGraphSite> filtered_sites;    // sites removed by depth/AF gates
-};
-```
-
-`BamChunk` (from `collect_types.hpp`) is the same struct used by the BAM path: it holds read
-profiles, candidate variant rows, hap assignments, phase sets, and overlap bookkeeping. It is
-non-copyable (owns a `cgranges_t*` via `unique_ptr`); all moves use `std::move`.
-
-### 2.4 `PhaseReadOutputRow` (`graph_bam_adapter.hpp`)
-
-Compact per-read accumulator maintained across chunks for the whole run:
-
-```cpp
-struct PhaseReadOutputRow {
-    std::string read_name;
-    int         chunk_id = -1;
-    int         hap = 0;
-    hts_pos_t   phase_set = -1;
-    bool        has_phased_assignment = false;
-    int         copies = 0;
-    int         best_assignment_obs = -1;
-    int         assignment_chunk_id = std::numeric_limits<int>::max();
-    std::unordered_map<std::string, int> allele_by_site;
-};
-```
-
-`assignment_chunk_id` is used for conflict resolution when a read appears in multiple chunks:
-the assignment from the chunk with the smallest global `chunk_id` (i.e., earlier in the genome)
-wins. `best_assignment_obs` tracks the k-means observation count so that a better-supported
-assignment in a later chunk can still override a weak earlier one.
+1. Parse CLI; validate paths and numeric bounds.
+2. Build two **`Options`** bundles:
+   - **`filter_opts`** — passed into **`build_graph_bam_chunk`** and GAF scan thresholding: copies **`verbose`**, sets **`touch_read_phase = true`**. All depth / AF / alt-depth / MAPQ thresholds use **`collect_types.hpp`** defaults (`min_mapq`, `min_depth`, `min_af`, `max_af`, `min_alt_depth`, …) because **`phase-graph` does not expose those flags on the CLI**.
+   - **`phase_opts`** — passed into **`assign_graph_chunk_hap`** / **`stitch_graph_chunk_pair`**: **`ReadTechnology::Hifi`**, **`output_aln = "graph"`**, **`verbose`**.
+3. Open **`--graph-sites-tsv`** and write **`write_graph_bam_phase_sites_tsv_header`** once.
+4. Open **`--graph-phase-bam`**, allocate a minimal SAM header (`HD VN=1.6 SO=unknown`), write header.
+5. Optionally open **`--graph-filtered-sites`** and write **`write_graph_bam_filtered_sites_tsv_header`**; allocate **`filter_reason_hist`**.
+6. **`require_indexed_gaf`** + **`require_graph_site_vcf_tabix_index`** — both inputs must be BGZF-backed with **`.tbi`** (see §5).
+7. For each logical contig (either **`--contig`** alone or every name from **`load_graph_site_contig_names`**):
+   - Resolve **`[interval_beg, interval_end)`**: from **`--interval`** when exactly one contig is selected; otherwise **`[0, graph_site_contig_end_bp_from_vcf_header(...))`**.
+   - **`split_graph_interval`** → vector of half-open chunk spans **`[chunk_beg, chunk_end)`**.
+   - Process chunks in **batches of width `threads`** (see §7).
+8. After **all** contigs: **`collect_gaf_read_names`** reads the **entire** GAF file (not tabix-sliced) to build the sorted universe of MAPQ-passing QNAMEs; **`write_graph_phase_bam_for_unobserved`** appends BAM records for reads that never entered **`rows_by_read`** / **`emitted_read_names`** (§13).
+9. If **`verbose >= 1`**, print filtered histogram and totals.
 
 ---
 
-## 3. Contig Discovery
+## 3. Coordinate conventions
 
-When `--contig` is supplied the pipeline processes exactly that contig. When it is absent,
-`load_graph_site_contig_names` enumerates all distinct reference contigs in the VCF:
-
-```cpp
-std::vector<std::string> load_graph_site_contig_names(const std::string& vcf_path);
-```
-
-**Tabix fast-path** (bgzipped VCF with `.tbi` or `.csi` index): reads the sequence-name table
-from the index with `tbx_seqnames` — no data lines are scanned.
-
-**Streaming fallback** (plain-text or bgzipped VCF without index): streams all data lines,
-extracts the first tab-delimited field, and collects distinct values. Result is sorted
-lexicographically.
-
-In both paths, pangenome-prefixed contig names (`CHM13#0#chr20`) are normalised to the suffix
-after the last `#` (`chr20`). Deduplication preserves VCF-header order for the tabix path and
-sorts for the fallback path.
-
-The returned list drives the outer contig loop in `phase_graph()`. Each contig is processed
-independently with no shared mutable state between iterations; `rows_by_read` and
-`diagnostic_catalog` are the only accumulators that grow across iterations.
+| Layer | Convention | Notes |
+|-------|------------|--------|
+| **`--interval`**, tiling **`split_graph_interval`** | **0-based half-open** `[beg, end)` | Parser rejects `beg < 0` or `end <= beg`. |
+| **`BamChunk.region.beg` / `region.end`** | **1-based inclusive start**, end consistent with collect pipeline | Set as **`beg + 1`** and **`end`** from the tile’s half-open `(beg, end)` when building the chunk in **`build_graph_bam_chunk`**. |
+| **`site_starts_in_interval`** | Compares **0-based** site start **`site_beg0 = (ref_beg > 0 ? ref_beg : site.pos) - 1`** against tile **`[beg, end)`** | A site belongs to **exactly one** chunk: the tile whose half-open interval contains its **start**. Snarls that span chunk boundaries do **not** duplicate the site across chunks. |
+| **Tabix catalog filter** (`load_half_open_tabix_catalog`) | **`RegionFilter`** uses **`f.beg = beg0 + 1`**, **`f.end = end0`** | Bridges half-open tiling coordinates into the same filtering helper used elsewhere for VCF extraction. |
+| **Indexed GAF `tbx_itr_queryi`** | **`[beg, end)`** half-open | Matches BAM-style interval query on **`rc`/`rb`/`re`** coordinates. |
 
 ---
 
-## 4. Catalog Loading (Per-Contig)
+## 4. Module map
 
-For each contig, the pipeline loads only that contig's sites:
-
-```cpp
-GraphSiteCatalog load_graph_site_catalog_from_vcf(
-    const std::string& path,
-    const std::vector<RegionFilter>& filters = {},
-    bool keep_allele_traversal_strings = true);
-```
-
-A `RegionFilter` specifying the current contig name is passed. When a tabix index is present the
-loader queries only the relevant sequence from the index; without an index it streams all data
-lines and skips non-matching `CHROM` values. Both paths converge to a stable-sorted catalog
-(`chrom`, then `pos`, then `id`).
-
-After loading, site metadata is re-validated:
-
-- `graph_site_validation_skip_reason` checks that the reference walk (allele 0) has at least two
-  nodes and that no structural problems (missing ID, missing walks, mismatched allele counts) are
-  present. Sites that fail receive `eligible = false` and a `skip_reason` string.
-- Spanning-deletion sites (`ALT = *`) set `has_spanning_deletion = true` and are excluded from
-  phasing (not placed in any chunk catalog).
-
-The catalog retains allele walk strings (`allele_traversals`, `allele_walks`) at this point
-because they are needed to build the compact index for the GAF scan (§7). They are released
-during or after the scan to reclaim memory.
+| Module | Role |
+|--------|------|
+| **`graph_pipeline.cpp`** | CLI; per-contig tiling; parallel batch dispatch; **`stable_sort`** batch results by **`region.beg`**; ordered **`stitch_graph_chunk_pair`**; streaming site TSV + BAM flush; histogram; final unobserved pass. |
+| **`graph_bam_adapter.hpp` / `.cpp`** | **`GraphBamChunkBuildResult`**, **`build_graph_bam_chunk`**, overlap **`populate_graph_chunk_pair_overlaps`**, **`assign_graph_chunk_hap`**, **`stitch_graph_chunk_pair`**, **`merge_graph_chunk_into_read_rows`**, **`merge_phase_read_assignment`**, **`flush_graph_phase_bam_after_merge`**, TSV/BAM writers. |
+| **`graph_query.hpp` / `.cpp`** | **`GraphReadAllele`**, **`scan_indexed_gaf_chunk`** (tabix interval + compact walk matching), **`require_indexed_gaf`**. |
+| **`graph_sites.hpp` / `.cpp`** | **`GraphSitesTabixReader::load_half_open_interval`** → **`load_half_open_tabix_catalog`** + **`finalize_graph_site_catalog_inplace`**. |
+| **`collect_phase.cpp`** | **`assign_hap_based_on_germline_het_vars_kmeans`** (via adapter), **`stitch_chunk_haps`**. |
+| **`collect_types.hpp`** | **`BamChunk`**, **`CandidateVariant`**, **`ReadRecord`**, **`ReadVariantProfile`**, **`Options`**. |
 
 ---
 
-## 5. Chunk Interval Splitting
+## 5. Input contracts
 
-```cpp
-std::vector<std::pair<hts_pos_t, hts_pos_t>>
-split_graph_interval(hts_pos_t beg, hts_pos_t end, hts_pos_t chunk_size);
-```
+### 5.1 Graph-site VCF
 
-Returns a vector of contiguous half-open intervals `[beg, beg+chunk_size), [beg+chunk_size,
-beg+2×chunk_size), …` covering `[beg, end)`. The last interval is clipped to `end`.
+- Must be **bgzip-compressed** with **tabix index** (`.tbi` or `.csi`) — enforced by **`require_graph_site_vcf_tabix_index`**.
+- **`GraphSitesTabixReader`** holds an **`htsFile*`** + **`tbx_t*`** per **worker thread** (each worker constructs its own reader inside **`run_vcf_gaf_chunks_parallel`**).
+- **`load_half_open_interval(contig, beg0, end0, keep_strings=true)`** for phase-graph passes **`keep_allele_traversal_strings = true`** so walks remain available for indexed-GAF matching **unless** released earlier by other paths (see queryable checks in **`build_graph_bam_chunk`**).
 
-`end` is computed as `catalog_end_bound(full_catalog)` — the maximum `ref_end` (or `pos`) across
-all sites in the current contig's catalog — unless overridden by `--interval`.
+### 5.2 Indexed GAF (pggaf)
 
-Each interval becomes one chunk index. The relationship between a site and its chunk is:
-
-```text
-site_beg0 = (site.ref_beg > 0 ? site.ref_beg : site.pos) - 1   // 0-based
-ci        = (site_beg0 - interval_beg) / chunk_size
-```
-
-This is an O(1) arithmetic assignment — no scan over intervals is needed.
+- Expected layout: **three leading columns** **`rc` `rb` `re`** (reference contig + 0-based half-open interval), followed by the **standard GAF columns** starting at column index **`3`** — see **`scan_indexed_gaf_chunk`** calling **`scan_gaf_line_compact(..., first_gaf_column = 3, ...)`**.
+- Must be **bgzip + tabix** — **`require_indexed_gaf`** opens the path and loads **`tbx_index_load`**.
+- **`tbx_seq_tid_with_pangenome_fallback`** resolves **`logical_chrom`** against index SQ lines (supports pangenome-style naming split when needed).
 
 ---
 
-## 6. Per-Chunk Catalog Construction
+## 6. Contig selection and empty-output pitfalls
 
-After interval splitting, a single O(n_sites) pass routes each site to its chunk:
-
-```cpp
-std::vector<GraphSiteCatalog> chunk_catalogs(n);  // one per interval
-std::unordered_map<std::string, size_t> site_to_chunk;
-
-for (const GraphSite& site : full_catalog.sites) {
-    const hts_pos_t site_beg0 = ...;
-    const size_t ci = (site_beg0 - interval_beg) / chunk_size;
-    chunk_catalogs[ci].sites.push_back(site);
-    site_to_chunk.emplace(site_key(site), ci);
-}
-```
-
-`site_key` returns `site.id` when the VCF ID is not `.`, otherwise constructs
-`"chrom:pos:ref"`. This key is used identically during the GAF scan to route matched
-`GraphReadAllele` rows to the correct chunk's shard file.
-
-After the site-to-chunk assignment, **walk strings are released from `chunk_catalogs`**:
-
-```cpp
-for (auto& cc : chunk_catalogs)
-    for (GraphSite& s : cc.sites) {
-        for (GraphWalk& w : s.allele_walks) w.clear();
-        s.allele_traversals.clear();
-    }
-```
-
-The chunk catalogs now retain only site metadata (id, chrom, pos, ref, alts, allele counts).
-This reduces RAM before the parallel build phase. The walk strings are still present in
-`full_catalog` at this point and remain there until the GAF scan releases them (§7).
+- With **`--contig NAME`**, only that string drives tiling and **`site_starts_in_interval`** equality against **`site.ref_contig`** (or **`site.chrom`** when ref contig empty).
+- With no **`--contig`**, contig list comes from **`load_graph_site_contig_names`** (VCF header / index sequence dictionary).
+- **Mismatch:** VCF sites tagged with **`chr20`** but **`--contig CHM13#0#chr20`** yields **no** candidates — sites never pass **`site_starts_in_interval`**. Tabix may still load lines by physical chrom name internally, but the adapter drops them when **`site_contig != contig`**.
 
 ---
 
-## 7. Shard Infrastructure
+## 7. Parallelism, batching, and ordering
 
-Each contig run creates a fresh per-(worker × chunk) temporary directory:
+**Worker pool:** **`run_vcf_gaf_chunks_parallel`** spins **`min(threads, batch_size)`** threads sharing an atomic **`next`** index into the current batch.
 
-```text
-/tmp/pgphase_graph_shard_<pid>_<counter>/
-    w0_c0.tsv   w0_c1.tsv   …   w0_cN.tsv
-    w1_c0.tsv   w1_c1.tsv   …   w1_cN.tsv
-    …
-    wW_c0.tsv   …           …   wW_cN.tsv
-```
+Each worker iteration:
 
-`ChunkRowShard` is an RAII wrapper: its destructor removes all shard files and calls `rmdir` on
-the directory.
+1. **`GraphSitesTabixReader reader(sites_vcf)`** — **thread-local** tabix reader (HTS handles not shared across threads).
+2. **`load_half_open_interval`** → **`GraphSiteCatalog`** for **`intervals[i]`**.
+3. **`scan_indexed_gaf_chunk(gaf, contig, beg, end, catalog, filter_opts.min_mapq)`** → **`std::vector<GraphReadAllele>`**.
+4. **`build_graph_bam_chunk(..., chunk_id_offset + i, filter_opts)`** → **`GraphBamChunkBuildResult`**.
 
-`ChunkRowWriter` is an LRU-caching append writer that keeps up to 64 file descriptors open
-simultaneously. When a worker writes to chunk index `ci`, the writer appends one TSV row
-(site_id, chrom, pos, read_name, mapq, allele) to `paths[worker_id][ci]`. Workers never share
-a writer, so no locking is needed at the file level.
+**Batch sizing:** Outer loop advances **`batch_beg`** by **`n_per_batch = nw`** where **`nw = max(1, threads)`**. So default **`threads = 1`** processes **one chunk at a time** (still parallel-ready).
 
-`ChunkRowShard::load_chunk(ci)` reconstitutes a `std::vector<GraphReadAllele>` from all
-workers' shard files for chunk `ci`. This is called once per chunk during the parallel build
-phase (§9).
+**Ordering:** Results return in **completion order**. Before stitching, **`phase_graph` stable-sorts** each batch by **`build_result.chunk.region.beg`**. This restores **genomic order** so **`prev_chunk` ↔ `cur`** adjacency matches physical tiles even when chunk *k* finishes before *k−1*.
 
-The shard mechanism decouples the GAF scan (streaming write, all threads) from the chunk build
-(random-access read, all threads) without holding all rows in RAM simultaneously. Peak RAM from
-shard rows = `n_workers × one_chunk_rows` rather than all rows across all chunks.
+**Chunk IDs:** **`chunk_id_offset`** increments by **chunk count per contig** so IDs stay unique across the whole run when multiple contigs are processed.
 
 ---
 
-## 8. GAF Scanning and Walk Matching
+## 8. Site catalog → candidate scaffold (`build_graph_bam_chunk`)
 
-### 8.1 Compact Site Index
+**Output shell:** **`GraphBamChunkBuildResult`** carries:
 
-Before scanning the GAF, `scan_gaf_for_catalog_emit_parallel_releasing_walks` builds a
-`CompactGraphSiteIndex` from the contig's `full_catalog`:
+- **`chunk`** — fully populated **`BamChunk`** (region, candidates, reads, profiles, overlap vectors, `haps`, `phase_sets`, **`read_var_cr`**).
+- **`site_ids`** — parallel to **`chunk.candidates`** (after Phase 2 possibly **multiple IDs per original multiallelic site**).
+- **`site_allele_orig_idx`** — maps surviving biallelic allele indices back to original walk indices (for ALT strings / diagnostics).
+- **`filtered_sites`** — audit rows.
+- **`variant_emit_rows`** — CHROM/POS/REF/ALT snapshots for variant-style writers (not the default `phase-graph` outputs).
 
-```cpp
-struct CompactGraphSite {
-    size_t   original_index;   // back-reference into full_catalog.sites
-    std::string site_id;
-    std::string chrom;
-    hts_pos_t   pos;
-    CompactHandle left, right;           // ref-walk boundary node handles (forward)
-    CompactHandle left_rev, right_rev;  // boundary node handles (reverse complement)
-    std::vector<std::vector<CompactHandle>> allele_walks;  // all alleles, all nodes
-};
+### 8.1 Site inclusion (pre-candidate)
 
-struct CompactGraphSiteIndex {
-    std::vector<CompactGraphSite> sites;
-    std::unordered_map<CompactHandle, std::vector<size_t>> boundary_to_sites;
-};
-```
+Iterate **`catalog.sites`**. For each site whose **start** lies in **`[beg,end)`** **and** matches **`contig`**:
 
-`CompactHandle` is a `uint32_t` encoding: `(node_id << 1) | orientation_bit`. Encoding with
-`graph_walk_to_compact_handles` converts all walk steps. The `boundary_to_sites` map indexes
-every snarl's left and right boundary node (both orientations) to the set of compact sites that
-share that boundary. This is the primary lookup used during GAF scanning.
+- **`precandidate_ineligible`** — **`!site.eligible`** after finalize.
+- **`precandidate_not_queryable`** — walk strings not released **and** **`!graph_site_is_queryable(site)`** (indexed GAF requires numeric node walks in compact index).
+- **`precandidate_monoallelic`** — fewer than two **`allele_walks`**.
 
-Only sites for which `graph_site_is_queryable` returns true and whose reference walk has at
-least two nodes are included in the compact index. Sites with malformed or empty walks are
-silently skipped.
+Eligible sites become **multi-allele Phase-1 candidates** via **`add_graph_candidate`** (synthetic **`tid`** from a local `contig → tid` map; single-contig runs effectively use **`tid = 0`**).
 
-After building the compact index the function optionally releases allele walk strings from
-`full_catalog` (the `_releasing_walks` variant used here). This frees the last remaining walk
-string storage from the per-contig catalog, since the compact index has its own `uint32`
-representation.
+**Site identity string:** **`site_key`** prefers **`site.id`** when non-empty and not `"."`; otherwise **`chrom:pos:ref`**.
 
-### 8.2 Parallel GAF Streaming
+### 8.2 Parent / conditional-child gating
 
-The GAF file is scanned with `n_workers` threads. Each thread reads a disjoint range of lines:
-the file is divided into roughly equal byte ranges and each thread seeks to the start of the
-first complete line within its range.
+If **`site.parent`** is set and both parent and child are present as Phase-1 candidates, **`parent_candidate[child] = parent_idx`**.
 
-For each GAF line, `parse_gaf_core_fields` extracts three fields without heap allocation using
-`string_view`:
+When aggregating per-read observations, **conditional_parent_alleles** restrict counting: the child observation is counted only if the same read shows the parent allele in the allowed parent-allele set (`std::find` on **`conditional_parent_alleles`**).
 
-```text
-field  0 → read_name
-field  5 → path (node walk, e.g. ">114818865>114818866>114818867")
-field 11 → mapq
-```
+### 8.3 From `GraphReadAllele` rows to allele counts
 
-Lines with `mapq < min_mapq` are skipped. Lines whose walk cannot be parsed as compact handles
-fall through to a string-walk path.
+- Index **`site_to_candidate`** maps **`site_id` → Phase-1 candidate index**.
+- **`allele_by_read_site`**: for each read and site, keep one allele; **conflicting** duplicate observations for the same read×site → **`allele = -1`** (discarded downstream).
+- **`read_obs`**: after conditional-parent filtering, increment **`allele_counts[site][allele]`** and append **`GraphProfileObservation{site_i, allele}`**.
 
-### 8.3 Walk Matching
+### 8.4 Phase 1 — per-site alt noise trim
 
-For each parsed read walk, the scanner searches for sites whose boundary nodes appear in the
-read's path:
+Mirror BAM het classification comment in source: drop alt walks with **`count < opts.min_alt_depth`**. Build **`allele_remap[site][old_allele]`** (‑1 = dropped). **Ref walk index 0** always survives. Recompute **`CandidateVariant` counts** from condensed **`alle_covs`**.
 
-1. Iterate every handle in the read's compact walk.
-2. Look up the handle in `boundary_to_sites`. For each candidate site:
-   a. Find the position of the site's `left` boundary in the read walk.
-   b. Find the position of the site's `right` boundary at or after `left`.
-   c. Extract the sub-walk `[left_pos, right_pos]` from the read.
-   d. Compare the sub-walk against each allele walk with `compact_span_matches_allele`.
-   e. Emit a `GraphReadAllele` with the matching allele index (0 = ref, 1+ = alt).
-   f. If no allele matches, emit `kGraphAlleleAmbiguous`; if the span is not found, skip.
+Remap **conditional_parent_alleles** through the **parent’s** **`allele_remap`** so child gates stay consistent after parent alleles disappear.
 
-A read can match multiple sites (it traverses multiple snarls). Each match is emitted as a
-separate `GraphReadAllele` observation.
+**`allele_orig_idx`** records, for each surviving **new** alt column, which **original** walk index it came from (used for multiallelic **`SITE_ID:walkIdx`** suffixes in Phase 2).
 
-### 8.4 Routing to Shard Files
+### 8.5 Phase 2 — biallelic decomposition + gates
 
-The emitter callback in `phase_graph()` receives `(worker_id, GraphReadAllele&&)` and routes
-the row using `site_to_chunk`:
+Each Phase-1 site with **`≥ 2`** surviving alleles is expanded into **one `CandidateVariant` per ref-vs-alt pair**:
 
-```cpp
-auto it = site_to_chunk.find(row.site_id);
-if (it != site_to_chunk.end())
-    writers[worker_id]->write(it->second, row);
-```
+- Pair **`SITE_ID`**: if only one alt survives, reuse base **`site_ids[i]`**; if multiple alts, append **`":" + orig_walk_index`** for disambiguation.
+- **`FilteredGraphSite`** reasons on rejected pairs:
+  - **`ref_only`** — fewer than two alleles after Phase 1 (`ac.size() < 2`).
+  - **`low_depth`** — **`ref_c + alt_c < opts.min_depth`**.
+  - **`high_af`** — AF **`> opts.max_af`**.
+  - **`low_af`** — AF **`< opts.min_af`**.
+- Surviving pairs become **`new_cands`** with **`n_uniq_alles = 2`**, updated **`allele_fraction`**, etc.
 
-`site_to_chunk` was built in §6 from the current contig's sites. Observations for unknown site
-IDs (sites outside the coordinate window or already-released sites) are dropped silently.
+Parent pointers **`parent_candidate`** / **`conditional_parent_alleles`** are **remapped** into the **new pair index space** by scanning **`old_site_to_pairs`** (first matching parent pair wins).
 
-After all threads complete, `writers.clear()` flushes and closes all shard files.
+### 8.6 Phase 3 — remap read profiles to pair indices
+
+For each read’s observations:
+
+- **Biallelic fast path:** map **ref** → allele 0 of the single pair; map matching **alt** → allele 1.
+- **Multiallelic:** **ref** observation fans out to **allele 0 on every** surviving pair from that site; **alt *j*** maps to **allele 1** only on the pair whose **`old_alt_phase1`** matches.
+
+Sort observations per read by **`site_index`**, deduplicate consecutive same-site entries with conflicting alleles → **`allele = -1`**, drop negatives, then **`add_read_profile`** builds **`ReadRecord`** + **`ReadVariantProfile`** (interval spans first/last variant **`sort_pos`**).
+
+Finally:
+
+- **`chunk.haps` / `chunk.phase_sets`** sized to **`reads.size()`**, initialized to **`0` / -1**.
+- **`rebuild_read_var_cr`** builds **`cgranges`** index over profiles for overlap queries inside phasing.
 
 ---
 
-## 9. Parallel Chunk Build
+## 9. Per-chunk haplotype assignment
 
-`run_vcf_gaf_chunks_parallel` processes a batch of `[batch_beg, batch_end)` chunk indices in
-parallel. Each worker:
+**`assign_graph_chunk_hap`** calls **`assign_hap_based_on_germline_het_vars_kmeans(chunk, opts, kCandGermlineClean)`**.
 
-1. Calls `shard.load_chunk(i)` — reads all workers' TSV rows for chunk `i` from disk.
-2. Calls `build_graph_bam_chunk(chunk_catalogs[i], chunk_rows, contig, beg, end, chunk_id, opts)`.
+Only candidates whose category bitmask intersects **`kCandGermlineClean`** participate in clustering; graph-built rows start as **`CleanHetSnp`** / matching **`lcd_var_i_to_cate`**.
 
-### 9.1 `build_graph_bam_chunk`
-
-This function constructs a `BamChunk` from the raw `GraphReadAllele` observations for one chunk.
-
-**Phase 1 — Alt-only allele filtering**: sites where all observations are reference allele
-(`allele == 0`) are dropped. For sites that survive, only allele indices that were actually
-observed in at least one read are retained. The `site_allele_orig_idx` mapping records the
-original VCF allele index for each surviving allele position.
-
-**Phase 2 — Depth and AF filtering**: for each remaining site, counts of reference and
-non-reference observations are tallied. Sites that fail any of:
-- total depth < `min_depth`
-- allele fraction (non-ref / total) < `min_af`
-- allele fraction > `max_af`
-
-are moved to `filtered_sites` (a `FilteredGraphSite` record with the failure reason) and
-excluded from phasing.
-
-**Read profile construction**: surviving observations are used to populate
-`BamChunk::read_var_profiles` — the same `ReadVariantProfile` / `hap_to_alle_profile` struct
-used by the BAM path. Each read gets one entry per site it was observed at, with the allele
-index stored as the profile value. The chunk's candidate variant rows (`BamChunk::cand_vars`)
-are populated from the surviving site list.
-
-The resulting `BamChunk` is indistinguishable to the phasing engine from one produced by the
-BAM path.
+No cross-chunk information is used here — stitching happens **after** each chunk has standalone hap labels and **`phase_set`** on **`CandidateVariant`** / reads.
 
 ---
 
-## 10. Per-Chunk Hap Assignment
+## 10. Adjacent-chunk stitching
 
-```cpp
-void assign_graph_chunk_hap(GraphBamChunkBuildResult& gc, const Options& opts);
-```
+**Streaming path:** **`stitch_graph_chunk_pair(pre, cur, phase_opts)`**:
 
-This is a thin wrapper around `phase_graph_bam_chunks` restricted to a single chunk. It calls
-`assign_hap_based_on_germline_het_vars_kmeans` (from `collect_phase.cpp`) on the chunk's
-`BamChunk`, runs the same k-means read-clustering algorithm used by the BAM path (§18 of the
-BAM path doc), and stores hap and phase-set assignments into the chunk's read profiles and
-candidate variants.
+1. **`populate_graph_chunk_pair_overlaps`** — match **`ReadRecord.qname`** between **`pre.chunk`** and **`cur.chunk`**; fill **`down_ovlp_read_i`** / **`up_ovlp_read_i`** (batch-of-one overlap slot **`[0]`**).
+2. Move both **`BamChunk`**s into **`std::vector<BamChunk> pair`**.
+3. **`stitch_chunk_haps(pair, &phase_opts, nullptr)`** — **`nullptr`** disables `.pgbam` sidecar augmentation.
+4. Move results back into **`pre.chunk`** and **`cur.chunk`**.
 
-No cross-chunk communication happens here. Stitching is a separate step (§12).
+**Batch alternative:** **`phase_graph_bam_chunks`** (used elsewhere) assigns hap for every chunk, **`populate_graph_chunk_overlaps`** on the full vector, then **one** **`stitch_chunk_haps`** over all chunks — equivalent stitching semantics, different scheduling.
 
 ---
 
-## 11. Build-Time Streaming Outputs
+## 11. Streaming site TSV (`--graph-sites-tsv`)
 
-Three diagnostic outputs are written immediately after `assign_graph_chunk_hap`, before any
-stitching. They reflect pre-stitch per-chunk state.
+**Header** (`write_graph_bam_phase_sites_tsv_header`):
 
-### 11.1 `--graph-site-counts` TSV
+`CHUNK_ID`, `SITE_INDEX`, `SITE_ID`, `POS`, `N_ALLELES`, `DEPTH`, `ALLELE_COUNTS`, `PHASE_SET`, `HAP1_ALLELE`, `HAP2_ALLELE`.
 
-Columns: `CHUNK_ID SITE_ID CHROM POS REF_COV ALT_COV TOTAL_COV AF`
+**When rows are written**
 
-One row per surviving site per chunk. Depths come from the `BamChunk` candidate allele counts
-populated in §9.1.
+- After **`stitch_graph_chunk_pair(prev, cur)`**, emit **`write_graph_bam_phase_sites_tsv_rows(sites_out, *prev_chunk)`** — the **previous** tile is now **final** through its downstream boundary.
+- At **contig end**, emit **`write_graph_bam_phase_sites_tsv_rows`** for the **last** held chunk.
 
-### 11.2 `--graph-read-profile` TSV
+Thus interior chunks are emitted **once**, **after** stitching with their successor; the terminal chunk is emitted **without** a following stitch.
 
-Columns: `CHUNK_ID READ SITE_ID ALLELE`
-
-One row per (read, site) observation that survived both filtering phases in §9.1. This is the
-sparse read×site matrix fed to k-means.
-
-### 11.3 `--graph-filtered-sites` TSV
-
-Columns: `CHUNK_ID SITE_ID CHROM POS REF_COV ALT_COV TOTAL_COV AF FILTER_REASON`
-
-One row per site removed in Phase 2 depth/AF filtering (`ref_only`, `low_depth`, `high_af`,
-`low_af`).
-
-These three files have their headers written once before the contig loop begins.
+**Content:** Rows reflect **`candidate.phase_set`** and **`candidate.hap_to_cons_alle[1/2]`** after **`stitch_chunk_haps`** updated **`BamChunk`** state.
 
 ---
 
-## 12. Chunk-Pair Overlap and Stitching
+## 12. Per-read accumulator (`PhaseReadOutputRow`)
 
-### 12.1 Overlap Population
+Fields (**`graph_bam_adapter.hpp`**):
 
-```cpp
-void populate_graph_chunk_pair_overlaps(GraphBamChunkBuildResult& pre,
-                                        GraphBamChunkBuildResult& cur);
-```
+- **`read_name`**, **`chunk_id`** / **`copies`** — diagnostics for multi-chunk appearances; **`chunk_id` becomes `-1`** if the read span touches multiple chunk IDs during merges.
+- **`hap`**, **`phase_set`**, **`has_phased_assignment`** — latest stitched assignment (§13).
+- **`allele_by_site`** — merged observations **`merge_phase_read_observation`**: first allele wins; conflicting later allele → **`-1`** for that site key.
 
-Builds the `BamChunk::down_ovlp_read_i` / `up_ovlp_read_i` overlap lists expected by
-`stitch_chunk_haps`. For the graph path, two adjacent chunks share reads that were assigned
-observations in both windows (a read that spans a chunk boundary will appear in both chunks'
-`GraphReadAllele` rows, which become entries in both `BamChunk::read_var_profiles`).
+**`merge_graph_chunk_into_read_rows`** walks **`read_var_profile`**:
 
-The function builds a name-to-index map for each chunk, then intersects them:
+- For each site observation with **`allele >= 0`**, merge **site_id + allele**.
+- **`merge_phase_read_assignment`** — **always overwrites** **`hap` / `phase_set`** from the **current** chunk’s **`ReadRecord` index**, and sets **`has_phased_assignment`** iff **`hap ∈ {1,2}`** and **`phase_set ≥ 0`**.
 
-```cpp
-const auto pre_reads = read_index_by_name(pre.chunk);
-const auto cur_reads = read_index_by_name(cur.chunk);
-for (const auto& [name, cur_idx] : cur_reads) {
-    auto it = pre_reads.find(name);
-    if (it == pre_reads.end()) continue;
-    pre.chunk.down_ovlp_read_i[0].push_back(it->second);
-    cur.chunk.up_ovlp_read_i[0].push_back(cur_idx);
-}
-```
-
-The overlap lists use a single slot (index 0) because each chunk-pair has exactly one boundary.
-This mirrors the BAM path's `build_bam_chunk_overlaps` but without coordinate-based positional
-logic — shard membership determines overlap, not genomic window containment.
-
-### 12.2 `stitch_graph_chunk_pair`
-
-```cpp
-void stitch_graph_chunk_pair(GraphBamChunkBuildResult& pre,
-                             GraphBamChunkBuildResult& cur,
-                             const Options& opts);
-```
-
-1. Calls `populate_graph_chunk_pair_overlaps(pre, cur)`.
-2. Moves `pre.chunk` and `cur.chunk` into a two-element `std::vector<BamChunk>` (using
-   `push_back(std::move(...))` — not an initializer list, since BamChunk is non-copyable).
-3. Calls `stitch_chunk_haps(pair, &opts, nullptr)` — the same stitching function used by the
-   BAM path.
-4. Moves the chunks back.
-
-`stitch_chunk_haps` applies `flip_chunk_hap`: if the common-read vote across the boundary
-disagrees with the current hap assignment of `cur`, it flips `cur`'s read hap assignments,
-candidate hap assignments, and phase-set polarities.
-
-`opts.touch_read_phase` must be `true` for flip to propagate to per-read hap values (not just
-candidate variants). The pipeline sets this unconditionally:
-
-```cpp
-filter_opts.touch_read_phase = true;
-```
-
-This ensures that `merge_graph_chunk_into_read_rows` (§13) sees correctly stitched per-read
-hap assignments after every stitch.
-
-### 12.3 Stitch-Time Output: `--graph-phase-sites` TSV
-
-Columns: `CHROM POS TYPE REF ALT DP REF_COV ALT_COV AF PHASE_SET HAP_ALT HAP_REF`
-
-Written for `prev_chunk` immediately after `stitch_graph_chunk_pair` finalises it. REF and ALT
-sequences come from the `site_map` (site_id → `const GraphSite*` built from `full_catalog`
-before the streaming loop). The header is written once before the contig loop.
+This tracks **`PhasedAlignmentWriter::write_chunks`** semantics: HP/PS reflect the **owning** chunk at emission, which for overlapping tiles is the **later** (genomic downstream) chunk after stitching.
 
 ---
 
-## 13. Per-Read Accumulator
+## 13. Streaming phased BAM (`--graph-phase-bam`)
 
-```cpp
-void merge_graph_chunk_into_read_rows(
-    std::unordered_map<std::string, PhaseReadOutputRow>& rows_by_read,
-    const GraphBamChunkBuildResult& gc);
-```
+### 13.1 Record shape
 
-After a chunk is fully stitched and finalized it is merged into the global `rows_by_read` map.
-For each read in the chunk's `BamChunk::read_var_profiles`:
+**`write_bam_record`** emits:
 
-- If the read has not been seen before: insert a new `PhaseReadOutputRow`.
-- If it has been seen: update if the new chunk provides a better assignment. "Better" is defined
-  as: lower `assignment_chunk_id` (earlier in the genome), or equal `assignment_chunk_id` and
-  higher `best_assignment_obs` (more k-means evidence).
+- **`FLAG = FUNMAP`** (unaligned),
+- **No RNAME/POS** (`tid = -1`, `pos = -1`),
+- Optional **`HP:i`** and **`PS:i`** aux tags when phased.
 
-The map grows monotonically across all chunks and all contigs. It is the single source of truth
-for end-of-run phase BAM and reads TSV output.
+### 13.2 Incremental flush
 
----
+After merging **`prev_chunk`** into **`rows_by_read`**, **`flush_graph_phase_bam_after_merge`**:
 
-## 14. End-of-Run Outputs
+- If **`next_chunk_qnames`** is non-null, **retain** rows whose **`read_name` appears in the next chunk’s read set** (they may receive a fresher **`merge_phase_read_assignment`** later).
+- **Drain** all others: sort drained keys lexicographically for deterministic output order, write BAM, insert into **`emitted_read_names`**.
 
-### 14.1 `--graph-sites-tsv` Diagnostic
+**End of contig:** call with **`next_chunk_qnames = nullptr`** to flush **all** remaining reads for that contig.
 
-The `diagnostic_catalog` accumulates one `GraphSiteCatalog` entry per chunk throughout the run
-(via `append_catalog`). After all contigs complete, the catalog is serialised by
-`write_graph_site_catalog_tsv`. This is a tab-delimited dump of every site that was processed,
-regardless of whether it survived depth/AF filtering, useful for inspecting the raw snarl
-catalog in tabular form.
+### 13.3 Unobserved reads
 
-### 14.2 `--graph-read-support` Diagnostic
+**`collect_gaf_read_names`** scans the **whole** GAF (supports both column layouts offset **`0`** or **`3`** for pggaf-prefixed lines), collects MAPQ-filtered unique names, sorts.
 
-Written per-contig by re-scanning that contig's shard files while they are still alive (before
-the shard RAII destructor removes them):
-
-```cpp
-if (read_support_out) {
-    for (size_t ci = 0; ci < n_shards; ++ci)
-        write_graph_read_alleles_tsv_rows(read_support_out, shard.load_chunk(ci));
-}
-```
-
-The header is written once before the contig loop. This is the raw (pre-filtering)
-read→site→allele observation table produced by the GAF scan.
-
-### 14.3 `--graph-phase-reads` TSV and `--graph-phase-bam`
-
-Both require a complete view of all reads across all contigs, so they are written after the
-contig loop from the accumulated `rows_by_read` map.
-
-A second GAF pass (`collect_gaf_read_names`) collects all MAPQ-passing read names so that reads
-with no site observations appear in the output as unphased rows (HAP=0, PHASE_SET=-1). This
-second pass reads only fields 0 and 11 (read name and MAPQ) from each GAF line.
-
-**Phase reads TSV** columns:
-`READ HAP PHASE_SET COPIES BEST_OBS CHUNK_ID ASSIGNMENT_CHUNK_ID ALLELE_BY_SITE`
-
-**Phase BAM** (`write_graph_bam_phase_bam_from_rows`): produces an unaligned name-sorted BAM.
-For each read in `rows_by_read` (or in `all_read_names`):
-- If `has_phased_assignment`: set `HP` aux tag (1 or 2) and `PS` aux tag (phase-set value).
-- If unphased: record is written with no HP/PS tags.
+**`write_graph_phase_bam_for_unobserved`** appends **unmapped** records **without HP/PS** for names never emitted — reads that never produced graph observations merged into **`rows_by_read`**.
 
 ---
 
-## 15. Memory Model and I/O Tradeoffs
+## 14. Filtered-site audit and verbosity
 
-### 15.1 Peak RAM Components
+**Optional `--graph-filtered-sites`:** for each chunk, **`write_graph_bam_filtered_sites_tsv_rows`** dumps **`filtered_sites`**:
 
-```text
-Per-contig catalog (walks present):   O(n_contig_sites × avg_walk_length)
-                                      Released during GAF scan.
-Per-contig catalog (walks released):  O(n_contig_sites × metadata_size)
-                                      Released at end of contig loop iteration.
-Compact index (during scan):          O(n_contig_sites × avg_allele_count × avg_walk_nodes × 4B)
-                                      Released after scan.
-site_to_chunk routing map:            O(n_contig_sites × site_id_string)
-                                      Released at end of contig loop iteration.
-chunk_catalogs (walks released):      O(n_contig_sites × metadata_size)
-                                      Released at end of contig loop iteration.
-Shard in-flight rows (per worker):    O(1 shard file per chunk, disk)
-BamChunk batch:                       O(n_threads × one_chunk_reads × profile_width)
-                                      Released after each batch.
-rows_by_read accumulator:             O(n_observed_reads × ~60 bytes + allele_map)
-                                      Grows across all contigs, released at end of run.
-diagnostic_catalog:                   O(n_total_sites × metadata_size)
-                                      Grows across all contigs; skip --graph-sites-tsv if not needed.
-```
+`site_id`, `ref_cov`, `alt_cov`, `total_cov`, `allele_fraction`, `filter_reason`.
 
-The dominant cost on the graph path is the per-contig catalog with walk strings, which is held
-from catalog load until the GAF scan's compact-index build releases it. For typical human
-chromosomes (~50 K–500 K sites), this is manageable; for a whole-genome VCF without `--contig`
-the contig loop ensures only one chromosome's walks are live at a time.
+**`-V 1` stderr:**
 
-### 15.2 GAF I/O: One Scan Per Contig
-
-The current implementation performs one complete GAF scan per contig. For a whole-genome run
-with 25 autosomes + sex chromosomes, this means 25–26 full passes over the GAF file.
-
-**Why one scan per contig rather than one scan total**: the GAF scanner matches reads by
-graph-node handles (§8.3). Building the compact index requires the allele walk data for all
-sites in the catalog. Loading all chromosomes' walk data simultaneously would require holding
-the entire genome-wide catalog in RAM — the RAM cost this architecture is designed to avoid.
-
-**Future optimisation (node-routing single scan)**: because every graph node belongs to exactly
-one chromosome, the first node in a read's walk handle determines the contig unambiguously.
-A lightweight first pass over the VCF can build a `boundary_node_handle → ref_contig` routing
-table (one entry per snarl, two handles, no walk strings). A single GAF pass using this table
-would route raw GAF lines to per-contig intermediate files; the per-contig allele matching would
-then run against those pre-filtered lines. This reduces GAF I/O from O(n_contigs × GAF_size) to
-O(GAF_size + sum_contig_reads) and enables parallel contig phasing, at the cost of intermediate
-disk space proportional to GAF size.
+- Per-contig chunk count and **sum of `read_allele_rows`** (GAF-derived row count).
+- Line **`chunk-local phased site row(s)`** — note this sums **`site_ids.size()`** per chunk across chunks; it is **not** the same as globally distinct scaffold rows (sites can only appear in one chunk by construction, but the metric is literal per-chunk candidate counts summed).
+- Global histogram: **`filter_reason` → count**, sorted by descending count. Total filtered rows must equal lines in the audit file (excluding header).
 
 ---
 
-## 16. Summary of the Complete Pipeline
+## 15. Error propagation
 
-```text
-phase_graph()
-│
-├── 3. Discover contigs (tabix seqnames / stream VCF)
-│
-├── Open all output files; write TSV headers
-│
-└── for each contig:
-    │
-    ├── §4  Load contig catalog from VCF (tabix or stream, RegionFilter)
-    ├── §5  Split [0, catalog_end_bound) into chunk intervals
-    ├── §6  Assign each site to its chunk (O(n_sites), arithmetic)
-    │       Release walk strings from chunk_catalogs
-    ├── §7  Create per-(worker × chunk) shard dir (RAII ChunkRowShard)
-    │
-    ├── §8  Parallel GAF scan
-    │       Build CompactGraphSiteIndex from full_catalog (releases walk strings)
-    │       n_workers stream GAF → match node handles → emit GraphReadAllele
-    │       Callback routes each row to per-chunk shard file via site_to_chunk
-    │       Writers flushed and closed
-    │
-    ├── §9–10 Streaming build → assign loop (batch of n_threads chunks at a time)
-    │   │
-    │   └── for each batch:
-    │       │
-    │       ├── run_vcf_gaf_chunks_parallel
-    │       │   Each worker: load_chunk(i) → build_graph_bam_chunk → BamChunk
-    │       │
-    │       └── for each chunk result cur:
-    │           ├── assign_graph_chunk_hap(cur)        [k-means]
-    │           ├── §11 write site_counts / profiles / filtered_sites rows
-    │           ├── if prev exists:
-    │           │   ├── stitch_graph_chunk_pair(prev, cur)
-    │           │   ├── §12.3 write variants_tsv rows for prev
-    │           │   └── §13  merge_graph_chunk_into_read_rows(rows_by_read, prev)
-    │           └── prev = cur
-    │
-    ├── Finalize last chunk (write variants + merge into rows_by_read)
-    ├── §14.2 Write graph_read_support rows from shards
-    └── Shard RAII destructor: delete temp files and dir
-        Release full_catalog, chunk_catalogs, site_to_chunk, site_map
-│
-├── §14.1 Write graph_sites_tsv from diagnostic_catalog
-│
-└── §14.3 Second GAF pass (collect_gaf_read_names)
-    Write graph_phase_reads_tsv from rows_by_read
-    Write graph_phase_bam from rows_by_read
-```
+**`run_vcf_gaf_chunks_parallel`** catches worker exceptions under mutex and **`std::rethrow_exception`** after **`join`** — first failure wins.
+
+---
+
+## 16. Tests and parity tooling
+
+| Artifact | Coverage |
+|----------|----------|
+| **`src/test_graph_bam_adapter.cpp`** | Chunk build, AF thresholds, phase-site / phase-read writers (batch-style). |
+| **`src/test_graph_sites.cpp`**, **`src/test_graph_phase.cpp`** | Catalog / matrix helpers. |
+| **`test_phase_block_stitch`** | **`flip_chunk_hap`** / propagate semantics depended on by **`stitch_chunk_haps`**. |
+
+---
+
+## 17. Quick reference — pipeline ordering inside `phase_graph` inner loop
+
+For each **`cur`** chunk result (already sorted within batch):
+
+1. **`assign_graph_chunk_hap(cur, phase_opts)`**
+2. Accumulate **`filter_reason_hist`**; optionally append filtered TSV rows
+3. If **`prev_chunk`** exists:
+   - **`stitch_graph_chunk_pair(*prev_chunk, cur, phase_opts)`**
+   - **`write_graph_bam_phase_sites_tsv_rows`** for **`prev_chunk`**
+   - **`merge_graph_chunk_into_read_rows(rows_by_read, *prev_chunk)`**
+   - Build **`next_qnames`** from **`cur.chunk.reads`**
+   - **`flush_graph_phase_bam_after_merge(..., &next_qnames, emitted)`**
+4. **`prev_chunk = move(cur)`**
+
+After all batches on contig: write **last** chunk sites, merge last chunk rows, **`flush(..., nullptr)`**.
+
+---
+
+## 18. Related documentation
+
+- **`docs/collect_bam_variation_implementation.md`** — full collect pipeline; stitching § references **`stitch_chunk_haps`** behaviour in detail.

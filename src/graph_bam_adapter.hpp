@@ -5,10 +5,12 @@
 #include "graph_query.hpp"
 #include "graph_sites.hpp"
 
+#include <htslib/sam.h>
+
 #include <iosfwd>
-#include <limits>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace pgphase_collect {
@@ -21,8 +23,6 @@ struct PhaseReadOutputRow {
     hts_pos_t phase_set = -1;
     bool has_phased_assignment = false;
     int copies = 0;
-    int best_assignment_obs = -1;
-    int assignment_chunk_id = std::numeric_limits<int>::max();
     std::unordered_map<std::string, int> allele_by_site;
 };
 
@@ -35,6 +35,14 @@ struct FilteredGraphSite {
     std::string filter_reason; // "ref_only", "low_depth", "high_af", "low_af"
 };
 
+/** CHROM/POS/REF/ALT snapshot per final candidate for streaming TSV (no global site map). */
+struct GraphVariantEmitRow {
+    std::string chrom;
+    hts_pos_t pos = 0;
+    std::string ref;
+    std::string alt;
+};
+
 struct GraphBamChunkBuildResult {
     BamChunk chunk;
     std::vector<std::string> site_ids;
@@ -43,6 +51,10 @@ struct GraphBamChunkBuildResult {
     std::vector<std::vector<int>> site_allele_orig_idx;
     // Sites dropped by depth/AF thresholds in Phase 2 (not included in phasing).
     std::vector<FilteredGraphSite> filtered_sites;
+    /** Parallel to chunk.candidates; filled by build_graph_bam_chunk for variant TSV emission. */
+    std::vector<GraphVariantEmitRow> variant_emit_rows;
+    /** Reference/pangenome contig name for phase-read TSV CHROM columns (may be empty). */
+    std::string graph_phase_contig;
 };
 
 GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
@@ -108,18 +120,48 @@ void write_graph_bam_variants_tsv_rows(
     const GraphBamChunkBuildResult& gc,
     const std::unordered_map<std::string, const GraphSite*>& site_map);
 
+// Same as above with owned GraphSite rows (used when join maps are built externally).
+void write_graph_bam_variants_tsv_rows(
+    std::ostream& out,
+    const GraphBamChunkBuildResult& gc,
+    const std::unordered_map<std::string, GraphSite>& site_by_id);
+
+// Uses gc.variant_emit_rows (chunk-local REF/ALT); no catalog map.
+void write_graph_bam_variants_tsv_rows(std::ostream& out,
+                                       const GraphBamChunkBuildResult& gc);
+
+// ── Phase-read TSV / phase-BAM (streaming phase-graph path) ─────────────────
+
+void write_graph_bam_phase_reads_tsv_header(std::ostream& out);
+
+/** Same columns as `write_phase_read_tsv_rows` with \p chunk_chrom instead of a BAM header. */
+void write_graph_chunk_phase_read_tsv_rows(std::ostream& out,
+                                           const std::string& chunk_chrom,
+                                           const BamChunk& chunk);
+
+// After merging a stitched chunk into rows_by_read, drop reads that cannot appear
+// in next_chunk_qnames (typically qnames in the next genomic chunk). Pass nullptr
+// for next_chunk_qnames to flush everything (end of contig / pipeline).
+void flush_graph_phase_bam_after_merge(
+    samFile* phase_bam_out,
+    sam_hdr_t* phase_bam_hdr,
+    std::unordered_map<std::string, PhaseReadOutputRow>& rows_by_read,
+    const std::unordered_set<std::string>* next_chunk_qnames,
+    std::unordered_set<std::string>& emitted_read_names);
+
+// Reads from all_read_names_sorted not present in emitted_read_names (no graph observations).
+void write_graph_phase_bam_for_unobserved(
+    samFile* phase_bam_out,
+    sam_hdr_t* phase_bam_hdr,
+    const std::unordered_set<std::string>& emitted_read_names,
+    const std::vector<std::string>& all_read_names_sorted);
+
 // ── End-of-run writers from accumulated rows_by_read map ─────────────────────
 
 // Write an unaligned BAM with HP/PS tags from a pre-built per-read map.
 // all_read_names: additional read names (e.g. from GAF) to include as unphased.
 void write_graph_bam_phase_bam_from_rows(
     const std::string& out_path,
-    const std::unordered_map<std::string, PhaseReadOutputRow>& rows_by_read,
-    const std::vector<std::string>& all_read_names);
-
-// Write the reads TSV from a pre-built per-read map.
-void write_graph_bam_phase_reads_tsv_from_rows(
-    std::ostream& out,
     const std::unordered_map<std::string, PhaseReadOutputRow>& rows_by_read,
     const std::vector<std::string>& all_read_names);
 
@@ -136,7 +178,8 @@ void write_graph_bam_phase_sites_tsv(std::ostream& out,
 
 // Writes the phased graph sites in the standard variant TSV format
 // (CHROM POS TYPE REF ALT DP ... PHASE_SET HAP_ALT HAP_REF).
-// Uses VCF REF/ALT sequences from the catalog — no reference FASTA required.
+// Each chunk must have variant_emit_rows from build_graph_bam_chunk (embedded REF/ALT).
+// catalog is unused (kept for a stable call signature).
 void write_graph_bam_variants_tsv(std::ostream& out,
                                   const std::vector<GraphBamChunkBuildResult>& graph_chunks,
                                   const GraphSiteCatalog& catalog);
