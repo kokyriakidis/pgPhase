@@ -20,6 +20,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <htslib/hts.h>
+#include <htslib/kstring.h>
+#include <htslib/tbx.h>
+
 namespace pgphase_collect {
 
 namespace {
@@ -155,14 +159,25 @@ struct GafCoreFields {
     int mapq = 0;
 };
 
+bool parse_gaf_core_fields_from_column(std::string_view line,
+                                       int first_gaf_column,
+                                       GafCoreFields& out);
+
 bool parse_gaf_core_fields(const std::string& line, GafCoreFields& out) {
+    return parse_gaf_core_fields_from_column(std::string_view(line), 0, out);
+}
+
+bool parse_gaf_core_fields_from_column(std::string_view line,
+                                       int first_gaf_column,
+                                       GafCoreFields& out) {
     std::array<std::pair<const char*, size_t>, 12> fld{};
-    int fi = 0;
-    const char* fs = line.c_str();
+    int fi = -first_gaf_column;
+    const char* fs = line.data();
     const char* le = fs + line.size();
     for (const char* p = fs; p <= le && fi < 12; ++p) {
         if (p == le || *p == '\t') {
-            fld[fi++] = {fs, static_cast<size_t>(p - fs)};
+            if (fi >= 0) fld[fi] = {fs, static_cast<size_t>(p - fs)};
+            ++fi;
             fs = p + 1;
         }
     }
@@ -415,6 +430,64 @@ size_t scan_gaf_range_compact(const std::string& gaf_file,
     return emitted;
 }
 
+size_t scan_gaf_line_compact(std::string_view line,
+                             int first_gaf_column,
+                             const CompactGraphSiteIndex& compact_index,
+                             int min_mapq,
+                             size_t worker_id,
+                             std::vector<CompactHandle>& read_walk,
+                             std::unordered_map<CompactHandle, std::vector<size_t>>& boundary_positions,
+                             std::vector<size_t>& candidates,
+                             std::vector<uint32_t>& site_marks,
+                             uint32_t& mark_stamp,
+                             const GraphReadAlleleThreadEmitter& emit) {
+    if (line.empty() || line[0] == '#') return 0;
+
+    GafCoreFields fields;
+    if (!parse_gaf_core_fields_from_column(line, first_gaf_column, fields)) return 0;
+    if (fields.mapq < min_mapq) return 0;
+    if (!parse_gaf_path_compact(fields.walk, read_walk) || read_walk.empty()) return 0;
+
+    candidates.clear();
+    boundary_positions.clear();
+    if (++mark_stamp == 0) {
+        std::fill(site_marks.begin(), site_marks.end(), 0);
+        mark_stamp = 1;
+    }
+
+    for (size_t step_i = 0; step_i < read_walk.size(); ++step_i) {
+        const CompactHandle handle = read_walk[step_i];
+        auto site_it = compact_index.boundary_to_sites.find(handle);
+        if (site_it == compact_index.boundary_to_sites.end()) continue;
+        boundary_positions[handle].push_back(step_i);
+        for (size_t site_index : site_it->second) {
+            if (site_marks[site_index] == mark_stamp) continue;
+            site_marks[site_index] = mark_stamp;
+            candidates.push_back(site_index);
+        }
+    }
+    if (candidates.empty()) return 0;
+
+    size_t emitted = 0;
+    const std::string read_name(fields.read_name);
+    for (size_t compact_site_index : candidates) {
+        const CompactGraphSite& site = compact_index.sites[compact_site_index];
+        const int allele = match_compact_site_on_read(read_walk, boundary_positions, site);
+        if (allele < 0) continue;
+        emit(worker_id, GraphReadAllele{
+            site.site_id,
+            site.chrom,
+            site.pos,
+            read_name,
+            allele,
+            "",
+            fields.mapq
+        });
+        ++emitted;
+    }
+    return emitted;
+}
+
 std::vector<GraphReadAllele> parse_gaf_read_alleles(const std::string& path,
                                                     const GraphSite& site,
                                                     int min_mapq) {
@@ -645,6 +718,90 @@ size_t scan_gaf_for_catalog_emit_parallel_releasing_walks(
     const GraphReadAlleleThreadEmitter& emit) {
     return scan_gaf_for_catalog_emit_parallel_impl(
         gaf_file, catalog, min_mapq, threads, true, emit);
+}
+
+void require_indexed_gaf(const std::string& indexed_gaf_file) {
+    htsFile* fp = hts_open(indexed_gaf_file.c_str(), "r");
+    if (fp == nullptr) {
+        throw std::runtime_error("failed to open indexed GAF: " + indexed_gaf_file);
+    }
+    hts_close(fp);
+
+    tbx_t* tbx = tbx_index_load(indexed_gaf_file.c_str());
+    if (tbx == nullptr) {
+        throw std::runtime_error(
+            "indexed GAF requires a tabix index (.tbi): " + indexed_gaf_file);
+    }
+    tbx_destroy(tbx);
+}
+
+std::vector<GraphReadAllele>
+scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
+                       const std::string& contig,
+                       hts_pos_t beg,
+                       hts_pos_t end,
+                       const GraphSiteCatalog& catalog,
+                       int min_mapq) {
+    if (contig.empty() || end <= beg) return {};
+    if (catalog.sites.empty()) return {};
+
+    GraphSiteCatalog& mutable_catalog = const_cast<GraphSiteCatalog&>(catalog);
+    CompactGraphSiteIndex compact_index;
+    if (!build_compact_graph_site_index(mutable_catalog, compact_index, false)) {
+        throw std::runtime_error(
+            "indexed GAF chunk scan requires queryable graph sites with numeric node IDs");
+    }
+
+    htsFile* raw_fp = hts_open(indexed_gaf_file.c_str(), "r");
+    if (raw_fp == nullptr) {
+        throw std::runtime_error("failed to open indexed GAF: " + indexed_gaf_file);
+    }
+    struct HtsFileGuard {
+        htsFile* fp = nullptr;
+        ~HtsFileGuard() { if (fp != nullptr) hts_close(fp); }
+    } fp_guard{raw_fp};
+
+    tbx_t* raw_tbx = tbx_index_load(indexed_gaf_file.c_str());
+    if (raw_tbx == nullptr) {
+        throw std::runtime_error(
+            "indexed GAF requires a tabix index (.tbi): " + indexed_gaf_file);
+    }
+    struct TbxGuard {
+        tbx_t* tbx = nullptr;
+        ~TbxGuard() { if (tbx != nullptr) tbx_destroy(tbx); }
+    } tbx_guard{raw_tbx};
+
+    const int tid = tbx_name2id(raw_tbx, contig.c_str());
+    if (tid < 0) return {};
+
+    hts_itr_t* raw_itr = tbx_itr_queryi(raw_tbx, tid, beg, end);
+    if (raw_itr == nullptr) return {};
+    struct IterGuard {
+        hts_itr_t* itr = nullptr;
+        ~IterGuard() { if (itr != nullptr) hts_itr_destroy(itr); }
+    } itr_guard{raw_itr};
+
+    std::vector<GraphReadAllele> rows;
+    uint32_t mark_stamp = 1;
+    std::vector<uint32_t> site_marks(compact_index.sites.size(), 0);
+    std::vector<size_t> candidates;
+    std::vector<CompactHandle> read_walk;
+    std::unordered_map<CompactHandle, std::vector<size_t>> boundary_positions;
+
+    kstring_t line = KS_INITIALIZE;
+    struct KStringGuard {
+        kstring_t* line = nullptr;
+        ~KStringGuard() { if (line != nullptr) ks_free(line); }
+    } line_guard{&line};
+
+    while (tbx_itr_next(raw_fp, raw_tbx, raw_itr, &line) >= 0) {
+        scan_gaf_line_compact(
+            std::string_view(line.s, line.l), 3, compact_index, min_mapq, 0,
+            read_walk, boundary_positions, candidates, site_marks, mark_stamp,
+            [&](size_t, GraphReadAllele&& row) { rows.push_back(std::move(row)); });
+    }
+
+    return rows;
 }
 
 std::vector<GraphReadAllele>

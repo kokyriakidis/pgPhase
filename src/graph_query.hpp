@@ -68,6 +68,20 @@ size_t scan_gaf_for_catalog_emit_parallel_releasing_walks(
     size_t threads,
     const GraphReadAlleleThreadEmitter& emit);
 
+// Per-chunk query for a pggaf index-gaf output. The file must be bgzip-compressed
+// and tabix-indexed, with pggaf's three leading coordinate columns:
+//   rc  rb  re  <original annotated GAF columns...>
+// Coordinates are queried as 0-based half-open intervals, mirroring BAM.
+std::vector<GraphReadAllele>
+scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
+                       const std::string& contig,
+                       hts_pos_t beg,
+                       hts_pos_t end,
+                       const GraphSiteCatalog& catalog,
+                       int min_mapq);
+
+void require_indexed_gaf(const std::string& indexed_gaf_file);
+
 // Per-chunk indexed GAF query using the query binary and a prebuilt gaf.db.
 // Calls: query [--sample S] --contig C --interval BEG..END
 //              --gaf-base gaf_db --gaf-output TMPFILE --alignments overlapping GBZ

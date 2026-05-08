@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdio>
 #include <exception>
 #include <fstream>
 #include <getopt.h>
@@ -14,121 +13,17 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <cstring>
-#include <list>
+#include <string_view>
 #include <optional>
-#include <sys/stat.h>
-#include <sys/types.h>
 #include <thread>
-#include <unistd.h>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <htslib/hts.h>
+#include <htslib/kstring.h>
+
 namespace {
-
-// ---------- Per-chunk disk shard infrastructure (mirrors graph_collect.cpp) ----------
-
-// Temp-file store: per_worker × per_chunk TSV files, written during GAF scan,
-// read per-chunk during parallel build. Peak RAM = n_workers × one_chunk_rows.
-struct ChunkRowShard {
-    std::string dir;
-    // paths[worker][chunk] = shard file path
-    std::vector<std::vector<std::string>> paths;
-
-    ChunkRowShard() = default;
-    ChunkRowShard(const ChunkRowShard&) = delete;
-    ChunkRowShard& operator=(const ChunkRowShard&) = delete;
-    ~ChunkRowShard() {
-        for (const auto& wp : paths)
-            for (const auto& p : wp)
-                std::remove(p.c_str());
-        if (!dir.empty()) rmdir(dir.c_str());
-    }
-
-    // Load and return all rows for chunk_index from every worker's shard file.
-    std::vector<pgphase_collect::GraphReadAllele> load_chunk(size_t chunk_index) const {
-        using namespace pgphase_collect;
-        std::vector<GraphReadAllele> rows;
-        for (const auto& wp : paths) {
-            if (chunk_index >= wp.size()) continue;
-            std::ifstream in(wp[chunk_index]);
-            if (!in) continue;
-            std::string line;
-            while (std::getline(in, line)) {
-                if (line.empty()) continue;
-                // site_id \t chrom \t pos \t read_name \t mapq \t allele
-                const char* s = line.c_str();
-                const char* e = s + line.size();
-                auto next = [&](const char* from) -> std::pair<std::string_view, const char*> {
-                    const char* t = static_cast<const char*>(
-                        std::memchr(from, '\t', static_cast<size_t>(e - from)));
-                    if (!t) t = e;
-                    return {{from, static_cast<size_t>(t - from)}, t < e ? t + 1 : e};
-                };
-                auto [site_id, p1] = next(s);
-                auto [chrom,   p2] = next(p1);
-                auto [pos_sv,  p3] = next(p2);
-                auto [rname,   p4] = next(p3);
-                auto [mapq_sv, p5] = next(p4);
-                auto [ale_sv,  p6] = next(p5);
-                rows.push_back(GraphReadAllele{
-                    std::string(site_id),
-                    std::string(chrom),
-                    static_cast<hts_pos_t>(std::stoll(std::string(pos_sv))),
-                    std::string(rname),
-                    std::stoi(std::string(ale_sv)),
-                    std::string(),
-                    std::stoi(std::string(mapq_sv))
-                });
-            }
-        }
-        return rows;
-    }
-};
-
-// LRU-cached append writer: keeps up to kMaxOpen file descriptors open at once.
-class ChunkRowWriter {
-public:
-    explicit ChunkRowWriter(const std::vector<std::string>& paths) : paths_(paths) {}
-
-    void write(size_t chunk_idx, const pgphase_collect::GraphReadAllele& row) {
-        std::ofstream& out = stream_for(chunk_idx);
-        out << row.site_id << '\t' << row.chrom << '\t' << row.pos << '\t'
-            << row.read_name << '\t' << row.mapq << '\t' << row.allele << '\n';
-    }
-
-private:
-    static constexpr size_t kMaxOpen = 64;
-    struct Entry { std::ofstream stream; std::list<size_t>::iterator lru_it; };
-
-    std::ofstream& stream_for(size_t idx) {
-        auto it = open_.find(idx);
-        if (it != open_.end()) {
-            lru_.erase(it->second.lru_it);
-            lru_.push_front(idx);
-            it->second.lru_it = lru_.begin();
-            return it->second.stream;
-        }
-        if (open_.size() >= kMaxOpen) {
-            open_.erase(lru_.back());
-            lru_.pop_back();
-        }
-        lru_.push_front(idx);
-        Entry e{std::ofstream(paths_[idx], std::ios::app), lru_.begin()};
-        if (!e.stream)
-            throw std::runtime_error("failed to open chunk shard: " + paths_[idx]);
-        auto [ins_it, ok] = open_.emplace(idx, std::move(e));
-        (void)ok;
-        return ins_it->second.stream;
-    }
-
-    const std::vector<std::string>& paths_;
-    std::unordered_map<size_t, Entry> open_;
-    std::list<size_t> lru_;
-};
-
-// ---------------------------------------------------------------------------------
 
 struct GraphOptions {
     std::string gaf_file;
@@ -171,7 +66,7 @@ void print_help() {
         << "Usage: pgphase phase-graph [options]\n"
         << "\n"
         << "Required:\n"
-        << "      --gaf FILE                Raw GAF graph alignments\n"
+        << "      --gaf FILE                pggaf indexed annotated GAF (.gaf.gz + .tbi; rc/rb/re required)\n"
         << "      --graph-sites-vcf FILE    Decomposed graph-site VCF (from build-snarl-catalog)\n"
         << "\n"
         << "Options:\n"
@@ -223,15 +118,16 @@ struct GraphChunkWorkResult {
     pgphase_collect::GraphBamChunkBuildResult build_result;
 };
 
-// VCF+GAF fast path: catalogs are pre-sliced; rows are loaded per-chunk from disk shards.
+// VCF+indexed-GAF fast path: catalogs are pre-sliced; rows are retrieved per
+// chunk with tabix from pggaf's rc/rb/re coordinate index.
 // Processes the half-open index range [batch_beg, batch_end) in parallel, returning
 // results[0..batch_size-1] corresponding to chunk indices [batch_beg..batch_end-1].
 // chunk_id_offset is added to each local chunk index so IDs are globally monotonic
 // across contigs.
-// Peak RAM = n_workers × one_chunk_rows (shard data) + batch_size × BamChunk.
+// Peak RAM = n_workers × one_chunk_rows + batch_size × BamChunk.
 static std::vector<GraphChunkWorkResult> run_vcf_gaf_chunks_parallel(
     const std::vector<pgphase_collect::GraphSiteCatalog>& chunk_catalogs,
-    const ChunkRowShard& shard,
+    const std::string& indexed_gaf_file,
     const std::vector<std::pair<hts_pos_t, hts_pos_t>>& intervals,
     size_t batch_beg,
     size_t batch_end,
@@ -255,12 +151,16 @@ static std::vector<GraphChunkWorkResult> run_vcf_gaf_chunks_parallel(
                     const size_t offset = next.fetch_add(1);
                     if (offset >= batch_size) break;
                     const size_t i = batch_beg + offset;
-                    const std::vector<GraphReadAllele> chunk_rows = shard.load_chunk(i);
+                    std::vector<GraphReadAllele> chunk_rows = scan_indexed_gaf_chunk(
+                        indexed_gaf_file, contig,
+                        intervals[i].first, intervals[i].second,
+                        chunk_catalogs[i], filter_opts.min_mapq);
                     results[offset].build_result = build_graph_bam_chunk(
                         chunk_catalogs[i], chunk_rows, contig,
                         intervals[i].first, intervals[i].second,
                         chunk_id_offset + static_cast<int>(i), filter_opts);
                     results[offset].catalog = chunk_catalogs[i];
+                    results[offset].rows = std::move(chunk_rows);
                 }
             } catch (...) {
                 std::lock_guard<std::mutex> lock(err_mutex);
@@ -320,27 +220,65 @@ static std::vector<GraphChunkWorkResult> run_gbz_chunks_parallel(
     return results;
 }
 
-// Collect unique, MAPQ-filtered read names from the GAF file.
+static bool parse_uint_field(std::string_view text, int& out) {
+    if (text.empty()) return false;
+    int value = 0;
+    for (char c : text) {
+        if (c < '0' || c > '9') return false;
+        value = value * 10 + (c - '0');
+    }
+    out = value;
+    return true;
+}
+
+static bool parse_gaf_name_mapq_from_columns(const std::string& line,
+                                             int first_gaf_column,
+                                             std::string& read_name,
+                                             int& mapq) {
+    const int qname_col = first_gaf_column;
+    const int mapq_col = first_gaf_column + 11;
+    int field = 0;
+    size_t pos = 0;
+    while (pos <= line.size()) {
+        const size_t tab = line.find('\t', pos);
+        const size_t end = tab == std::string::npos ? line.size() : tab;
+        if (field == qname_col) read_name.assign(line, pos, end - pos);
+        if (field == mapq_col) {
+            return parse_uint_field(std::string_view(line.data() + pos, end - pos), mapq);
+        }
+        if (tab == std::string::npos) break;
+        pos = tab + 1;
+        ++field;
+    }
+    return false;
+}
+
+// Collect unique, MAPQ-filtered read names from raw or pggaf indexed GAF.
 static std::vector<std::string> collect_gaf_read_names(const std::string& gaf_file, int min_mapq) {
     std::vector<std::string> names;
-    std::ifstream gaf(gaf_file);
-    std::string line;
-    while (std::getline(gaf, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        size_t pos = 0, field = 0;
+    htsFile* raw_fp = hts_open(gaf_file.c_str(), "r");
+    if (raw_fp == nullptr) throw std::runtime_error("failed to open GAF: " + gaf_file);
+    struct HtsFileGuard {
+        htsFile* fp = nullptr;
+        ~HtsFileGuard() { if (fp != nullptr) hts_close(fp); }
+    } fp_guard{raw_fp};
+
+    kstring_t line = KS_INITIALIZE;
+    struct KStringGuard {
+        kstring_t* line = nullptr;
+        ~KStringGuard() { if (line != nullptr) ks_free(line); }
+    } line_guard{&line};
+
+    while (hts_getline(raw_fp, '\n', &line) >= 0) {
+        if (line.l == 0 || line.s[0] == '#') continue;
+        const std::string text(line.s, line.l);
         int mapq = 255;
         std::string read_name;
-        while (true) {
-            const size_t tab = line.find('\t', pos);
-            const size_t len = (tab == std::string::npos) ? line.size() - pos : tab - pos;
-            if (field == 0) read_name.assign(line, pos, len);
-            else if (field == 11) { mapq = std::atoi(line.c_str() + pos); break; }
-            if (tab == std::string::npos) break;
-            pos = tab + 1;
-            ++field;
+        if (!parse_gaf_name_mapq_from_columns(text, 3, read_name, mapq) &&
+            !parse_gaf_name_mapq_from_columns(text, 0, read_name, mapq)) {
+            continue;
         }
-        if (mapq >= min_mapq && !read_name.empty())
-            names.push_back(std::move(read_name));
+        if (mapq >= min_mapq && !read_name.empty()) names.push_back(std::move(read_name));
     }
     std::sort(names.begin(), names.end());
     names.erase(std::unique(names.begin(), names.end()), names.end());
@@ -477,17 +415,15 @@ int phase_graph(int argc, char* argv[]) {
         size_t total_chunks = 0;
         int    chunk_id_offset = 0;
 
-        static std::atomic<int> shard_counter{0};
         const size_t nw = static_cast<size_t>(std::max(1, opts.threads));
+        require_indexed_gaf(opts.gaf_file);
 
         // ── Per-contig streaming loop ─────────────────────────────────────────
         // For each contig:
         //   1. Load only that contig's sites from the VCF (tabix if indexed).
         //   2. Build per-chunk catalogs in the contig's own [0, end) position space.
-        //   3. Create fresh per-(worker × chunk) shard files in a temp dir.
-        //   4. Scan the GAF once for this contig's sites → route rows to shards.
-        //   5. Run the streaming build → assign → stitch → emit loop.
-        //   6. Destroy the shard (temp files deleted by RAII).
+        //   3. Query the indexed annotated GAF per chunk with tabix.
+        //   4. Run the streaming build → assign → stitch → emit loop.
         // Peak catalog RAM = one contig's sites (not the whole genome at once).
         // Peak BamChunk RAM = O(n_threads × one_chunk).
         for (const std::string& contig : contigs) {
@@ -516,7 +452,7 @@ int phase_graph(int argc, char* argv[]) {
             }
 
             if (opts.verbose >= 1)
-                std::cerr << "Contig " << contig << ": scanning GAF for "
+                std::cerr << "Contig " << contig << ": querying indexed GAF for "
                           << full_catalog.sites.size() << " graph sites...\n";
 
             // Coordinate bounds for this contig (always 0-based half-open).
@@ -530,8 +466,6 @@ int phase_graph(int argc, char* argv[]) {
 
             // Build per-chunk catalogs in O(n_sites) — one arithmetic pass.
             std::vector<GraphSiteCatalog> chunk_catalogs(n);
-            std::unordered_map<std::string, size_t> site_to_chunk;
-            site_to_chunk.reserve(full_catalog.sites.size());
             for (const GraphSite& site : full_catalog.sites) {
                 const hts_pos_t site_beg0 =
                     (site.ref_beg > 0 ? site.ref_beg : site.pos) - 1;
@@ -540,63 +474,6 @@ int phase_graph(int argc, char* argv[]) {
                     (site_beg0 - interval_beg) / opts.graph_chunk_size);
                 if (ci >= n) continue;
                 chunk_catalogs[ci].sites.push_back(site);
-                const std::string key = (!site.id.empty() && site.id != ".")
-                    ? site.id
-                    : site.chrom + ":" + std::to_string(site.pos) + ":" + site.ref;
-                site_to_chunk.emplace(key, ci);
-            }
-
-            // Release walk strings from chunk_catalogs — the compact index for the
-            // GAF scan is built from full_catalog (still intact at this point).
-            for (auto& cc : chunk_catalogs) {
-                for (GraphSite& s : cc.sites) {
-                    for (GraphWalk& w : s.allele_walks) w.clear();
-                    s.allele_traversals.clear();
-                }
-            }
-
-            // Per-contig shard dir (globally unique via atomic counter).
-            const std::string shard_dir =
-                "/tmp/pgphase_graph_shard_" + std::to_string(getpid()) +
-                "_" + std::to_string(++shard_counter);
-            if (mkdir(shard_dir.c_str(), 0700) != 0)
-                throw std::runtime_error("failed to create shard dir: " + shard_dir);
-
-            ChunkRowShard shard;
-            shard.dir = shard_dir;
-            shard.paths.resize(nw);
-            for (size_t wi = 0; wi < nw; ++wi) {
-                shard.paths[wi].resize(n);
-                for (size_t ci = 0; ci < n; ++ci)
-                    shard.paths[wi][ci] = shard_dir + "/w" + std::to_string(wi) +
-                                          "_c" + std::to_string(ci) + ".tsv";
-            }
-
-            // Scan GAF for this contig's sites; route matched rows to shard files.
-            // scan_gaf_for_catalog_emit_parallel_releasing_walks releases walk strings
-            // from full_catalog while building the compact index, minimising peak RAM.
-            {
-                std::vector<std::unique_ptr<ChunkRowWriter>> writers(nw);
-                for (size_t wi = 0; wi < nw; ++wi)
-                    writers[wi] = std::make_unique<ChunkRowWriter>(shard.paths[wi]);
-
-                std::atomic<size_t> row_counter{0};
-                scan_gaf_for_catalog_emit_parallel_releasing_walks(
-                    opts.gaf_file, full_catalog, filter_opts.min_mapq, nw,
-                    [&](size_t worker_id, GraphReadAllele&& row) {
-                        auto it = site_to_chunk.find(row.site_id);
-                        if (it != site_to_chunk.end()) {
-                            writers[worker_id]->write(it->second, row);
-                            row_counter.fetch_add(1, std::memory_order_relaxed);
-                        }
-                    });
-                // Flush + close all shard files.
-                writers.clear();
-                const size_t contig_rows = row_counter.load();
-                total_rows += contig_rows;
-                if (opts.verbose >= 1)
-                    std::cerr << "Contig " << contig << ": " << contig_rows
-                              << " read-allele rows, " << n << " chunk(s)\n";
             }
 
             // Build per-contig site_id → GraphSite* lookup (valid until end of
@@ -612,17 +489,21 @@ int phase_graph(int argc, char* argv[]) {
             // but scoped to this contig).
             const size_t n_per_batch = nw;
             std::optional<GraphBamChunkBuildResult> prev_chunk;
+            size_t contig_rows = 0;
 
             for (size_t batch_beg = 0; batch_beg < n; batch_beg += n_per_batch) {
                 const size_t batch_end = std::min(batch_beg + n_per_batch, n);
                 auto results = run_vcf_gaf_chunks_parallel(
-                    chunk_catalogs, shard, intervals,
+                    chunk_catalogs, opts.gaf_file, intervals,
                     batch_beg, batch_end,
                     opts.threads, contig, filter_opts,
                     chunk_id_offset);
 
                 for (size_t bi = 0; bi < results.size(); ++bi) {
                     append_catalog(diagnostic_catalog, results[bi].catalog);
+                    contig_rows += results[bi].rows.size();
+                    if (read_support_out)
+                        write_graph_read_alleles_tsv_rows(read_support_out, results[bi].rows);
                     GraphBamChunkBuildResult cur = std::move(results[bi].build_result);
 
                     assign_graph_chunk_hap(cur, phase_opts);
@@ -657,18 +538,12 @@ int phase_graph(int argc, char* argv[]) {
                 prev_chunk.reset();
             }
 
-            // graph_read_support_tsv: scan this contig's shards while still alive.
-            if (read_support_out) {
-                const size_t n_shards =
-                    shard.paths.empty() ? 0 : shard.paths[0].size();
-                for (size_t ci = 0; ci < n_shards; ++ci)
-                    write_graph_read_alleles_tsv_rows(
-                        read_support_out, shard.load_chunk(ci));
-            }
-
+            total_rows += contig_rows;
+            if (opts.verbose >= 1)
+                std::cerr << "Contig " << contig << ": " << contig_rows
+                          << " read-allele rows, " << n << " chunk(s)\n";
             chunk_id_offset += static_cast<int>(n);
             total_chunks    += n;
-            // shard RAII: temp files deleted when it goes out of scope here.
         } // end per-contig loop
 
         // ── Post-loop outputs ─────────────────────────────────────────────────
