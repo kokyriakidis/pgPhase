@@ -20,6 +20,7 @@ struct GraphReadAllele {
     int allele = kGraphAlleleMissing;
     std::string walk;
     int mapq = 255;
+    bool reverse = false; // true when the read traverses the snarl in reverse-complement
 };
 
 struct GraphQueryConfig {
