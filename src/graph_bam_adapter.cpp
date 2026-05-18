@@ -2,6 +2,7 @@
 
 #include "collect_output.hpp"
 #include "collect_phase.hpp"
+#include "fisher_exact.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -180,6 +181,66 @@ void merge_phase_read_assignment(PhaseReadOutputRow& row,
     row.has_phased_assignment = ((hap == 1 || hap == 2) && phase_set >= 0);
 }
 
+// Classify graph candidates using count-based rules matching the BAM pipeline's
+// classify_variant_initial (collect_var.cpp), minus reference-sequence-dependent
+// checks (homopolymer/repeat detection).  Runs in a single pass over candidates.
+void classify_graph_candidates(BamChunk& chunk, const Options& opts) {
+    for (auto& cand : chunk.candidates) {
+        VariantCounts& c = cand.counts;
+
+        // Low coverage / low alt depth.
+        if (c.total_cov < opts.min_depth || c.alt_cov < opts.min_alt_depth) {
+            c.category = VariantCategory::LowCoverage;
+            c.candvarcate_initial = VariantCategory::LowCoverage;
+            cand.lcd_var_i_to_cate = category_to_flag(VariantCategory::LowCoverage);
+            continue;
+        }
+
+        // ONT strand-bias filter (Fisher exact test on alt forward vs reverse).
+        if (opts.is_ont()) {
+            const int fa = c.forward_alt;
+            const int ra = c.reverse_alt;
+            const int expected = (fa + ra) / 2;
+            if (expected > 0) {
+                const double p = fisher_exact_two_tail(fa, ra, expected, expected);
+                if (p < opts.strand_bias_pval) {
+                    c.category = VariantCategory::StrandBias;
+                    c.candvarcate_initial = VariantCategory::StrandBias;
+                    cand.lcd_var_i_to_cate = category_to_flag(VariantCategory::StrandBias);
+                    continue;
+                }
+            }
+        }
+
+        // Low allele fraction → folded to LowCoverage (matches BAM pipeline pass 2).
+        if (c.allele_fraction < opts.min_af) {
+            c.category = VariantCategory::LowCoverage;
+            c.candvarcate_initial = VariantCategory::LowAlleleFraction;
+            cand.lcd_var_i_to_cate = category_to_flag(VariantCategory::LowCoverage);
+            continue;
+        }
+
+        // Homozygous (high AF).
+        if (c.allele_fraction > opts.max_af) {
+            c.category = VariantCategory::CleanHom;
+            c.candvarcate_initial = VariantCategory::CleanHom;
+            cand.lcd_var_i_to_cate = category_to_flag(VariantCategory::CleanHom);
+            continue;
+        }
+
+        // Surviving het — type-aware classification.
+        if (cand.key.type == VariantType::Snp) {
+            c.category = VariantCategory::CleanHetSnp;
+            c.candvarcate_initial = VariantCategory::CleanHetSnp;
+            cand.lcd_var_i_to_cate = kCandCleanHetSnp;
+        } else {
+            c.category = VariantCategory::CleanHetIndel;
+            c.candvarcate_initial = VariantCategory::CleanHetIndel;
+            cand.lcd_var_i_to_cate = kCandCleanHetIndel;
+        }
+    }
+}
+
 } // namespace
 
 GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
@@ -273,6 +334,15 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         if (!inserted && row.mapq > it->second) it->second = row.mapq;
     }
 
+    // Pack allele + reverse into a single int: low 16 bits = allele, bit 16 = reverse.
+    // Conflict sentinel is -1 (allele < 0).
+    constexpr int kRevBit = 0x10000;
+    auto pack_allele_rev = [](int allele, bool rev) -> int {
+        return allele | (rev ? kRevBit : 0);
+    };
+    auto unpack_allele = [](int packed) -> int { return packed & 0xFFFF; };
+    auto unpack_reverse = [&](int packed) -> bool { return (packed & kRevBit) != 0; };
+
     std::unordered_map<std::string, std::unordered_map<int, int>> allele_by_read_site;
     for (const GraphReadAllele& row : rows) {
         auto it = site_to_candidate.find(row.site_id);
@@ -280,16 +350,12 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         const int site_i = it->second;
         CandidateVariant& candidate = out.chunk.candidates[static_cast<size_t>(site_i)];
         if (row.allele < 0 || row.allele >= candidate.counts.n_uniq_alles) continue;
-        // Accumulate per-observation strand counts (before read-level dedup).
-        auto& sc = row.reverse ? rev_strand_counts[static_cast<size_t>(site_i)]
-                               : fwd_strand_counts[static_cast<size_t>(site_i)];
-        ++sc[static_cast<size_t>(row.allele)];
         std::unordered_map<int, int>& by_site = allele_by_read_site[row.read_name];
         auto obs_it = by_site.find(site_i);
         if (obs_it == by_site.end()) {
-            by_site.emplace(site_i, row.allele);
-        } else if (obs_it->second != row.allele) {
-            obs_it->second = -1;
+            by_site.emplace(site_i, pack_allele_rev(row.allele, row.reverse));
+        } else if (obs_it->second >= 0 && unpack_allele(obs_it->second) != row.allele) {
+            obs_it->second = -1;  // conflict
         }
     }
 
@@ -297,20 +363,26 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     for (const auto& read_item : allele_by_read_site) {
         for (const auto& site_item : read_item.second) {
             const int site_i = site_item.first;
-            const int allele = site_item.second;
-            if (allele < 0) continue;
+            const int packed = site_item.second;
+            if (packed < 0) continue;
+            const int allele = unpack_allele(packed);
+            const bool rev = unpack_reverse(packed);
             const std::vector<int>& conditional = conditional_parent_alleles[static_cast<size_t>(site_i)];
             const int parent_i = parent_candidate[static_cast<size_t>(site_i)];
             if (!conditional.empty()) {
                 if (parent_i < 0) continue;
                 auto parent_obs = read_item.second.find(parent_i);
-                if (parent_obs == read_item.second.end()) continue;
-                if (std::find(conditional.begin(), conditional.end(), parent_obs->second) ==
+                if (parent_obs == read_item.second.end() || parent_obs->second < 0) continue;
+                const int parent_allele = unpack_allele(parent_obs->second);
+                if (std::find(conditional.begin(), conditional.end(), parent_allele) ==
                     conditional.end()) {
                     continue;
                 }
             }
             ++allele_counts[static_cast<size_t>(site_i)][static_cast<size_t>(allele)];
+            auto& sc = rev ? rev_strand_counts[static_cast<size_t>(site_i)]
+                           : fwd_strand_counts[static_cast<size_t>(site_i)];
+            ++sc[static_cast<size_t>(allele)];
             read_obs[read_item.first].push_back(GraphProfileObservation{site_i, allele});
         }
     }
@@ -478,6 +550,25 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
             old_site_to_pairs[i].push_back({new_idx, static_cast<int>(a)});
 
             CandidateVariant pair_cand = out.chunk.candidates[i];
+
+            // Derive variant type from VCF REF/ALT sequence lengths.
+            {
+                const GraphSite& site = catalog.sites[catalog_site_idx_phase1[i]];
+                const size_t ref_len = site.ref.size();
+                const size_t alt_idx = static_cast<size_t>(orig_alt - 1);
+                const size_t alt_len = alt_idx < site.alts.size() ? site.alts[alt_idx].size() : ref_len;
+                if (ref_len < alt_len) {
+                    pair_cand.key.type = VariantType::Insertion;
+                    pair_cand.key.ref_len = 1;
+                } else if (ref_len > alt_len) {
+                    pair_cand.key.type = VariantType::Deletion;
+                    pair_cand.key.ref_len = static_cast<int>(ref_len);
+                } else {
+                    pair_cand.key.type = VariantType::Snp;
+                    pair_cand.key.ref_len = static_cast<int>(ref_len);
+                }
+            }
+
             pair_cand.counts.alle_covs       = {ref_c, alt_c};
             pair_cand.counts.n_uniq_alles    = 2;
             pair_cand.counts.ref_cov         = ref_c;
@@ -532,9 +623,25 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     conditional_parent_alleles = std::move(new_cpa);
     allele_orig_idx            = std::move(new_orig_idx);
 
+    // Classify candidates before building read profiles so that pruned sites
+    // (LowCoverage, StrandBias) never enter the profile / cr_overlap index.
+    classify_graph_candidates(out.chunk, opts);
+
+    // Build a fast lookup for pruned candidates.
+    const size_t n_final_cands = out.chunk.candidates.size();
+    std::vector<bool> cand_pruned(n_final_cands, false);
+    for (size_t ci = 0; ci < n_final_cands; ++ci) {
+        const VariantCategory cat = out.chunk.candidates[ci].counts.category;
+        if (cat == VariantCategory::LowCoverage || cat == VariantCategory::StrandBias ||
+            cat == VariantCategory::NonVariant) {
+            cand_pruned[ci] = true;
+        }
+    }
+
     // Phase 3: remap read observations to the new biallelic pair space.
     // Allele 0 (ref) fans out to all new pairs from its original site (allele 0 in each).
     // Allele j (alt) maps to allele 1 in the one pair that holds alt j.
+    // Observations at pruned candidates are dropped.
     for (auto& [read_name, obs] : read_obs) {
         std::vector<GraphProfileObservation> new_obs;
         new_obs.reserve(obs.size());  // biallelic sites: exact; multiallelic: slight under-reserve
@@ -545,6 +652,7 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
             if (pairs.empty()) continue;
             // Fast path: biallelic site (one surviving pair) — no loop needed.
             if (pairs.size() == 1) {
+                if (cand_pruned[static_cast<size_t>(pairs[0].new_idx)]) continue;
                 if (o.allele == 0) {
                     new_obs.push_back({pairs[0].new_idx, 0});
                 } else if (o.allele > 0 &&
@@ -557,14 +665,16 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
             // General path: multiallelic site with multiple surviving pairs.
             if (o.allele == 0) {
                 for (const NewPairEntry& pe : pairs)
-                    new_obs.push_back({pe.new_idx, 0});
+                    if (!cand_pruned[static_cast<size_t>(pe.new_idx)])
+                        new_obs.push_back({pe.new_idx, 0});
             } else if (o.allele > 0 &&
                        static_cast<size_t>(o.allele) < allele_remap[old_si].size()) {
                 const int phase1_alt = allele_remap[old_si][static_cast<size_t>(o.allele)];
                 if (phase1_alt >= 0) {
                     for (const NewPairEntry& pe : pairs) {
                         if (pe.old_alt_phase1 == phase1_alt) {
-                            new_obs.push_back({pe.new_idx, 1});
+                            if (!cand_pruned[static_cast<size_t>(pe.new_idx)])
+                                new_obs.push_back({pe.new_idx, 1});
                             break;
                         }
                     }
@@ -626,6 +736,7 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         GraphVariantEmitRow row;
         row.chrom = site.ref_contig.empty() ? site.chrom : site.ref_contig;
         row.pos = site.pos;
+        row.snarl_id = ci < out.site_ids.size() ? out.site_ids[ci] : ".";
         row.ref = site.ref;
 
         int orig_walk_idx = 1;
@@ -873,7 +984,7 @@ void write_graph_bam_phase_sites_tsv(std::ostream& out,
 }
 
 void write_graph_bam_variants_tsv_header(std::ostream& out) {
-    out << "CHROM\tPOS\tTYPE\tREF\tALT\tDP\tREF_COUNT\tALT_COUNT\tLOW_QUAL_COUNT"
+    out << "CHROM\tPOS\tSNARL_ID\tTYPE\tREF\tALT\tDP\tREF_COUNT\tALT_COUNT\tLOW_QUAL_COUNT"
            "\tFORWARD_REF\tREVERSE_REF\tFORWARD_ALT\tREVERSE_ALT"
            "\tAF\tCATEGORY\tINIT_CAT\tPHASE_SET\tHAP_ALT\tHAP_REF\n";
 }
@@ -882,6 +993,7 @@ static void write_graph_bam_variant_tsv_line(std::ostream& out,
                                              const CandidateVariant& cand,
                                              const std::string& chrom,
                                              hts_pos_t pos,
+                                             const std::string& snarl_id,
                                              const std::string& ref_seq,
                                              const std::string& alt_seq) {
     if (ref_seq.empty()) return;
@@ -902,7 +1014,7 @@ static void write_graph_bam_variant_tsv_line(std::ostream& out,
     if (h1 < 0) h1 = 0;
     if (h2 < 0) h2 = 0;
 
-    out << chrom << '\t' << pos << '\t' << type_name(vtype) << '\t'
+    out << chrom << '\t' << pos << '\t' << snarl_id << '\t' << type_name(vtype) << '\t'
         << ref_seq << '\t' << alt_seq << '\t'
         << cand.counts.total_cov << '\t' << cand.counts.ref_cov << '\t'
         << cand.counts.alt_cov << '\t' << cand.counts.low_qual_cov << '\t'
@@ -932,7 +1044,8 @@ static void write_graph_bam_variant_one_row(std::ostream& out,
     const int alt_seq_idx = orig_walk_idx - 1;
     if (alt_seq_idx < 0 || alt_seq_idx >= static_cast<int>(site.alts.size())) return;
     const std::string& alt_seq = site.alts[static_cast<size_t>(alt_seq_idx)];
-    write_graph_bam_variant_tsv_line(out, cand, chrom, site.pos, ref_seq, alt_seq);
+    const std::string& snarl_id = ci < gc.site_ids.size() ? gc.site_ids[ci] : std::string(".");
+    write_graph_bam_variant_tsv_line(out, cand, chrom, site.pos, snarl_id, ref_seq, alt_seq);
 }
 
 void write_graph_bam_variants_tsv_rows(
@@ -986,7 +1099,7 @@ void write_graph_bam_variants_tsv_rows(std::ostream& out,
     for (size_t ci = 0; ci < gc.chunk.candidates.size(); ++ci) {
         const GraphVariantEmitRow& row = gc.variant_emit_rows[ci];
         write_graph_bam_variant_tsv_line(out, gc.chunk.candidates[ci],
-                                         row.chrom, row.pos, row.ref, row.alt);
+                                         row.chrom, row.pos, row.snarl_id, row.ref, row.alt);
     }
 }
 
