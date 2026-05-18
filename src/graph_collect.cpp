@@ -125,14 +125,17 @@ struct GraphObservationChunkIndex {
             if (line.empty()) continue;
             const std::vector<std::string> fields = split_tab_fields(line);
             if (fields.size() < 6) continue;
+            // Shard format: site_id chrom pos read_name mapq allele [reverse [walk]]
+            const bool rev = fields.size() >= 7 && fields[6] == "1";
             rows.push_back(GraphReadAllele{
                 fields[0],
                 fields[1],
                 static_cast<hts_pos_t>(std::stoll(fields[2])),
                 fields[3],
                 std::stoi(fields[5]),
-                fields.size() >= 7 ? fields[6] : std::string(),
-                std::stoi(fields[4])
+                fields.size() >= 8 ? fields[7] : std::string(),
+                std::stoi(fields[4]),
+                rev
             });
         }
     }
@@ -168,7 +171,8 @@ public:
             << row.pos << '\t'
             << row.read_name << '\t'
             << row.mapq << '\t'
-            << row.allele << '\n';
+            << row.allele << '\t'
+            << (row.reverse ? '1' : '0') << '\n';
         if (!out) throw std::runtime_error("failed to write graph observation shard");
     }
 
