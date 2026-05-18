@@ -1,9 +1,12 @@
 [submodule "third_party/WFA2-lib"]
 	path = third_party/WFA2-lib
-	url = /home/kokyriakidis/Downloads/longcallD/WFA2-lib
+	url = https://github.com/smarco/WFA2-lib.git
 [submodule "third_party/abPOA"]
 	path = third_party/abPOA
-	url = /home/kokyriakidis/Downloads/longcallD/abPOA
+	url = https://github.com/yangao07/abPOA.git
 [submodule "third_party/gbz-base"]
 	path = third_party/gbz-base
 	url = https://github.com/kokyriakidis/gbz-base.git
+[submodule "third_party/edlib"]
+	path = third_party/edlib
+	url = https://github.com/Martinsos/edlib.git
