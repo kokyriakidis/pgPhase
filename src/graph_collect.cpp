@@ -5,6 +5,7 @@
 #include "collect_pipeline.hpp"
 #include "collect_types.hpp"
 #include "collect_var.hpp"
+#include "gbz_ffi.h"
 #include "graph_bam_adapter.hpp"
 #include "graph_query.hpp"
 #include "graph_sites.hpp"
@@ -475,8 +476,9 @@ static CandidateTable graph_chunks_to_candidate_table(
 
 // Processes one batch of graph chunks in parallel (one thread pool per reg_chunk_i batch,
 // mirroring collect_chunk_batch_parallel in collect_pipeline.cpp).
-// Each worker calls query_gbz_interval_gaf for its chunk, then build_graph_bam_chunk
-// + assign_hap k-means.  Peak memory = threads × reads_per_chunk (like BAM).
+// Each worker queries overlapping reads via the gbz-base FFI (one SQLite connection
+// per thread), then build_graph_bam_chunk + assign_hap k-means.
+// Peak memory = threads × reads_per_chunk (like BAM).
 // After all workers join: populate_graph_chunk_overlaps + stitch_chunk_haps.
 static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
     const GraphSiteCatalog& catalog,
@@ -501,6 +503,51 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
 
     for (size_t w = 0; w < worker_count; ++w) {
         workers.emplace_back([&]() {
+            // Each thread opens its own GBZ + GAF database connection
+            // (SQLite requires one connection per thread).
+            char* err = nullptr;
+            void* gbz_h = pgphase_gbz_open(qconfig.gbz_db.c_str(), &err);
+            if (!gbz_h) {
+                std::string msg = err ? std::string(err) : "unknown error";
+                if (err) pgphase_gbz_free_string(err);
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!first_error)
+                    first_error = std::make_exception_ptr(
+                        std::runtime_error("failed to open GBZ: " + msg));
+                return;
+            }
+            void* gaf_h = pgphase_gaf_open(qconfig.gaf_db.c_str(), &err);
+            if (!gaf_h) {
+                std::string msg = err ? std::string(err) : "unknown error";
+                if (err) pgphase_gbz_free_string(err);
+                pgphase_gbz_close(gbz_h);
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!first_error)
+                    first_error = std::make_exception_ptr(
+                        std::runtime_error("failed to open GAF-base: " + msg));
+                return;
+            }
+            // Validate GBZ/GAF compatibility (same check the query binary does).
+            if (pgphase_gbz_gaf_validate(gbz_h, gaf_h, &err) != 0) {
+                std::string msg = err ? std::string(err) : "unknown error";
+                if (err) pgphase_gbz_free_string(err);
+                pgphase_gaf_close(gaf_h);
+                pgphase_gbz_close(gbz_h);
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!first_error)
+                    first_error = std::make_exception_ptr(
+                        std::runtime_error("GBZ/GAF-base incompatible: " + msg));
+                return;
+            }
+            // RAII cleanup for FFI handles.
+            struct HandleCleanup {
+                void* gbz; void* gaf;
+                ~HandleCleanup() {
+                    if (gaf) pgphase_gaf_close(gaf);
+                    if (gbz) pgphase_gbz_close(gbz);
+                }
+            } cleanup{gbz_h, gaf_h};
+
             try {
                 while (true) {
                     const size_t offset = next_offset.fetch_add(1);
@@ -508,7 +555,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
                     const RegionChunk& region = chunks[batch_begin + offset];
                     const std::string contig_name = header->target_name[region.tid];
 
-                    // Strip pangenome sample prefix for the query binary:
+                    // Strip pangenome sample prefix:
                     // "CHM13#0#chr20" → "chr20"; plain "chr20" stays unchanged.
                     const std::string query_contig = [&]() -> std::string {
                         auto it = fai_full_to_suffix.find(contig_name);
@@ -519,11 +566,10 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
 
                     std::vector<GraphReadAllele> chunk_rows;
                     if (!chunk_catalog.sites.empty()) {
-                        // Per-chunk indexed GAF query: only reads overlapping [beg-1, end) loaded.
-                        chunk_rows = query_gbz_interval_gaf(
-                            qconfig, ref_sample, query_contig,
+                        chunk_rows = query_gbz_interval_gaf_ffi(
+                            gbz_h, gaf_h, ref_sample, query_contig,
                             region.beg - 1, region.end,
-                            chunk_catalog);
+                            chunk_catalog, qconfig.min_mapq);
                     }
 
                     graph_chunks[offset] = build_graph_bam_chunk(
