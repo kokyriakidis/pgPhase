@@ -96,6 +96,19 @@ query_gbz_interval_gaf(const GraphQueryConfig& config,
                        hts_pos_t end,
                        const GraphSiteCatalog& catalog);
 
+// FFI-based interval query: uses pre-opened GBZ/GAF handles instead of
+// spawning a subprocess per chunk. Eliminates process spawn overhead,
+// temp file I/O, and repeated database open/close.
+std::vector<GraphReadAllele>
+query_gbz_interval_gaf_ffi(void* gbz_handle,
+                            void* gaf_handle,
+                            const std::string& sample,
+                            const std::string& contig,
+                            hts_pos_t beg,
+                            hts_pos_t end,
+                            const GraphSiteCatalog& catalog,
+                            int min_mapq);
+
 // Legacy subprocess-based collection (used for GBZ-path and gaf-db inputs).
 std::vector<GraphReadAllele>
 collect_graph_read_alleles_for_catalog(const GraphQueryConfig& config,
