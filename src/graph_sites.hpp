@@ -127,7 +127,8 @@ std::string graph_walk_to_string(const GraphWalk& walk);
 GraphWalk reverse_graph_walk(const GraphWalk& walk);
 
 int match_graph_allele_exact(const GraphWalk& read_walk,
-                             const std::vector<GraphWalk>& allele_walks);
+                             const std::vector<GraphWalk>& allele_walks,
+                             bool* reverse_out = nullptr);
 
 std::string graph_site_between_query(const GraphSite& site);
 

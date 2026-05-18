@@ -753,15 +753,23 @@ GraphWalk reverse_graph_walk(const GraphWalk& walk) {
 }
 
 int match_graph_allele_exact(const GraphWalk& read_walk,
-                             const std::vector<GraphWalk>& allele_walks) {
+                             const std::vector<GraphWalk>& allele_walks,
+                             bool* reverse_out) {
     int match = kGraphAlleleMissing;
+    bool match_reverse = false;
     const GraphWalk reverse_walk = reverse_graph_walk(read_walk);
     for (size_t allele_i = 0; allele_i < allele_walks.size(); ++allele_i) {
-        if (read_walk == allele_walks[allele_i] || reverse_walk == allele_walks[allele_i]) {
+        if (read_walk == allele_walks[allele_i]) {
             if (match != kGraphAlleleMissing) return kGraphAlleleAmbiguous;
             match = static_cast<int>(allele_i);
+            match_reverse = false;
+        } else if (reverse_walk == allele_walks[allele_i]) {
+            if (match != kGraphAlleleMissing) return kGraphAlleleAmbiguous;
+            match = static_cast<int>(allele_i);
+            match_reverse = true;
         }
     }
+    if (match >= 0 && reverse_out) *reverse_out = match_reverse;
     return match;
 }
 
