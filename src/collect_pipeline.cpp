@@ -984,7 +984,6 @@ enum LongOption {
     kShortReadsOption,
     kStrandBiasPvalOption,
     kNoisyMaxXgapsOption,
-    kMinNoisyRegTotalDepthOption,
     kMaxNoisyFracOption,
     kNoisySlideWinOption,
     kDebugSiteOption,
@@ -1106,7 +1105,6 @@ static void print_collect_help() {
         << "      --short-reads             Short-read mode: 25 bp noisy window (no ONT Fisher strand test)\n"
         << "      --strand-bias-pval FLOAT  max p-value for ONT strand filter [0.01]\n"
         << "      --noisy-max-xgaps INT     max indel len (bp) for STR/homopolymer flags [5]\n"
-        << "      --min-noisy-reg-total-depth INT   Min reads overlapping a noisy region to keep it [0 off; 5 = paper]\n"
         << "  -V, --verbose INT            Verbosity level; 2 prints longcallD-style noisy-region logs [0]\n"
         << "\n"
         << "Regions can also be supplied after <input.bam|bam.list>, e.g.\n"
@@ -1199,7 +1197,6 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"short-reads",               no_argument,       nullptr, kShortReadsOption},
         {"strand-bias-pval",          required_argument, nullptr, kStrandBiasPvalOption},
         {"noisy-max-xgaps",           required_argument, nullptr, kNoisyMaxXgapsOption},
-        {"min-noisy-reg-total-depth", required_argument, nullptr, kMinNoisyRegTotalDepthOption},
         {"verbose",                  required_argument, nullptr, 'V'},
         {"help",                      no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -1287,9 +1284,6 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kShortReadsOption:     set_read_technology(ReadTechnology::ShortReads); break;
             case kStrandBiasPvalOption: opts.strand_bias_pval = std::stod(optarg); break;
             case kNoisyMaxXgapsOption:  opts.noisy_reg_max_xgaps = std::stoi(optarg); break;
-            case kMinNoisyRegTotalDepthOption:
-                opts.min_noisy_reg_total_depth = std::stoi(optarg);
-                break;
             case 'V': opts.verbose = std::stoi(optarg); break;
             case 'h': print_collect_help(); return 0;
             default:  print_collect_help(); return 1;
@@ -1301,7 +1295,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         opts.min_sv_len < 0 || opts.min_af < 0.0 || opts.max_af < opts.min_af ||
         opts.strand_bias_pval < 0.0 || opts.strand_bias_pval > 1.0 ||
         opts.max_var_ratio_per_read < 0.0 || opts.max_noisy_frac_per_read < 0.0 ||
-        opts.noisy_reg_max_xgaps < 0 || opts.min_noisy_reg_total_depth < 0 ||
+        opts.noisy_reg_max_xgaps < 0 ||
         opts.noisy_reg_slide_win < -1 || opts.verbose < 0 ||
         opts.graph_between_limit_nodes < 1 ||
         opts.pgbam_primary_polarity_margin < 1 || opts.pgbam_primary_min_winning_threads < 1 ||
