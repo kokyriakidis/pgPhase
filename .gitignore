@@ -77,6 +77,10 @@ __pycache__/
 .claude/
 .codex
 
+# Rust / Cargo build artifacts
+src/gbz_ffi/target/
+src/gbz_ffi/Cargo.lock
+
 # OS metadata
 .DS_Store
 Thumbs.db

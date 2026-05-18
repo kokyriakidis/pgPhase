@@ -1,4 +1,5 @@
 #include "graph_query.hpp"
+#include "gbz_ffi.h"
 
 #include <array>
 #include <atomic>
@@ -20,6 +21,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include <htslib/bgzf.h>
 #include <htslib/hts.h>
 #include <htslib/kstring.h>
 #include <htslib/tbx.h>
@@ -27,6 +29,16 @@
 namespace pgphase_collect {
 
 namespace {
+
+// Detect whether a file is BGZF-compressed by checking the magic bytes.
+// Returns true for BGZF (bgzf_compression == 2), false for plain text or gzip.
+bool is_bgzf_file(const std::string& path) {
+    BGZF* fp = bgzf_open(path.c_str(), "r");
+    if (!fp) return false;
+    const int comp = bgzf_compression(fp);
+    bgzf_close(fp);
+    return comp == 2; // 2 = BGZF
+}
 
 std::string shell_quote(const std::string& value) {
     std::string out = "'";
@@ -356,13 +368,14 @@ size_t file_size_or_throw(const std::string& path) {
     return static_cast<size_t>(st.st_size);
 }
 
-size_t scan_gaf_range_compact(const std::string& gaf_file,
-                              const CompactGraphSiteIndex& compact_index,
-                              int min_mapq,
-                              size_t worker_id,
-                              size_t byte_begin,
-                              size_t byte_end,
-                              const GraphReadAlleleThreadEmitter& emit) {
+// Plain-text parallel scan: divide file by raw byte offsets.
+size_t scan_gaf_range_compact_plain(const std::string& gaf_file,
+                                    const CompactGraphSiteIndex& compact_index,
+                                    int min_mapq,
+                                    size_t worker_id,
+                                    size_t byte_begin,
+                                    size_t byte_end,
+                                    const GraphReadAlleleThreadEmitter& emit) {
     std::ifstream in(gaf_file, std::ios::binary);
     if (!in) throw std::runtime_error("failed to open GAF file: " + gaf_file);
     in.seekg(static_cast<std::streamoff>(byte_begin));
@@ -388,6 +401,100 @@ size_t scan_gaf_range_compact(const std::string& gaf_file,
 
         GafCoreFields fields;
         if (!parse_gaf_core_fields(line, fields)) continue;
+        if (fields.mapq < min_mapq) continue;
+        if (!parse_gaf_path_compact(fields.walk, read_walk) || read_walk.empty()) continue;
+
+        candidates.clear();
+        boundary_positions.clear();
+        if (++mark_stamp == 0) {
+            std::fill(site_marks.begin(), site_marks.end(), 0);
+            mark_stamp = 1;
+        }
+
+        for (size_t step_i = 0; step_i < read_walk.size(); ++step_i) {
+            const CompactHandle handle = read_walk[step_i];
+            auto site_it = compact_index.boundary_to_sites.find(handle);
+            if (site_it == compact_index.boundary_to_sites.end()) continue;
+            boundary_positions[handle].push_back(step_i);
+            for (size_t site_index : site_it->second) {
+                if (site_marks[site_index] == mark_stamp) continue;
+                site_marks[site_index] = mark_stamp;
+                candidates.push_back(site_index);
+            }
+        }
+        if (candidates.empty()) continue;
+
+        const std::string read_name(fields.read_name);
+        for (size_t compact_site_index : candidates) {
+            const CompactGraphSite& site = compact_index.sites[compact_site_index];
+            bool rev = false;
+            const int allele = match_compact_site_on_read(read_walk, boundary_positions, site, &rev);
+            if (allele < 0) continue;
+            emit(worker_id, GraphReadAllele{
+                site.site_id,
+                site.chrom,
+                site.pos,
+                read_name,
+                allele,
+                "",
+                fields.mapq,
+                rev
+            });
+            ++emitted;
+        }
+    }
+    return emitted;
+}
+
+// BGZF-aware parallel scan: divide file by compressed byte offsets.
+// Each thread opens its own BGZF handle, seeks to a compressed offset,
+// skips to the next line boundary, and reads until past its end offset.
+size_t scan_gaf_range_compact_bgzf(const std::string& gaf_file,
+                                    const CompactGraphSiteIndex& compact_index,
+                                    int min_mapq,
+                                    size_t worker_id,
+                                    size_t compressed_begin,
+                                    size_t compressed_end,
+                                    const GraphReadAlleleThreadEmitter& emit) {
+    BGZF* fp = bgzf_open(gaf_file.c_str(), "r");
+    if (!fp) throw std::runtime_error("failed to open BGZF GAF file: " + gaf_file);
+    struct BgzfCloser { BGZF* f; ~BgzfCloser() { if (f) bgzf_close(f); } } closer{fp};
+
+    // Seek to the compressed offset. The virtual offset has the compressed
+    // block offset in the upper 48 bits and the uncompressed offset within
+    // the block in the lower 16 bits.
+    if (compressed_begin > 0) {
+        const int64_t voffset = static_cast<int64_t>(compressed_begin) << 16;
+        if (bgzf_seek(fp, voffset, SEEK_SET) < 0)
+            throw std::runtime_error("bgzf_seek failed for GAF file: " + gaf_file);
+        // Skip partial first line (we may have landed mid-line).
+        kstring_t discard = {0, 0, nullptr};
+        bgzf_getline(fp, '\n', &discard);
+        free(discard.s);
+    }
+
+    size_t emitted = 0;
+    uint32_t mark_stamp = 1;
+    std::vector<uint32_t> site_marks(compact_index.sites.size(), 0);
+    std::vector<size_t> candidates;
+    std::vector<CompactHandle> read_walk;
+    std::unordered_map<CompactHandle, std::vector<size_t>> boundary_positions;
+    kstring_t ks = {0, 0, nullptr};
+    struct KsFree { kstring_t* s; ~KsFree() { free(s->s); } } ks_cleanup{&ks};
+
+    while (true) {
+        // Check compressed position against end boundary.
+        const int64_t voff = bgzf_tell(fp);
+        if (voff < 0) break;
+        const size_t compressed_pos = static_cast<size_t>(voff >> 16);
+        if (compressed_pos >= compressed_end) break;
+
+        if (bgzf_getline(fp, '\n', &ks) < 0) break;
+        const std::string_view line(ks.s, ks.l);
+        if (line.empty() || line[0] == '#') continue;
+
+        GafCoreFields fields;
+        if (!parse_gaf_core_fields_from_column(line, 0, fields)) continue;
         if (fields.mapq < min_mapq) continue;
         if (!parse_gaf_path_compact(fields.walk, read_walk) || read_walk.empty()) continue;
 
@@ -580,12 +687,17 @@ size_t scan_gaf_for_catalog_emit_string(const std::string& gaf_file,
             node_to_sites[w.back().node].push_back(i);
     }
 
-    std::ifstream in(gaf_file);
-    if (!in) throw std::runtime_error("failed to open GAF file: " + gaf_file);
+    // Use htslib to transparently handle both plain text and BGZF-compressed GAF.
+    htsFile* fp = hts_open(gaf_file.c_str(), "r");
+    if (!fp) throw std::runtime_error("failed to open GAF file: " + gaf_file);
+    struct HtsCloser { htsFile* f; ~HtsCloser() { if (f) hts_close(f); } } closer{fp};
+
+    kstring_t ks = {0, 0, nullptr};
+    struct KsFree { kstring_t* s; ~KsFree() { free(s->s); } } ks_cleanup{&ks};
 
     size_t emitted = 0;
-    std::string line;
-    while (std::getline(in, line)) {
+    while (hts_getline(fp, '\n', &ks) >= 0) {
+        const std::string line(ks.s, ks.l);
         if (line.empty() || line[0] == '#') continue;
 
         GafCoreFields fields;
@@ -678,10 +790,17 @@ size_t scan_gaf_for_catalog_emit_parallel_impl(
 
     const size_t file_size = file_size_or_throw(gaf_file);
     if (file_size == 0) return 0;
+
+    const bool bgzf = is_bgzf_file(gaf_file);
     const size_t worker_count = std::max<size_t>(1, std::min<size_t>(threads, file_size));
     if (worker_count == 1) {
-        return scan_gaf_range_compact(gaf_file, compact_index, min_mapq,
-                                      0, 0, file_size, emit);
+        if (bgzf) {
+            return scan_gaf_range_compact_bgzf(gaf_file, compact_index, min_mapq,
+                                                0, 0, file_size, emit);
+        } else {
+            return scan_gaf_range_compact_plain(gaf_file, compact_index, min_mapq,
+                                                0, 0, file_size, emit);
+        }
     }
 
     std::atomic<size_t> emitted_total{0};
@@ -690,14 +809,23 @@ size_t scan_gaf_for_catalog_emit_parallel_impl(
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
     for (size_t worker = 0; worker < worker_count; ++worker) {
+        // For BGZF: divide by compressed file size (each thread seeks to a
+        // compressed block boundary). For plain text: divide by raw bytes.
         const size_t beg = (file_size * worker) / worker_count;
         const size_t end = (file_size * (worker + 1)) / worker_count;
-        workers.emplace_back([&, worker, beg, end]() {
+        workers.emplace_back([&, worker, beg, end, bgzf]() {
             try {
-                emitted_total.fetch_add(
-                    scan_gaf_range_compact(gaf_file, compact_index, min_mapq,
-                                           worker, beg, end, emit),
-                    std::memory_order_relaxed);
+                if (bgzf) {
+                    emitted_total.fetch_add(
+                        scan_gaf_range_compact_bgzf(gaf_file, compact_index, min_mapq,
+                                                     worker, beg, end, emit),
+                        std::memory_order_relaxed);
+                } else {
+                    emitted_total.fetch_add(
+                        scan_gaf_range_compact_plain(gaf_file, compact_index, min_mapq,
+                                                      worker, beg, end, emit),
+                        std::memory_order_relaxed);
+                }
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);
                 if (!first_error) first_error = std::current_exception();
@@ -859,6 +987,127 @@ query_gbz_interval_gaf(const GraphQueryConfig& config,
     (void)run_command_capture_stdout(cmd.str());
 
     return scan_gaf_for_catalog(gaf_out, catalog, config.min_mapq);
+}
+
+// ── FFI-based interval query (structured, no GAF text) ────────────────────
+
+namespace {
+
+// Convert a GBWT node handle to a GraphWalkStep.
+// GBWT encoding: handle = 2 * node_id + orientation (Forward=0, Reverse=1).
+inline GraphWalkStep gbwt_handle_to_step(uint64_t handle) {
+    return GraphWalkStep{std::to_string(handle / 2), (handle & 1) != 0};
+}
+
+// Context for the structured alignment callback.
+struct StructuredQueryContext {
+    const std::unordered_map<std::string, std::vector<size_t>>* node_to_sites;
+    const GraphSiteCatalog* catalog;
+    int min_mapq;
+    std::vector<GraphReadAllele>* results;
+};
+
+extern "C" void structured_alignment_callback(
+    const unsigned char* name, size_t name_len,
+    const uint64_t* nodes, size_t node_count,
+    int mapq, void* user_data)
+{
+    auto* ctx = static_cast<StructuredQueryContext*>(user_data);
+    if (mapq < ctx->min_mapq) return;
+    if (node_count == 0) return;
+
+    // Build GraphWalk from GBWT handles.
+    GraphWalk read_walk;
+    read_walk.reserve(node_count);
+    for (size_t i = 0; i < node_count; ++i)
+        read_walk.push_back(gbwt_handle_to_step(nodes[i]));
+
+    // Find candidate sites whose boundary node appears in this walk.
+    std::unordered_set<size_t> candidates;
+    for (const GraphWalkStep& step : read_walk) {
+        auto it = ctx->node_to_sites->find(step.node);
+        if (it == ctx->node_to_sites->end()) continue;
+        for (size_t si : it->second) candidates.insert(si);
+    }
+    if (candidates.empty()) return;
+
+    const std::string read_name(reinterpret_cast<const char*>(name), name_len);
+
+    for (size_t si : candidates) {
+        const GraphSite& site = ctx->catalog->sites[si];
+        const GraphWalkStep& left_bnd  = site.allele_walks[0].front();
+        const GraphWalkStep& right_bnd = site.allele_walks[0].back();
+
+        const GraphWalk subwalk = extract_subwalk_between(read_walk, left_bnd, right_bnd);
+        if (subwalk.empty()) continue;
+
+        bool rev = false;
+        const int allele = match_graph_allele_exact(subwalk, site.allele_walks, &rev);
+        if (allele < 0) continue;
+
+        ctx->results->push_back(GraphReadAllele{
+            graph_site_key_str(site, si),
+            site.ref_contig.empty() ? site.chrom : site.ref_contig,
+            site.pos,
+            read_name,
+            allele,
+            graph_walk_to_string(subwalk),
+            mapq,
+            rev
+        });
+    }
+}
+
+} // namespace
+
+std::vector<GraphReadAllele>
+query_gbz_interval_gaf_ffi(void* gbz_handle,
+                            void* gaf_handle,
+                            const std::string& sample,
+                            const std::string& contig,
+                            hts_pos_t beg,
+                            hts_pos_t end,
+                            const GraphSiteCatalog& catalog,
+                            int min_mapq)
+{
+    if (!gbz_handle) throw std::runtime_error("null GBZ handle for FFI query");
+    if (!gaf_handle) throw std::runtime_error("null GAF handle for FFI query");
+    if (contig.empty() || end <= beg)
+        throw std::runtime_error("invalid interval for graph query: " + contig +
+                                 ":" + std::to_string(beg) + ".." + std::to_string(end));
+
+    // Build boundary-node index for catalog matching.
+    std::unordered_map<std::string, std::vector<size_t>> node_to_sites;
+    for (size_t i = 0; i < catalog.sites.size(); ++i) {
+        const GraphSite& site = catalog.sites[i];
+        if (!graph_site_is_queryable(site)) continue;
+        const GraphWalk& w = site.allele_walks[0];
+        if (w.size() < 2) continue;
+        node_to_sites[w.front().node].push_back(i);
+        if (w.back().node != w.front().node)
+            node_to_sites[w.back().node].push_back(i);
+    }
+
+    std::vector<GraphReadAllele> results;
+    StructuredQueryContext ctx{&node_to_sites, &catalog, min_mapq, &results};
+
+    char* err = nullptr;
+    const int rc = pgphase_gbz_query_interval_structured(
+        gbz_handle, gaf_handle,
+        sample.empty() ? nullptr : sample.c_str(),
+        contig.c_str(),
+        static_cast<uint64_t>(beg),
+        static_cast<uint64_t>(end),
+        structured_alignment_callback,
+        &ctx,
+        &err);
+    if (rc != 0) {
+        std::string msg = err ? std::string(err) : "unknown FFI error";
+        if (err) pgphase_gbz_free_string(err);
+        throw std::runtime_error("gbz_query_interval failed: " + msg);
+    }
+
+    return results;
 }
 
 std::vector<GraphReadAllele>

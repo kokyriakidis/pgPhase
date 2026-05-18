@@ -28,6 +28,11 @@ ALIGN_CPPFLAGS = $(WFA_CPPFLAGS) $(AB_CPPFLAGS) $(EDLIB_CPPFLAGS)
 WFA2_LIB = $(WFA2_ROOT)/lib/libwfa.a
 ABPOA_LIB = $(ABPOA_ROOT)/lib/libabpoa.a
 
+GBZ_FFI_DIR = src/gbz_ffi
+GBZ_FFI_LIB = $(GBZ_FFI_DIR)/target/release/libpgphase_gbz_ffi.a
+# System libraries required by the Rust static library (SQLite is bundled).
+GBZ_FFI_SYSLIBS = -ldl -lrt
+
 SOURCES_CXX = src/main.cpp \
 	src/collect_pipeline.cpp \
 	src/build_catalog.cpp \
@@ -100,8 +105,11 @@ $(ABPOA_LIB):
 $(EDLIB_OBJ): $(EDLIB_ROOT)/src/edlib.cpp
 	$(CXX) $(CXXFLAGS) $(EDLIB_CPPFLAGS) -c $< -o $@
 
-pgphase: $(OBJS) $(WFA2_LIB) $(ABPOA_LIB)
-	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
+$(GBZ_FFI_LIB): $(wildcard $(GBZ_FFI_DIR)/lib.rs $(GBZ_FFI_DIR)/Cargo.toml)
+	cd $(GBZ_FFI_DIR) && RUSTC=$(CARGO_RUSTC) $(CARGO) build --release
+
+pgphase: $(OBJS) $(WFA2_LIB) $(ABPOA_LIB) $(GBZ_FFI_LIB)
+	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(WFA2_LIB) $(ABPOA_LIB) $(GBZ_FFI_LIB) $(LDFLAGS) $(GBZ_FFI_SYSLIBS)
 
 test_phase_block_stitch: src/test_phase_block_stitch.cpp src/collect_phase.o src/collect_phase_pgbam.o src/collect_phase_noisy.o src/collect_output.o src/collect_var.o src/align.o src/cgranges.o src/kalloc.o src/sdust.o $(EDLIB_OBJ) $(WFA2_LIB) $(ABPOA_LIB)
 	$(CXX) $(CXXFLAGS) -o $@ $< src/collect_phase.o src/collect_phase_pgbam.o src/collect_phase_noisy.o src/collect_output.o src/collect_var.o src/align.o src/cgranges.o src/kalloc.o src/sdust.o $(EDLIB_OBJ) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
@@ -109,8 +117,8 @@ test_phase_block_stitch: src/test_phase_block_stitch.cpp src/collect_phase.o src
 test_graph_sites: src/test_graph_sites.cpp src/graph_sites.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-test_graph_bam_adapter: src/test_graph_bam_adapter.cpp src/graph_bam_adapter.o src/graph_sites.o src/graph_query.o src/collect_phase.o src/collect_phase_pgbam.o src/collect_output.o
-	$(CXX) $(CXXFLAGS) -o $@ $^ src/cgranges.o src/kalloc.o $(LDFLAGS)
+test_graph_bam_adapter: src/test_graph_bam_adapter.cpp src/graph_bam_adapter.o src/graph_sites.o src/graph_query.o src/collect_phase.o src/collect_phase_pgbam.o src/collect_output.o $(GBZ_FFI_LIB)
+	$(CXX) $(CXXFLAGS) -o $@ $^ src/cgranges.o src/kalloc.o $(LDFLAGS) $(GBZ_FFI_SYSLIBS)
 
 clean:
 	rm -f pgphase test_phase_block_stitch test_graph_sites test_graph_bam_adapter src/*.o src/*.d
