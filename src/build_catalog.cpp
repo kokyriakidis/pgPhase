@@ -27,8 +27,8 @@ void print_help(const char* prog) {
         << "Usage: " << prog << " build-snarl-catalog [options] <graph.gbz>\n"
         << "\n"
         << "Run 'vg deconstruct -a' on a GBZ pangenome graph and write a bgzipped,\n"
-        << "tabix-indexed VCF that serves as the phasing site catalog.\n"
-        << "Use the output directly with 'phase-graph --graph-sites-vcf'.\n"
+        << "tabix-indexed sites-only VCF (no sample genotypes) for use as a\n"
+        << "phasing site catalog with 'collect-graph-variation'.\n"
         << "\n"
         << "  <graph.gbz> may be the full pangenome GBZ or a per-chr chunk extracted\n"
         << "  with 'vg chunk --gbz --contig CHR -x full.gbz -o /tmp/chunk'.\n"
@@ -58,7 +58,13 @@ void print_help(const char* prog) {
         << "  wait\n"
         << "\n"
         << "  # Run phasing\n"
-        << "  pgphase phase-graph --graph-sites-vcf chr20.sites.vcf.gz ...\n";
+        << "  pgphase collect-graph-variation \\\n"
+        << "      --ref ref.fa \\\n"
+        << "      --sites chr20.sites.vcf.gz \\\n"
+        << "      --gaf reads.gaf \\\n"
+        << "      --phased-vcf-out phased.vcf \\\n"
+        << "      --phased-bam-out phased.bam \\\n"
+        << "      -t 8\n";
 }
 
 } // namespace
@@ -125,8 +131,15 @@ int build_snarl_catalog(int argc, char* argv[]) {
         deconstruct_cmd << " -r " << bc_shell_quote(snarls_file);
     deconstruct_cmd << " " << bc_shell_quote(gbz_file);
 
+    // Strip FORMAT/SAMPLE columns (fields 9+) — pgphase only reads
+    // CHROM..INFO (fields 1-8).  Keep ##header lines intact; rewrite
+    // the #CHROM header line to drop FORMAT and sample names.
+    const std::string strip_samples =
+        "awk -F'\\t' 'BEGIN{OFS=\"\\t\"} /^##/{print;next} "
+        "{for(i=9;i<=NF;i++) $i=\"\"; sub(/\\t*$/,\"\"); print}'";
+
     const std::string full_cmd =
-        deconstruct_cmd.str() + " | bgzip -c > " + bc_shell_quote(output_file);
+        deconstruct_cmd.str() + " | " + strip_samples + " | bgzip -c > " + bc_shell_quote(output_file);
     std::cerr << "[build-snarl-catalog] " << full_cmd << "\n";
     int ret = std::system(full_cmd.c_str());
 
