@@ -306,12 +306,15 @@ int phase_graph(int argc, char* argv[]) {
     }
 
     try {
+        const ReadTechnology tech = opts.ont ? ReadTechnology::Ont : ReadTechnology::Hifi;
+
         pgphase_collect::Options filter_opts;
         filter_opts.verbose = opts.verbose;
         filter_opts.touch_read_phase = true;
+        filter_opts.read_technology = tech;
 
         Options phase_opts;
-        phase_opts.read_technology = opts.ont ? ReadTechnology::Ont : ReadTechnology::Hifi;
+        phase_opts.read_technology = tech;
         phase_opts.output_aln = "graph";
         phase_opts.verbose = opts.verbose;
 

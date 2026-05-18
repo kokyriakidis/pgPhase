@@ -2,6 +2,7 @@
 
 #include "collect_output.hpp"
 #include "collect_phase.hpp"
+#include "fisher_exact.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -178,6 +179,60 @@ void merge_phase_read_assignment(PhaseReadOutputRow& row,
     row.hap                   = hap;
     row.phase_set             = phase_set;
     row.has_phased_assignment = ((hap == 1 || hap == 2) && phase_set >= 0);
+}
+
+// Classify graph candidates using count-based rules matching the BAM pipeline's
+// classify_variant_initial (collect_var.cpp), minus reference-sequence-dependent
+// checks (homopolymer/repeat detection).  Runs in a single pass over candidates.
+void classify_graph_candidates(BamChunk& chunk, const Options& opts) {
+    for (auto& cand : chunk.candidates) {
+        VariantCounts& c = cand.counts;
+
+        // Low coverage / low alt depth.
+        if (c.total_cov < opts.min_depth || c.alt_cov < opts.min_alt_depth) {
+            c.category = VariantCategory::LowCoverage;
+            c.candvarcate_initial = VariantCategory::LowCoverage;
+            cand.lcd_var_i_to_cate = category_to_flag(VariantCategory::LowCoverage);
+            continue;
+        }
+
+        // ONT strand-bias filter (Fisher exact test on alt forward vs reverse).
+        if (opts.is_ont()) {
+            const int fa = c.forward_alt;
+            const int ra = c.reverse_alt;
+            const int expected = (fa + ra) / 2;
+            if (expected > 0) {
+                const double p = fisher_exact_two_tail(fa, ra, expected, expected);
+                if (p < opts.strand_bias_pval) {
+                    c.category = VariantCategory::StrandBias;
+                    c.candvarcate_initial = VariantCategory::StrandBias;
+                    cand.lcd_var_i_to_cate = category_to_flag(VariantCategory::StrandBias);
+                    continue;
+                }
+            }
+        }
+
+        // Low allele fraction → folded to LowCoverage (matches BAM pipeline pass 2).
+        if (c.allele_fraction < opts.min_af) {
+            c.category = VariantCategory::LowCoverage;
+            c.candvarcate_initial = VariantCategory::LowAlleleFraction;
+            cand.lcd_var_i_to_cate = category_to_flag(VariantCategory::LowCoverage);
+            continue;
+        }
+
+        // Homozygous (high AF).
+        if (c.allele_fraction > opts.max_af) {
+            c.category = VariantCategory::CleanHom;
+            c.candvarcate_initial = VariantCategory::CleanHom;
+            cand.lcd_var_i_to_cate = category_to_flag(VariantCategory::CleanHom);
+            continue;
+        }
+
+        // Surviving het — CleanHetSnp (graph sites are snarl bubbles, not typed as SNP/indel).
+        c.category = VariantCategory::CleanHetSnp;
+        c.candvarcate_initial = VariantCategory::CleanHetSnp;
+        cand.lcd_var_i_to_cate = kCandCleanHetSnp;
+    }
 }
 
 } // namespace
@@ -606,6 +661,7 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     out.chunk.haps.assign(out.chunk.reads.size(), 0);
     out.chunk.phase_sets.assign(out.chunk.reads.size(), -1);
     rebuild_read_var_cr(out.chunk);
+    classify_graph_candidates(out.chunk, opts);
     out.site_allele_orig_idx = std::move(allele_orig_idx);
 
     constexpr size_t kNoPhase1 = std::numeric_limits<size_t>::max();
