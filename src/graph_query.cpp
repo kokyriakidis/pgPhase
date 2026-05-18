@@ -40,6 +40,41 @@ bool is_bgzf_file(const std::string& path) {
     return comp == 2; // 2 = BGZF
 }
 
+// Build an index of BGZF block compressed offsets by reading block headers
+// sequentially.  Each entry is the compressed file offset where a BGZF block
+// starts.  This is a fast linear scan — only the 18-byte header of each block
+// is read, no decompression occurs.
+//
+// BGZF block header layout (RFC 1952 + SAM spec §4.1):
+//   bytes 0-9:   gzip header (ID1=0x1f, ID2=0x8b, ... )
+//   bytes 10-11: XLEN (little-endian, must be >= 6)
+//   bytes 12-13: SI1='B'(0x42), SI2='C'(0x43)
+//   bytes 14-15: SLEN = 2
+//   bytes 16-17: BSIZE (little-endian) = total block size - 1
+std::vector<int64_t> build_bgzf_block_index(const std::string& path) {
+    std::vector<int64_t> offsets;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) throw std::runtime_error("cannot open BGZF file: " + path);
+    struct FCloser { FILE* f; ~FCloser() { if (f) fclose(f); } } closer{f};
+
+    uint8_t hdr[18];
+    int64_t pos = 0;
+    while (true) {
+        if (fread(hdr, 1, 18, f) != 18) break;
+        // Validate BGZF magic: ID1, ID2, and BC subfield.
+        if (hdr[0] != 0x1f || hdr[1] != 0x8b || hdr[12] != 'B' || hdr[13] != 'C')
+            break;
+        const uint16_t bsize = static_cast<uint16_t>(hdr[16]) |
+                               (static_cast<uint16_t>(hdr[17]) << 8);
+        const int64_t block_size = static_cast<int64_t>(bsize) + 1;
+        offsets.push_back(pos);
+        pos += block_size;
+        // Seek past the rest of this block (we already read 18 bytes of it).
+        if (fseeko(f, pos, SEEK_SET) != 0) break;
+    }
+    return offsets;
+}
+
 std::string shell_quote(const std::string& value) {
     std::string out = "'";
     for (char c : value) {
@@ -446,28 +481,26 @@ size_t scan_gaf_range_compact_plain(const std::string& gaf_file,
     return emitted;
 }
 
-// BGZF-aware parallel scan: divide file by compressed byte offsets.
-// Each thread opens its own BGZF handle, seeks to a compressed offset,
-// skips to the next line boundary, and reads until past its end offset.
+// BGZF-aware scan over a range defined by virtual offsets (block-aligned).
+// voff_begin/voff_end are htslib virtual offsets: (block_compressed_offset << 16).
+// For the first worker (voff_begin == 0) no line is skipped; otherwise the
+// first partial line is discarded to avoid double-counting at boundaries.
 size_t scan_gaf_range_compact_bgzf(const std::string& gaf_file,
                                     const CompactGraphSiteIndex& compact_index,
                                     int min_mapq,
                                     size_t worker_id,
-                                    size_t compressed_begin,
-                                    size_t compressed_end,
+                                    int64_t voff_begin,
+                                    int64_t voff_end,
                                     const GraphReadAlleleThreadEmitter& emit) {
     BGZF* fp = bgzf_open(gaf_file.c_str(), "r");
     if (!fp) throw std::runtime_error("failed to open BGZF GAF file: " + gaf_file);
     struct BgzfCloser { BGZF* f; ~BgzfCloser() { if (f) bgzf_close(f); } } closer{fp};
 
-    // Seek to the compressed offset. The virtual offset has the compressed
-    // block offset in the upper 48 bits and the uncompressed offset within
-    // the block in the lower 16 bits.
-    if (compressed_begin > 0) {
-        const int64_t voffset = static_cast<int64_t>(compressed_begin) << 16;
-        if (bgzf_seek(fp, voffset, SEEK_SET) < 0)
+    if (voff_begin > 0) {
+        if (bgzf_seek(fp, voff_begin, SEEK_SET) < 0)
             throw std::runtime_error("bgzf_seek failed for GAF file: " + gaf_file);
-        // Skip partial first line (we may have landed mid-line).
+        // Skip partial first line (we landed at a block boundary, not
+        // necessarily a line boundary).
         kstring_t discard = {0, 0, nullptr};
         bgzf_getline(fp, '\n', &discard);
         free(discard.s);
@@ -483,11 +516,10 @@ size_t scan_gaf_range_compact_bgzf(const std::string& gaf_file,
     struct KsFree { kstring_t* s; ~KsFree() { free(s->s); } } ks_cleanup{&ks};
 
     while (true) {
-        // Check compressed position against end boundary.
+        // Check current virtual offset against end boundary.
         const int64_t voff = bgzf_tell(fp);
         if (voff < 0) break;
-        const size_t compressed_pos = static_cast<size_t>(voff >> 16);
-        if (compressed_pos >= compressed_end) break;
+        if (voff_end > 0 && voff >= voff_end) break;
 
         if (bgzf_getline(fp, '\n', &ks) < 0) break;
         const std::string_view line(ks.s, ks.l);
@@ -791,16 +823,57 @@ size_t scan_gaf_for_catalog_emit_parallel_impl(
     const size_t file_size = file_size_or_throw(gaf_file);
     if (file_size == 0) return 0;
 
-    const bool bgzf = is_bgzf_file(gaf_file);
+    const bool is_bgzf = is_bgzf_file(gaf_file);
+
+    if (is_bgzf) {
+        // Build a block index (fast sequential scan of block headers, no
+        // decompression) so we can split at valid BGZF block boundaries.
+        const std::vector<int64_t> block_offsets = build_bgzf_block_index(gaf_file);
+        const size_t n_blocks = block_offsets.size();
+        if (n_blocks == 0) return 0;
+
+        const size_t worker_count = std::max<size_t>(1, std::min<size_t>(threads, n_blocks));
+        if (worker_count == 1) {
+            return scan_gaf_range_compact_bgzf(gaf_file, compact_index, min_mapq,
+                                                0, 0, -1, emit);
+        }
+
+        std::atomic<size_t> emitted_total{0};
+        std::exception_ptr first_error;
+        std::mutex error_mutex;
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (size_t w = 0; w < worker_count; ++w) {
+            // Split blocks evenly across workers.
+            const size_t blk_beg = (n_blocks * w) / worker_count;
+            const size_t blk_end = (n_blocks * (w + 1)) / worker_count;
+            // Virtual offsets: block compressed offset << 16, intra-block offset 0.
+            const int64_t voff_beg = block_offsets[blk_beg] << 16;
+            const int64_t voff_end = (blk_end < n_blocks)
+                                         ? (block_offsets[blk_end] << 16)
+                                         : static_cast<int64_t>(-1);
+            workers.emplace_back([&, w, voff_beg, voff_end]() {
+                try {
+                    emitted_total.fetch_add(
+                        scan_gaf_range_compact_bgzf(gaf_file, compact_index, min_mapq,
+                                                     w, voff_beg, voff_end, emit),
+                        std::memory_order_relaxed);
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(error_mutex);
+                    if (!first_error) first_error = std::current_exception();
+                }
+            });
+        }
+        for (std::thread& t : workers) t.join();
+        if (first_error) std::rethrow_exception(first_error);
+        return emitted_total.load(std::memory_order_relaxed);
+    }
+
+    // Plain text: split by raw byte offset.
     const size_t worker_count = std::max<size_t>(1, std::min<size_t>(threads, file_size));
     if (worker_count == 1) {
-        if (bgzf) {
-            return scan_gaf_range_compact_bgzf(gaf_file, compact_index, min_mapq,
-                                                0, 0, file_size, emit);
-        } else {
-            return scan_gaf_range_compact_plain(gaf_file, compact_index, min_mapq,
-                                                0, 0, file_size, emit);
-        }
+        return scan_gaf_range_compact_plain(gaf_file, compact_index, min_mapq,
+                                            0, 0, file_size, emit);
     }
 
     std::atomic<size_t> emitted_total{0};
@@ -809,23 +882,14 @@ size_t scan_gaf_for_catalog_emit_parallel_impl(
     std::vector<std::thread> workers;
     workers.reserve(worker_count);
     for (size_t worker = 0; worker < worker_count; ++worker) {
-        // For BGZF: divide by compressed file size (each thread seeks to a
-        // compressed block boundary). For plain text: divide by raw bytes.
         const size_t beg = (file_size * worker) / worker_count;
         const size_t end = (file_size * (worker + 1)) / worker_count;
-        workers.emplace_back([&, worker, beg, end, bgzf]() {
+        workers.emplace_back([&, worker, beg, end]() {
             try {
-                if (bgzf) {
-                    emitted_total.fetch_add(
-                        scan_gaf_range_compact_bgzf(gaf_file, compact_index, min_mapq,
-                                                     worker, beg, end, emit),
-                        std::memory_order_relaxed);
-                } else {
-                    emitted_total.fetch_add(
-                        scan_gaf_range_compact_plain(gaf_file, compact_index, min_mapq,
-                                                      worker, beg, end, emit),
-                        std::memory_order_relaxed);
-                }
+                emitted_total.fetch_add(
+                    scan_gaf_range_compact_plain(gaf_file, compact_index, min_mapq,
+                                                  worker, beg, end, emit),
+                    std::memory_order_relaxed);
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);
                 if (!first_error) first_error = std::current_exception();
