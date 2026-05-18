@@ -1,63 +1,183 @@
 # pgphase
 
-## Portable binary bundle (Linux/macOS)
+Variant calling and haplotype phasing for long reads, with two pipelines:
 
-Build a self-contained runtime bundle (binary + copied shared libraries + launcher):
+- **`collect-bam-variation`** — call and phase SNPs/indels from BAM/CRAM alignments (HiFi, ONT, short reads).
+- **`collect-graph-variation`** — call and phase variants from a pangenome graph (GBZ + GAF).
+- **`build-snarl-catalog`** — preprocess a GBZ pangenome graph into a phasing site catalog VCF for `collect-graph-variation`.
+
+## Prerequisites
+
+- C++17 compiler (GCC ≥ 8 or Clang ≥ 7)
+- [htslib](https://github.com/samtools/htslib) (development headers and library)
+- zlib, pthreads
+- Rust toolchain (for the `gbz-base` graph query tools; install via [rustup](https://rustup.rs/))
+- [vg](https://github.com/vgteam/vg) (only needed for `build-snarl-catalog`)
+- [samtools](https://github.com/samtools/samtools) (optional; needed for `--refine-aln` coordinate sorting)
+
+## Building
+
+```bash
+git clone --recursive https://github.com/kokyriakidis/pgphase.git
+cd pgphase
+
+# Build third-party libraries (WFA2, abPOA)
+make third-party-libs
+
+# Build the gbz-base Rust tools (query, gaf2db, gbz2db)
+make gbz-base
+
+# Build pgphase
+make -j$(nproc)
+```
+
+To build a portable self-contained bundle (binary + shared libraries + launcher):
 
 ```bash
 make portable-bundle
+# Output: dist/pgphase-<os>-<arch>/
 ```
 
-Create a release artifact (build + checks + portable bundle + tarball):
+## Quick start
+
+### BAM pipeline (HiFi)
 
 ```bash
+pgphase collect-bam-variation \
+    --ref ref.fa \
+    --bam hifi.bam \
+    --hifi \
+    --phased-vcf-out phased.vcf \
+    -o candidates.tsv \
+    -t 8
+```
+
+### BAM pipeline (ONT)
+
+```bash
+pgphase collect-bam-variation \
+    --ref ref.fa \
+    --bam ont.bam \
+    --ont \
+    --phased-vcf-out phased.vcf \
+    -o candidates.tsv \
+    -t 16
+```
+
+### Graph pipeline
+
+1. Build a site catalog from a pangenome GBZ:
+
+```bash
+# Precompute snarls once
+vg snarls -t 16 full.gbz > full.snarls.pb
+
+# Build per-chromosome catalog VCFs
+for chr in chr{1..22} chrX chrY; do
+    vg chunk --gbz --contig $chr -x full.gbz -o /tmp/chunk_${chr}
+    pgphase build-snarl-catalog \
+        --ref-sample CHM13 \
+        --contig $chr \
+        --snarls full.snarls.pb \
+        --threads 8 \
+        -o ${chr}.sites.vcf.gz \
+        /tmp/chunk_${chr}_graph_0_${chr}.gbz &
+done
+wait
+```
+
+2. Run graph-based phasing:
+
+```bash
+pgphase collect-graph-variation \
+    --ref ref.fa \
+    --sites chr20.sites.vcf.gz \
+    --gaf reads.gaf \
+    --phased-vcf-out phased.vcf \
+    --phased-bam-out phased.bam \
+    -t 8
+```
+
+The sites VCF must be bgzip-compressed with a tabix index (`.tbi` or `.csi`).
+
+## Subcommands
+
+### `collect-bam-variation`
+
+Collects SNP/indel candidates from BAM/CRAM alignments and phases them using k-means clustering on read haplotype support.
+
+Key options:
+
+| Option | Description | Default |
+|---|---|---|
+| `--ref FILE` | Reference FASTA (indexed) | required |
+| `--bam FILE` | Input BAM/CRAM | required |
+| `--hifi` / `--ont` / `--short-reads` | Read technology mode | `--hifi` |
+| `-t INT` | Worker threads | 1 |
+| `-o FILE` | Candidate TSV output | `output.tsv` |
+| `--phased-vcf-out FILE` | Phased VCF (GT:DP:AD:VAF:GQ:PS) | — |
+| `--out-bam FILE` | Phased BAM with HP/PS tags | — |
+| `-r STR` | Restrict to region (repeatable) | whole genome |
+| `--autosome` | Process chr1–22 only | off |
+| `-q INT` | Minimum mapping quality | 30 |
+| `-D INT` | Minimum depth | 5 |
+| `--min-af FLOAT` | Minimum allele fraction | 0.20 |
+| `--pgbam-file FILE` | `.pgbam` sidecar for chunk stitching | — |
+
+Run `pgphase collect-bam-variation --help` for the full option list.
+
+### `collect-graph-variation`
+
+Collects and phases variants using a pangenome graph site catalog and GAF read alignments.
+
+| Option | Description | Default |
+|---|---|---|
+| `--ref FILE` | Reference FASTA (indexed) | required |
+| `--sites FILE` | Sites VCF (bgzipped + tabix-indexed) | required |
+| `--gaf FILE` | Raw GAF alignments | — |
+| `--gbz-db FILE` | GBZ graph database | — |
+| `--gaf-db FILE` | GAF-base read alignment database | — |
+| `--phased-vcf-out FILE` | Phased VCF | — |
+| `--phased-bam-out FILE` | Unaligned BAM with HP/PS tags | — |
+| `-t INT` | Worker threads | 1 |
+
+Provide either `--gaf` (builds an observation index on the fly) or `--gbz-db` + `--gaf-db`.
+
+### `build-snarl-catalog`
+
+Runs `vg deconstruct -a` on a GBZ graph and produces a bgzipped, tabix-indexed sites-only VCF for use with `collect-graph-variation`.
+
+| Option | Description | Default |
+|---|---|---|
+| `--ref-sample STR` | Reference sample name (e.g. `CHM13`) | required |
+| `--contig STR` | Process one contig (recommended) | all |
+| `-o FILE` | Output bgzipped VCF | required |
+| `--snarls FILE` | Pre-built snarls file | recomputed |
+| `--vg-bin PATH` | Path to `vg` binary | `vg` |
+| `-t INT` | Threads for `vg deconstruct` | 4 |
+
+## Testing
+
+```bash
+# Run validation gates (requires test_data/)
+make check
+
+# Run unit tests
+make unit-tests
+```
+
+## Release
+
+```bash
+# Build + portable bundle + tarball
 make release
-```
 
-Strict variant (fails if validation checks fail):
-
-```bash
+# Strict mode: fails if output differs from golden fixtures
 make release-strict
 ```
 
-`release-strict` uses fixture golden outputs:
+Output: `dist/pgphase-<os>-<arch>.tar.gz`
 
-```text
-test_data/expected/hifi_collect_expected.tsv
-test_data/expected/hifi_collect_expected.phased.vcf
-test_data/expected/ont_collect_expected.tsv
-test_data/expected/ont_collect_expected.phased.vcf
-```
+## License
 
-Regenerate goldens (for intentional baseline updates):
-
-```bash
-./pgphase collect-bam-variation -t 1 --hifi --include-filtered test_data/chr11_2M.fa test_data/HG002_chr11_hifi_test.bam -o test_data/expected/hifi_collect_expected.tsv
-./pgphase collect-bam-variation -t 1 --ont  --include-filtered test_data/chr11_2M.fa test_data/HG002_chr11_ont_test.bam  -o test_data/expected/ont_collect_expected.tsv
-./pgphase collect-bam-variation -t 1 --hifi --include-filtered test_data/chr11_2M.fa test_data/HG002_chr11_hifi_test.bam -o test_data/expected/hifi_collect_expected.tsv --phased-vcf-output test_data/expected/hifi_collect_expected.phased.vcf
-./pgphase collect-bam-variation -t 1 --ont  --include-filtered test_data/chr11_2M.fa test_data/HG002_chr11_ont_test.bam  -o test_data/expected/ont_collect_expected.tsv  --phased-vcf-output test_data/expected/ont_collect_expected.phased.vcf
-```
-
-Output directory:
-
-```text
-dist/pgphase-<os>-<arch>/
-  bin/pgphase
-  bin/pgphase-portable
-  lib/*.(so|dylib)*
-  README.portable.txt
-dist/pgphase-<os>-<arch>.tar.gz
-```
-
-Run:
-
-```bash
-./dist/pgphase-<os>-<arch>/bin/pgphase-portable --help
-```
-
-Notes:
-
-- Linux bundle portability depends on compatible CPU/kernel/glibc ABI.
-- macOS bundle portability depends on compatible CPU architecture/runtime ABI.
-- Build separate bundles for `arm64` and `x86_64` macOS targets when needed.
-- When `samtools` is on `PATH` during `make portable-bundle` / `make release`, its binary (and shared libs) are copied into `bin/` so `--refine-aln` coordinate-sort works without a separate install. Override with `SAMTOOLS=/path/to/samtools` if needed.
+See repository for license details.

@@ -362,56 +362,31 @@ GraphSiteCatalog load_graph_site_catalog_from_vcf(
 {
     GraphSiteCatalog catalog;
 
-    auto passes_any_filter = [&](const std::string& chrom, hts_pos_t pos) -> bool {
-        for (const RegionFilter& f : filters) {
-            if (!f.enabled) continue;
-            if (!chrom_names_match_vcf(f.chrom, chrom)) continue;
-            if (pos < f.beg) continue;
-            if (f.end >= 0 && pos > f.end) continue;
-            return true;
-        }
-        return false;
-    };
-
     bool has_filters = false;
     for (const RegionFilter& f : filters) {
         if (f.enabled) { has_filters = true; break; }
     }
 
+    struct TbxDeleter { void operator()(tbx_t* p) const { tbx_destroy(p); } };
+    struct HtsFileDeleter { void operator()(htsFile* p) const { hts_close(p); } };
+
     if (has_filters) {
-        struct TbxDeleter { void operator()(tbx_t* p) const { tbx_destroy(p); } };
-        struct HtsFileDeleter { void operator()(htsFile* p) const { hts_close(p); } };
-
+        // Region-filtered: require tabix index for efficient random access.
         std::unique_ptr<tbx_t, TbxDeleter> tbx(tbx_index_load(path.c_str()));
-        if (tbx) {
-            std::unique_ptr<htsFile, HtsFileDeleter> fp(hts_open(path.c_str(), "r"));
-            if (!fp) throw std::runtime_error("failed to open graph site VCF: " + path);
-            append_graph_sites_tabix_filtered(fp.get(), tbx.get(), filters, catalog,
-                                               keep_allele_traversal_strings);
-            finalize_graph_site_catalog_inplace(catalog);
-            return catalog;
-        }
-    }
-
-    {
-        struct HtsFileDeleter { void operator()(htsFile* p) const { hts_close(p); } };
+        if (!tbx)
+            throw std::runtime_error(
+                "sites VCF must be bgzip-compressed with a tabix index: " + path);
+        std::unique_ptr<htsFile, HtsFileDeleter> fp(hts_open(path.c_str(), "r"));
+        if (!fp) throw std::runtime_error("failed to open graph site VCF: " + path);
+        append_graph_sites_tabix_filtered(fp.get(), tbx.get(), filters, catalog,
+                                           keep_allele_traversal_strings);
+    } else {
+        // No region filters: stream the entire file.
         std::unique_ptr<htsFile, HtsFileDeleter> fp(hts_open(path.c_str(), "r"));
         if (!fp) throw std::runtime_error("failed to open graph site VCF: " + path);
         kstring_t str = KS_INITIALIZE;
         while (hts_getline(fp.get(), '\n', &str) >= 0) {
             if (str.l == 0 || str.s[0] == '#') continue;
-            if (has_filters) {
-                const char* s = str.s;
-                const char* t1 = static_cast<const char*>(memchr(s, '\t', str.l));
-                if (!t1) continue;
-                const char* t2 = static_cast<const char*>(
-                    memchr(t1 + 1, '\t', str.l - static_cast<size_t>(t1 + 1 - s)));
-                if (!t2) continue;
-                const std::string chrom(s, static_cast<size_t>(t1 - s));
-                const hts_pos_t pos =
-                    static_cast<hts_pos_t>(std::stoll(std::string(t1 + 1, t2)));
-                if (!passes_any_filter(chrom, pos)) continue;
-            }
             append_graph_site_from_vcf_data_line(str.s, str.l, catalog,
                                                  keep_allele_traversal_strings);
         }

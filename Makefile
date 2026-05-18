@@ -3,7 +3,7 @@ CC ?= gcc
 THIRD_PARTY ?= $(abspath third_party)
 WFA2_ROOT ?= $(THIRD_PARTY)/WFA2-lib
 ABPOA_ROOT ?= $(THIRD_PARTY)/abPOA
-EDLIB_ROOT ?= $(abspath ../longcallD/edlib)
+EDLIB_ROOT ?= $(THIRD_PARTY)/edlib/edlib
 GBZ_BASE_ROOT ?= $(THIRD_PARTY)/gbz-base
 # Prefer the rustup-managed toolchain over any system-installed rustc/cargo.
 CARGO       ?= $(firstword $(wildcard $(HOME)/.cargo/bin/cargo) cargo)
@@ -32,7 +32,6 @@ SOURCES_CXX = src/main.cpp \
 	src/collect_pipeline.cpp \
 	src/build_catalog.cpp \
 	src/graph_collect.cpp \
-	src/graph_pipeline.cpp \
 	src/bam_digar.cpp \
 	src/collect_var.cpp \
 	src/collect_phase.cpp \
@@ -61,10 +60,9 @@ all: pgphase
 check: pgphase
 	bash scripts/validate_collect_gates.sh
 
-unit-tests: test_phase_block_stitch test_graph_sites test_graph_phase test_graph_bam_adapter
+unit-tests: test_phase_block_stitch test_graph_sites test_graph_bam_adapter
 	./test_phase_block_stitch
 	./test_graph_sites
-	./test_graph_phase
 	./test_graph_bam_adapter
 
 portable-bundle: pgphase
@@ -105,6 +103,9 @@ $(EDLIB_OBJ): $(EDLIB_ROOT)/src/edlib.cpp
 pgphase: $(OBJS) $(WFA2_LIB) $(ABPOA_LIB)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
 
+test_phase_block_stitch: src/test_phase_block_stitch.cpp src/collect_phase.o src/collect_phase_pgbam.o src/collect_phase_noisy.o src/collect_output.o src/collect_var.o src/align.o src/cgranges.o src/kalloc.o src/sdust.o $(EDLIB_OBJ) $(WFA2_LIB) $(ABPOA_LIB)
+	$(CXX) $(CXXFLAGS) -o $@ $< src/collect_phase.o src/collect_phase_pgbam.o src/collect_phase_noisy.o src/collect_output.o src/collect_var.o src/align.o src/cgranges.o src/kalloc.o src/sdust.o $(EDLIB_OBJ) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
+
 test_graph_sites: src/test_graph_sites.cpp src/graph_sites.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
@@ -112,4 +113,4 @@ test_graph_bam_adapter: src/test_graph_bam_adapter.cpp src/graph_bam_adapter.o s
 	$(CXX) $(CXXFLAGS) -o $@ $^ src/cgranges.o src/kalloc.o $(LDFLAGS)
 
 clean:
-	rm -f pgphase test_graph_sites test_graph_bam_adapter src/*.o src/*.d
+	rm -f pgphase test_phase_block_stitch test_graph_sites test_graph_bam_adapter src/*.o src/*.d
