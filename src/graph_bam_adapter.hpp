@@ -39,6 +39,7 @@ struct FilteredGraphSite {
 struct GraphVariantEmitRow {
     std::string chrom;
     hts_pos_t pos = 0;
+    std::string snarl_id;
     std::string ref;
     std::string alt;
 };
