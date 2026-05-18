@@ -24,6 +24,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -829,6 +830,25 @@ void run_collect_graph_variation(const Options& opts) {
 
     ReferenceCache ref(fai.get());
 
+    // Phased BAM: open output file and write header.
+    struct SamFileCloser { void operator()(samFile* fp) const { if (fp) hts_close(fp); } };
+    std::unique_ptr<samFile, SamFileCloser> phased_bam_fp;
+    std::unique_ptr<sam_hdr_t, decltype(&sam_hdr_destroy)> phased_bam_hdr(nullptr, &sam_hdr_destroy);
+    std::unordered_map<std::string, PhaseReadOutputRow> phased_bam_rows;
+    std::unordered_set<std::string> phased_bam_emitted;
+    const bool emit_phased_bam = !opts.output_phased_bam.empty();
+    if (emit_phased_bam) {
+        samFile* raw_fp = hts_open(opts.output_phased_bam.c_str(), "wb");
+        if (!raw_fp)
+            throw std::runtime_error("failed to open phased BAM: " + opts.output_phased_bam);
+        phased_bam_fp.reset(raw_fp);
+        sam_hdr_t* hdr = sam_hdr_init();
+        if (!hdr) throw std::runtime_error("failed to allocate phased BAM header");
+        phased_bam_hdr.reset(hdr);
+        if (sam_hdr_write(phased_bam_fp.get(), phased_bam_hdr.get()) < 0)
+            throw std::runtime_error("failed to write phased BAM header");
+    }
+
     // 10. Process chunks in reg_chunk_i batches (one contig per batch), streaming output.
     //     Mirrors run_collect_bam_variation's batch loop exactly.
     size_t n_variants = 0;
@@ -859,6 +879,22 @@ void run_collect_graph_variation(const Options& opts) {
         if (!opts.output_phased_vcf.empty())
             write_phased_variants_vcf_records(phased_vcf_out, opts, header.get(), ref, variants);
 
+        // Phased BAM: accumulate post-stitch read assignments, flush reads
+        // that won't appear in the next batch.
+        if (emit_phased_bam) {
+            for (const GraphBamChunkBuildResult& gc : graph_chunks)
+                merge_graph_chunk_into_read_rows(phased_bam_rows, gc);
+            // Collect read names in the next batch to avoid flushing overlap reads early.
+            std::unordered_set<std::string> next_batch_qnames;
+            if (batch_end < chunks.size()) {
+                // Peek: next batch shares the same reg_chunk_i? If not, no overlap.
+                // Cross-contig batches never share reads, so flush all.
+            }
+            flush_graph_phase_bam_after_merge(
+                phased_bam_fp.get(), phased_bam_hdr.get(),
+                phased_bam_rows, nullptr, phased_bam_emitted);
+        }
+
         batch_begin = batch_end;
     }
 
@@ -870,14 +906,17 @@ void run_collect_graph_variation(const Options& opts) {
         std::cerr << "Wrote candidate VCF to " << opts.output_vcf << "\n";
     if (!opts.output_phased_vcf.empty())
         std::cerr << "Wrote phased candidate VCF to " << opts.output_phased_vcf << "\n";
+    if (emit_phased_bam)
+        std::cerr << "Wrote phased BAM to " << opts.output_phased_bam << "\n";
 }
 
 static void print_graph_collect_help() {
     std::cout
-        << "Usage: pgphase collect-graph-variation [options] <ref.fa> <sites.vcf>\n"
+        << "Usage: pgphase collect-graph-variation [options]\n"
         << "\n"
-        << "  <ref.fa>     Reference FASTA (indexed)\n"
-        << "  <sites.vcf>  vg deconstruct VCF (plain or bgzipped+tabix-indexed)\n"
+        << "Required:\n"
+        << "      --ref FILE                Reference FASTA (indexed)\n"
+        << "      --sites FILE              Sites VCF from build-snarl-catalog (bgzipped + tabix-indexed)\n"
         << "\n"
         << "Read input:\n"
         << "      --gaf FILE                Raw GAF alignments; builds a fast pgphase observation index\n"
@@ -887,7 +926,8 @@ static void print_graph_collect_help() {
         << "Options:\n"
         << "  -o, --output FILE             Output TSV [output.tsv]\n"
         << "  -v, --vcf-output FILE         Candidate VCF output\n"
-        << "      --phased-vcf-output FILE  Phased VCF with GT:PS\n"
+        << "      --phased-vcf-out FILE     Phased VCF with GT:DP:AD:VAF:GQ:PS\n"
+        << "      --phased-bam-out FILE     Unaligned BAM with HP/PS tags per read\n"
         << "  -t, --threads INT             Worker threads [1]\n"
         << "  -q, --min-mapq INT            Minimum read mapping quality [30]\n"
         << "  -D, --min-depth INT           Minimum total depth [5]\n"
@@ -904,7 +944,24 @@ static void print_graph_collect_help() {
         << "      --gbz-query-bin FILE      Path to GBZ-base query binary [query]\n"
         << "      --ont                     ONT read mode (enables strand-bias filter)\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
-        << "  -h, --help                    Print this help\n";
+        << "  -h, --help                    Print this help\n"
+        << "\n"
+        << "Examples:\n"
+        << "  pgphase collect-graph-variation \\\n"
+        << "      --ref ref.fa \\\n"
+        << "      --sites sites.vcf.gz \\\n"
+        << "      --gaf reads.gaf \\\n"
+        << "      --phased-vcf-out phased.vcf \\\n"
+        << "      --phased-bam-out phased.bam \\\n"
+        << "      -t 8\n"
+        << "\n"
+        << "  pgphase collect-graph-variation \\\n"
+        << "      --ref ref.fa \\\n"
+        << "      --sites sites.vcf.gz \\\n"
+        << "      --gbz-db reads.gaf.db \\\n"
+        << "      --ont \\\n"
+        << "      --phased-vcf-out phased.vcf \\\n"
+        << "      -t 16\n";
 }
 
 enum GraphCollectOption {
@@ -922,6 +979,9 @@ enum GraphCollectOption {
     kGcSample,
     kGcGbzQueryBin,
     kGcOnt,
+    kGcPhasedBam,
+    kGcRef,
+    kGcSites,
 };
 
 } // namespace
@@ -943,7 +1003,8 @@ int collect_graph_variation(int argc, char* argv[]) {
     const struct option long_options[] = {
         {"output",            required_argument, nullptr, 'o'},
         {"vcf-output",        required_argument, nullptr, 'v'},
-        {"phased-vcf-output", required_argument, nullptr, kGcPhasedVcf},
+        {"phased-vcf-out",    required_argument, nullptr, kGcPhasedVcf},
+        {"phased-bam-out",   required_argument, nullptr, kGcPhasedBam},
         {"threads",           required_argument, nullptr, 't'},
         {"min-mapq",          required_argument, nullptr, 'q'},
         {"min-depth",         required_argument, nullptr, 'D'},
@@ -962,6 +1023,8 @@ int collect_graph_variation(int argc, char* argv[]) {
         {"sample",            required_argument, nullptr, kGcSample},
         {"gbz-query-bin",     required_argument, nullptr, kGcGbzQueryBin},
         {"ont",               no_argument,       nullptr, kGcOnt},
+        {"ref",               required_argument, nullptr, kGcRef},
+        {"sites",             required_argument, nullptr, kGcSites},
         {"verbose",           required_argument, nullptr, 'V'},
         {"help",              no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -974,6 +1037,7 @@ int collect_graph_variation(int argc, char* argv[]) {
             case 'o': opts.output_tsv = optarg; break;
             case 'v': opts.output_vcf = optarg; break;
             case kGcPhasedVcf:    opts.output_phased_vcf = optarg; break;
+            case kGcPhasedBam:    opts.output_phased_bam = optarg; break;
             case 't': opts.threads = std::stoi(optarg); break;
             case 'q': opts.min_mapq = std::stoi(optarg); break;
             case 'D': opts.min_depth = std::stoi(optarg); break;
@@ -991,19 +1055,21 @@ int collect_graph_variation(int argc, char* argv[]) {
             case kGcSample:       opts.graph_sample = optarg; break;
             case kGcGbzQueryBin:  opts.gbz_query_bin = optarg; break;
             case kGcOnt:          opts.read_technology = ReadTechnology::Ont; break;
+            case kGcRef:          opts.ref_fasta = optarg; break;
+            case kGcSites:        opts.graph_sites_vcf = optarg; break;
             case 'V': opts.verbose = std::stoi(optarg); break;
             case 'h': print_graph_collect_help(); return 0;
             default:  print_graph_collect_help(); return 1;
         }
     }
 
-    if (optind + 2 > argc) {
+    if (opts.ref_fasta.empty() || opts.graph_sites_vcf.empty()) {
+        std::cerr << "Error: --ref and --sites are required\n";
         print_graph_collect_help();
         return 1;
     }
 
-    opts.ref_fasta       = argv[optind];
-    opts.graph_sites_vcf = argv[optind + 1];
+    require_graph_site_vcf_tabix_index(opts.graph_sites_vcf);
 
     if (opts.gaf_file.empty() && (opts.gbz_db.empty() || opts.gaf_db.empty())) {
         std::cerr << "Error: provide --gaf, or provide --gbz-db and --gaf-db\n";

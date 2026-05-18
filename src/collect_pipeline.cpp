@@ -14,9 +14,6 @@
 #include "collect_output.hpp"
 #include "collect_phase.hpp"
 #include "collect_var.hpp"
-#include "graph_bam_adapter.hpp"
-#include "graph_query.hpp"
-#include "graph_sites.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -726,96 +723,6 @@ CandidateTable collect_chunks_parallel(
  * @param opts Output paths, reference, BAM list, and threading configuration.
  */
 void run_collect_bam_variation(const Options& opts) {
-    std::unique_ptr<GraphSiteCatalog> graph_sites;
-    if (!opts.graph_sites_vcf.empty()) {
-        graph_sites = std::make_unique<GraphSiteCatalog>(
-            load_graph_site_catalog_from_vcf(opts.graph_sites_vcf));
-        if (!opts.graph_sites_tsv.empty()) {
-            std::ofstream graph_site_out(opts.graph_sites_tsv);
-            if (!graph_site_out) {
-                throw std::runtime_error("failed to open graph-site output: " + opts.graph_sites_tsv);
-            }
-            write_graph_site_catalog_tsv(graph_site_out, *graph_sites);
-        }
-        if (opts.verbose >= 1) {
-            std::cerr << "Loaded " << graph_sites->sites.size()
-                      << " graph sites from " << opts.graph_sites_vcf << "\n";
-        }
-        const bool need_graph_read_rows =
-            !opts.graph_read_support_tsv.empty() ||
-            !opts.graph_site_counts_tsv.empty() ||
-            !opts.graph_read_profile_tsv.empty() ||
-            !opts.graph_phase_sites_tsv.empty() ||
-            !opts.graph_phase_reads_tsv.empty();
-        if (need_graph_read_rows) {
-            GraphQueryConfig graph_config;
-            graph_config.gbz_db = opts.gbz_db;
-            graph_config.gaf_file = opts.gaf_file;
-            graph_config.gaf_db = opts.gaf_db;
-            graph_config.query_bin = opts.gbz_query_bin;
-            graph_config.gaf2db_bin = opts.gaf2db_bin;
-            graph_config.between_limit_nodes = opts.graph_between_limit_nodes;
-            graph_config.min_mapq = opts.min_mapq;
-            std::vector<GraphReadAllele> rows =
-                collect_graph_read_alleles_for_catalog(graph_config, *graph_sites);
-            if (!opts.graph_read_support_tsv.empty()) {
-                std::ofstream graph_read_out(opts.graph_read_support_tsv);
-                if (!graph_read_out) {
-                    throw std::runtime_error("failed to open graph read-support output: " +
-                                             opts.graph_read_support_tsv);
-                }
-                write_graph_read_alleles_tsv(graph_read_out, rows);
-            }
-            std::vector<GraphBamChunkBuildResult> graph_chunks;
-            hts_pos_t graph_end = 1;
-            for (const GraphSite& site : graph_sites->sites) {
-                graph_end = std::max(graph_end, site.ref_end > 0 ? site.ref_end : site.pos);
-            }
-            graph_chunks.push_back(build_graph_bam_chunk(*graph_sites, rows, "", 0, graph_end, 0, opts));
-            if (!opts.graph_phase_sites_tsv.empty() || !opts.graph_phase_reads_tsv.empty()) {
-                phase_graph_bam_chunks(graph_chunks, opts);
-            }
-            if (!opts.graph_site_counts_tsv.empty()) {
-                std::ofstream graph_counts_out(opts.graph_site_counts_tsv);
-                if (!graph_counts_out) {
-                    throw std::runtime_error("failed to open graph site-count output: " +
-                                             opts.graph_site_counts_tsv);
-                }
-                write_graph_bam_site_counts_tsv(graph_counts_out, graph_chunks);
-            }
-            if (!opts.graph_read_profile_tsv.empty()) {
-                std::ofstream graph_profile_out(opts.graph_read_profile_tsv);
-                if (!graph_profile_out) {
-                    throw std::runtime_error("failed to open graph read-profile output: " +
-                                             opts.graph_read_profile_tsv);
-                }
-                write_graph_bam_read_profiles_tsv(graph_profile_out, graph_chunks);
-            }
-            if (!opts.graph_phase_sites_tsv.empty()) {
-                std::ofstream graph_phase_sites_out(opts.graph_phase_sites_tsv);
-                if (!graph_phase_sites_out) {
-                    throw std::runtime_error("failed to open graph phase-site output: " +
-                                             opts.graph_phase_sites_tsv);
-                }
-                write_graph_bam_phase_sites_tsv(graph_phase_sites_out, graph_chunks);
-            }
-            if (!opts.graph_phase_reads_tsv.empty()) {
-                std::ofstream graph_phase_reads_out(opts.graph_phase_reads_tsv);
-                if (!graph_phase_reads_out) {
-                    throw std::runtime_error("failed to open graph phase-read output: " +
-                                             opts.graph_phase_reads_tsv);
-                }
-                write_graph_bam_phase_reads_tsv(graph_phase_reads_out, graph_chunks);
-            }
-            if (opts.verbose >= 1) {
-                std::cerr << "Wrote " << rows.size()
-                          << " graph read-support rows over "
-                          << graph_sites->sites.size() << " graph sites and "
-                          << graph_chunks.front().chunk.reads.size() << " reads\n";
-            }
-        }
-    }
-
     std::unique_ptr<PgbamSidecarData> pgbam_sidecar;
     if (!opts.pgbam_file.empty()) {
         pgbam_sidecar = std::make_unique<PgbamSidecarData>(load_pgbam_sidecar(opts.pgbam_file));
@@ -1001,19 +908,7 @@ enum LongOption {
     kPgbamRelaxedCleanupMarginOption,
     kPgbamRelaxedCleanupMinWinningOption,
     kAmbBaseOption,
-    kGbzDbOption,
-    kGafFileOption,
-    kGafDbOption,
-    kGraphSitesVcfOption,
-    kGraphSitesTsvOption,
-    kGraphReadSupportTsvOption,
-    kGraphSiteCountsTsvOption,
-    kGraphReadProfileTsvOption,
-    kGraphPhaseSitesTsvOption,
-    kGraphPhaseReadsTsvOption,
-    kGbzQueryBinOption,
-    kGaf2dbBinOption,
-    kGraphBetweenLimitOption
+
 };
 
 /**
@@ -1045,9 +940,14 @@ static std::vector<std::string> load_bam_list(const std::string& path) {
  */
 static void print_collect_help() {
     std::cout
-        << "Usage: pgphase collect-bam-variation [options] <ref.fa> <input.bam|bam.list> [region ...]\n"
+        << "Usage: pgphase collect-bam-variation [options]\n"
+        << "\n"
+        << "Required:\n"
+        << "      --ref FILE                Reference FASTA (indexed)\n"
+        << "      --bam FILE                Input BAM/CRAM file (or list with -L)\n"
+        << "\n"
         << "Options:\n"
-        << "  -L, --input-is-list          Treat input path as a list of BAM/CRAM files\n"
+        << "  -L, --input-is-list          Treat --bam path as a list of BAM/CRAM files\n"
         << "  -X, --extra-bam FILE         Extra input BAM/CRAM file; may be repeated\n"
         << "  -t, --threads INT             Region worker threads [1]\n"
         << "  -q, --min-mapq INT            Minimum read mapping quality [30]\n"
@@ -1065,7 +965,7 @@ static void print_collect_help() {
         << "      --amb-base                Emit VCF rows with ambiguous REF/ALT (longcallD --amb-base)\n"
         << "  -o, --output FILE             Output TSV file [output.tsv]\n"
         << "  -v, --vcf-output FILE         Optional VCF output for collected candidates\n"
-        << "      --phased-vcf-output FILE  Optional phased VCF (GT:PS from hap/phase_set scaffold)\n"
+        << "      --phased-vcf-out FILE      Optional phased VCF (GT:DP:AD:VAF:GQ:PS)\n"
         << "  -S/b/C --out-sam/bam/cram FILE\n"
         << "                                output phased SAM/BAM/CRAM file []\n"
         << "                                note: multiple input BAM/CRAM files will be merged in SAM/BAM/CRAM output\n"
@@ -1083,19 +983,7 @@ static void print_collect_help() {
         << "      --pgbam-relaxed-cleanup-margin INT Thread polarity margin for relaxed cleanup pass [1]\n"
         << "      --pgbam-relaxed-cleanup-min-winning INT\n"
         << "                                      Winning shared polarized threads for relaxed cleanup pass [1]\n"
-        << "      --gbz-db FILE             GBZ-base database for graph-native snarl queries (experimental)\n"
-        << "      --gaf FILE                Raw GAF graph alignments for graph-native phasing (experimental)\n"
-        << "      --gaf-db FILE             GAF-base database/cache for graph-native ReadSet queries (experimental)\n"
-        << "      --graph-sites-vcf FILE    Optional precomputed vg deconstruct VCF graph-site catalog (debug)\n"
-        << "      --graph-sites-tsv FILE    Diagnostic dump of parsed graph-site catalog\n"
-        << "      --graph-read-support FILE Diagnostic exact read->graph-site allele support TSV\n"
-        << "      --graph-site-counts FILE  Diagnostic graph-site allele depth/count TSV\n"
-        << "      --graph-read-profile FILE Diagnostic sparse read x graph-site allele profile TSV\n"
-        << "      --graph-phase-sites FILE  Experimental graph-site hap consensus TSV\n"
-        << "      --graph-phase-reads FILE  Experimental graph read HAP / PHASE_SET TSV\n"
-        << "      --gbz-query-bin FILE      GBZ-base query binary [query]\n"
-        << "      --gaf2db-bin FILE         GAF-base builder binary [gaf2db]\n"
-        << "      --graph-between-limit INT Safety node limit for GBZ-base --between queries [100000]\n"
+
         << "      --chunk-size INT          Region chunk size in bp [500000]\n"
         << "      --noisy-merge-dis INT     Max distance (bp) to merge noisy/SV windows [500]\n"
         << "      --min-sv-len INT          min_sv_len for noisy-region cgranges merge [30]\n"
@@ -1107,8 +995,22 @@ static void print_collect_help() {
         << "      --noisy-max-xgaps INT     max indel len (bp) for STR/homopolymer flags [5]\n"
         << "  -V, --verbose INT            Verbosity level; 2 prints longcallD-style noisy-region logs [0]\n"
         << "\n"
-        << "Regions can also be supplied after <input.bam|bam.list>, e.g.\n"
-        << "  pgphase collect-bam-variation ref.fa hifi.bam chr11:1000-2000 chr12:1-500\n";
+        << "Examples:\n"
+        << "  pgphase collect-bam-variation \\\n"
+        << "      --ref ref.fa \\\n"
+        << "      --bam hifi.bam \\\n"
+        << "      -o candidates.tsv \\\n"
+        << "      --phased-vcf-out phased.vcf \\\n"
+        << "      -t 8 \\\n"
+        << "      -r chr11:1000-2000 \\\n"
+        << "      -r chr12:1-500\n"
+        << "\n"
+        << "  pgphase collect-bam-variation \\\n"
+        << "      --ref ref.fa \\\n"
+        << "      --bam ont_reads.bam \\\n"
+        << "      --ont \\\n"
+        << "      --phased-vcf-out phased.vcf \\\n"
+        << "      -t 16\n";
 }
 
 } // namespace pgphase_collect
@@ -1155,7 +1057,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"amb-base",                  no_argument,       nullptr, kAmbBaseOption},
         {"output",                    required_argument, nullptr, 'o'},
         {"vcf-output",                required_argument, nullptr, 'v'},
-        {"phased-vcf-output",         required_argument, nullptr, kPhasedVcfOutputOption},
+        {"phased-vcf-out",            required_argument, nullptr, kPhasedVcfOutputOption},
         {"out-sam",                   required_argument, nullptr, 'S'},
         {"out-bam",                   required_argument, nullptr, 'b'},
         {"out-cram",                  required_argument, nullptr, 'C'},
@@ -1171,20 +1073,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"no-pgbam-relaxed-cleanup-pass", no_argument,   nullptr, kNoPgbamRelaxedCleanupPassOption},
         {"pgbam-relaxed-cleanup-margin", required_argument, nullptr, kPgbamRelaxedCleanupMarginOption},
         {"pgbam-relaxed-cleanup-min-winning", required_argument, nullptr, kPgbamRelaxedCleanupMinWinningOption},
-        {"gbz-db",                    required_argument, nullptr, kGbzDbOption},
-        {"gaf",                       required_argument, nullptr, kGafFileOption},
-        {"gaf-file",                  required_argument, nullptr, kGafFileOption},
-        {"gaf-db",                    required_argument, nullptr, kGafDbOption},
-        {"graph-sites-vcf",           required_argument, nullptr, kGraphSitesVcfOption},
-        {"graph-sites-tsv",           required_argument, nullptr, kGraphSitesTsvOption},
-        {"graph-read-support",        required_argument, nullptr, kGraphReadSupportTsvOption},
-        {"graph-site-counts",         required_argument, nullptr, kGraphSiteCountsTsvOption},
-        {"graph-read-profile",        required_argument, nullptr, kGraphReadProfileTsvOption},
-        {"graph-phase-sites",         required_argument, nullptr, kGraphPhaseSitesTsvOption},
-        {"graph-phase-reads",         required_argument, nullptr, kGraphPhaseReadsTsvOption},
-        {"gbz-query-bin",             required_argument, nullptr, kGbzQueryBinOption},
-        {"gaf2db-bin",                required_argument, nullptr, kGaf2dbBinOption},
-        {"graph-between-limit",       required_argument, nullptr, kGraphBetweenLimitOption},
+
         {"chunk-size",                required_argument, nullptr, kChunkSizeOption},
         {"noisy-merge-dis",           required_argument, nullptr, kNoisyRegMergeDisOption},
         {"min-sv-len",                required_argument, nullptr, kMinSvLenOption},
@@ -1259,19 +1148,6 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kNoPgbamRelaxedCleanupPassOption: opts.pgbam_relaxed_cleanup_pass = false; break;
             case kPgbamRelaxedCleanupMarginOption: opts.pgbam_relaxed_cleanup_polarity_margin = std::stoi(optarg); break;
             case kPgbamRelaxedCleanupMinWinningOption: opts.pgbam_relaxed_cleanup_min_winning_threads = std::stoi(optarg); break;
-            case kGbzDbOption:         opts.gbz_db = optarg; break;
-            case kGafFileOption:       opts.gaf_file = optarg; break;
-            case kGafDbOption:         opts.gaf_db = optarg; break;
-            case kGraphSitesVcfOption: opts.graph_sites_vcf = optarg; break;
-            case kGraphSitesTsvOption: opts.graph_sites_tsv = optarg; break;
-            case kGraphReadSupportTsvOption: opts.graph_read_support_tsv = optarg; break;
-            case kGraphSiteCountsTsvOption: opts.graph_site_counts_tsv = optarg; break;
-            case kGraphReadProfileTsvOption: opts.graph_read_profile_tsv = optarg; break;
-            case kGraphPhaseSitesTsvOption: opts.graph_phase_sites_tsv = optarg; break;
-            case kGraphPhaseReadsTsvOption: opts.graph_phase_reads_tsv = optarg; break;
-            case kGbzQueryBinOption:   opts.gbz_query_bin = optarg; break;
-            case kGaf2dbBinOption:     opts.gaf2db_bin = optarg; break;
-            case kGraphBetweenLimitOption: opts.graph_between_limit_nodes = std::stoi(optarg); break;
             case kChunkSizeOption:      opts.chunk_size = std::stoll(optarg); break;
             case kNoisyRegMergeDisOption: opts.noisy_reg_merge_dis = std::stoi(optarg); break;
             case kMinSvLenOption:       opts.min_sv_len = std::stoi(optarg); break;
@@ -1297,7 +1173,6 @@ int collect_bam_variation(int argc, char* argv[]) {
         opts.max_var_ratio_per_read < 0.0 || opts.max_noisy_frac_per_read < 0.0 ||
         opts.noisy_reg_max_xgaps < 0 ||
         opts.noisy_reg_slide_win < -1 || opts.verbose < 0 ||
-        opts.graph_between_limit_nodes < 1 ||
         opts.pgbam_primary_polarity_margin < 1 || opts.pgbam_primary_min_winning_threads < 1 ||
         opts.pgbam_cleanup_polarity_margin < 1 || opts.pgbam_cleanup_min_winning_threads < 1 ||
         opts.pgbam_relaxed_cleanup_polarity_margin < 1 || opts.pgbam_relaxed_cleanup_min_winning_threads < 1) {
@@ -1306,39 +1181,6 @@ int collect_bam_variation(int argc, char* argv[]) {
     }
     if (read_technology_conflict) {
         std::cerr << "Error: choose only one of --hifi, --ont, or --short-reads\n";
-        return 1;
-    }
-    if (!opts.graph_sites_tsv.empty() && opts.graph_sites_vcf.empty()) {
-        std::cerr << "Error: --graph-sites-tsv requires --graph-sites-vcf\n";
-        return 1;
-    }
-    if (!opts.graph_read_support_tsv.empty() && opts.graph_sites_vcf.empty()) {
-        std::cerr << "Error: --graph-read-support currently requires --graph-sites-vcf\n";
-        return 1;
-    }
-    if ((!opts.graph_site_counts_tsv.empty() ||
-         !opts.graph_read_profile_tsv.empty() ||
-         !opts.graph_phase_sites_tsv.empty() ||
-         !opts.graph_phase_reads_tsv.empty()) &&
-        opts.graph_sites_vcf.empty()) {
-        std::cerr << "Error: graph matrix diagnostics currently require --graph-sites-vcf\n";
-        return 1;
-    }
-    if ((!opts.graph_read_support_tsv.empty() ||
-         !opts.graph_site_counts_tsv.empty() ||
-         !opts.graph_read_profile_tsv.empty() ||
-         !opts.graph_phase_sites_tsv.empty() ||
-         !opts.graph_phase_reads_tsv.empty()) &&
-        (opts.gbz_db.empty() || (opts.gaf_file.empty() && opts.gaf_db.empty()))) {
-        std::cerr << "Error: graph read/matrix diagnostics require --gbz-db plus --gaf or --gaf-db\n";
-        return 1;
-    }
-    if (!opts.gbz_db.empty() && opts.gaf_file.empty() && opts.gaf_db.empty()) {
-        std::cerr << "Error: --gbz-db graph mode requires --gaf or --gaf-db\n";
-        return 1;
-    }
-    if ((!opts.gaf_file.empty() || !opts.gaf_db.empty()) && opts.gbz_db.empty()) {
-        std::cerr << "Error: graph alignment inputs require --gbz-db plus --gaf or --gaf-db\n";
         return 1;
     }
     if (optind + 2 > argc) {
