@@ -210,10 +210,6 @@ bool parse_gaf_core_fields_from_column(std::string_view line,
                                        int first_gaf_column,
                                        GafCoreFields& out);
 
-bool parse_gaf_core_fields(const std::string& line, GafCoreFields& out) {
-    return parse_gaf_core_fields_from_column(std::string_view(line), 0, out);
-}
-
 bool parse_gaf_core_fields_from_column(std::string_view line,
                                        int first_gaf_column,
                                        GafCoreFields& out) {
@@ -404,9 +400,12 @@ size_t file_size_or_throw(const std::string& path) {
 }
 
 // Plain-text parallel scan: divide file by raw byte offsets.
+// first_gaf_column: 0 for standard GAF, 3 for annotated-coord format
+// (chrom/start/end prepended before GAF columns).
 size_t scan_gaf_range_compact_plain(const std::string& gaf_file,
                                     const CompactGraphSiteIndex& compact_index,
                                     int min_mapq,
+                                    int first_gaf_column,
                                     size_t worker_id,
                                     size_t byte_begin,
                                     size_t byte_end,
@@ -435,7 +434,7 @@ size_t scan_gaf_range_compact_plain(const std::string& gaf_file,
         if (line.empty() || line[0] == '#') continue;
 
         GafCoreFields fields;
-        if (!parse_gaf_core_fields(line, fields)) continue;
+        if (!parse_gaf_core_fields_from_column(line, first_gaf_column, fields)) continue;
         if (fields.mapq < min_mapq) continue;
         if (!parse_gaf_path_compact(fields.walk, read_walk) || read_walk.empty()) continue;
 
@@ -485,9 +484,11 @@ size_t scan_gaf_range_compact_plain(const std::string& gaf_file,
 // voff_begin/voff_end are htslib virtual offsets: (block_compressed_offset << 16).
 // For the first worker (voff_begin == 0) no line is skipped; otherwise the
 // first partial line is discarded to avoid double-counting at boundaries.
+// first_gaf_column: 0 for standard GAF, 3 for annotated-coord format.
 size_t scan_gaf_range_compact_bgzf(const std::string& gaf_file,
                                     const CompactGraphSiteIndex& compact_index,
                                     int min_mapq,
+                                    int first_gaf_column,
                                     size_t worker_id,
                                     int64_t voff_begin,
                                     int64_t voff_end,
@@ -526,7 +527,7 @@ size_t scan_gaf_range_compact_bgzf(const std::string& gaf_file,
         if (line.empty() || line[0] == '#') continue;
 
         GafCoreFields fields;
-        if (!parse_gaf_core_fields_from_column(line, 0, fields)) continue;
+        if (!parse_gaf_core_fields_from_column(line, first_gaf_column, fields)) continue;
         if (fields.mapq < min_mapq) continue;
         if (!parse_gaf_path_compact(fields.walk, read_walk) || read_walk.empty()) continue;
 
@@ -705,6 +706,7 @@ GraphWalk extract_subwalk_between(const GraphWalk& walk,
 size_t scan_gaf_for_catalog_emit_string(const std::string& gaf_file,
                                         const GraphSiteCatalog& catalog,
                                         int min_mapq,
+                                        int first_gaf_column,
                                         const GraphReadAlleleEmitter& emit) {
     // Build boundary-node index: node_id → site indices whose first allele walk
     // has that node as either the left or right boundary anchor.
@@ -733,7 +735,7 @@ size_t scan_gaf_for_catalog_emit_string(const std::string& gaf_file,
         if (line.empty() || line[0] == '#') continue;
 
         GafCoreFields fields;
-        if (!parse_gaf_core_fields(line, fields)) continue;
+        if (!parse_gaf_core_fields_from_column(line, first_gaf_column, fields)) continue;
         if (fields.mapq < min_mapq) continue;
 
         GraphWalk read_walk;
@@ -811,11 +813,17 @@ size_t scan_gaf_for_catalog_emit_parallel_impl(
     size_t threads,
     bool release_catalog_walks,
     const GraphReadAlleleThreadEmitter& emit) {
+    // Annotated-coord GAF (used by tabix-indexed files) prepends 3 columns
+    // (chrom, start, end) before the standard GAF fields.  Detect by
+    // checking for a .tbi sidecar.
+    const bool has_tbi = (access((gaf_file + ".tbi").c_str(), F_OK) == 0);
+    const int first_gaf_column = has_tbi ? 3 : 0;
+
     CompactGraphSiteIndex compact_index;
     if (!build_compact_graph_site_index(catalog, compact_index, release_catalog_walks)) {
         size_t emitted = 0;
         emitted = scan_gaf_for_catalog_emit_string(
-            gaf_file, catalog, min_mapq,
+            gaf_file, catalog, min_mapq, first_gaf_column,
             [&](GraphReadAllele&& row) { emit(0, std::move(row)); });
         return emitted;
     }
@@ -835,7 +843,7 @@ size_t scan_gaf_for_catalog_emit_parallel_impl(
         const size_t worker_count = std::max<size_t>(1, std::min<size_t>(threads, n_blocks));
         if (worker_count == 1) {
             return scan_gaf_range_compact_bgzf(gaf_file, compact_index, min_mapq,
-                                                0, 0, -1, emit);
+                                                first_gaf_column, 0, 0, -1, emit);
         }
 
         std::atomic<size_t> emitted_total{0};
@@ -852,11 +860,11 @@ size_t scan_gaf_for_catalog_emit_parallel_impl(
             const int64_t voff_end = (blk_end < n_blocks)
                                          ? (block_offsets[blk_end] << 16)
                                          : static_cast<int64_t>(-1);
-            workers.emplace_back([&, w, voff_beg, voff_end]() {
+            workers.emplace_back([&, w, voff_beg, voff_end, first_gaf_column]() {
                 try {
                     emitted_total.fetch_add(
                         scan_gaf_range_compact_bgzf(gaf_file, compact_index, min_mapq,
-                                                     w, voff_beg, voff_end, emit),
+                                                     first_gaf_column, w, voff_beg, voff_end, emit),
                         std::memory_order_relaxed);
                 } catch (...) {
                     std::lock_guard<std::mutex> lock(error_mutex);
@@ -873,7 +881,7 @@ size_t scan_gaf_for_catalog_emit_parallel_impl(
     const size_t worker_count = std::max<size_t>(1, std::min<size_t>(threads, file_size));
     if (worker_count == 1) {
         return scan_gaf_range_compact_plain(gaf_file, compact_index, min_mapq,
-                                            0, 0, file_size, emit);
+                                            first_gaf_column, 0, 0, file_size, emit);
     }
 
     std::atomic<size_t> emitted_total{0};
@@ -884,11 +892,11 @@ size_t scan_gaf_for_catalog_emit_parallel_impl(
     for (size_t worker = 0; worker < worker_count; ++worker) {
         const size_t beg = (file_size * worker) / worker_count;
         const size_t end = (file_size * (worker + 1)) / worker_count;
-        workers.emplace_back([&, worker, beg, end]() {
+        workers.emplace_back([&, worker, beg, end, first_gaf_column]() {
             try {
                 emitted_total.fetch_add(
                     scan_gaf_range_compact_plain(gaf_file, compact_index, min_mapq,
-                                                  worker, beg, end, emit),
+                                                  first_gaf_column, worker, beg, end, emit),
                     std::memory_order_relaxed);
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);
