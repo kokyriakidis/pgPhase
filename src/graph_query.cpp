@@ -306,7 +306,8 @@ int match_compact_span(const std::vector<CompactHandle>& read_walk,
 int match_compact_site_on_read(
     const std::vector<CompactHandle>& read_walk,
     const std::unordered_map<CompactHandle, std::vector<size_t>>& boundary_positions,
-    const CompactGraphSite& site) {
+    const CompactGraphSite& site,
+    bool* reverse_out = nullptr) {
     auto left_it = boundary_positions.find(site.left);
     auto right_it = boundary_positions.find(site.right);
     if (left_it != boundary_positions.end() && right_it != boundary_positions.end()) {
@@ -315,7 +316,7 @@ int match_compact_site_on_read(
                 if (right_pos < left_pos) continue;
                 const int allele = match_compact_span(read_walk, left_pos, right_pos,
                                                       site, false);
-                if (allele >= 0) return allele;
+                if (allele >= 0) { if (reverse_out) *reverse_out = false; return allele; }
                 if (allele == kGraphAlleleAmbiguous) return allele;
                 if (!site.allele_walks.empty() &&
                     right_pos - left_pos + 1 > site.allele_walks[0].size()) {
@@ -333,7 +334,7 @@ int match_compact_site_on_read(
                 if (left_pos < right_pos) continue;
                 const int allele = match_compact_span(read_walk, right_pos, left_pos,
                                                       site, true);
-                if (allele >= 0) return allele;
+                if (allele >= 0) { if (reverse_out) *reverse_out = true; return allele; }
                 if (allele == kGraphAlleleAmbiguous) return allele;
                 if (!site.allele_walks.empty() &&
                     left_pos - right_pos + 1 > site.allele_walks[0].size()) {
@@ -413,7 +414,8 @@ size_t scan_gaf_range_compact(const std::string& gaf_file,
         const std::string read_name(fields.read_name);
         for (size_t compact_site_index : candidates) {
             const CompactGraphSite& site = compact_index.sites[compact_site_index];
-            const int allele = match_compact_site_on_read(read_walk, boundary_positions, site);
+            bool rev = false;
+            const int allele = match_compact_site_on_read(read_walk, boundary_positions, site, &rev);
             if (allele < 0) continue;
             emit(worker_id, GraphReadAllele{
                 site.site_id,
@@ -422,7 +424,8 @@ size_t scan_gaf_range_compact(const std::string& gaf_file,
                 read_name,
                 allele,
                 "",
-                fields.mapq
+                fields.mapq,
+                rev
             });
             ++emitted;
         }
@@ -472,7 +475,8 @@ size_t scan_gaf_line_compact(std::string_view line,
     const std::string read_name(fields.read_name);
     for (size_t compact_site_index : candidates) {
         const CompactGraphSite& site = compact_index.sites[compact_site_index];
-        const int allele = match_compact_site_on_read(read_walk, boundary_positions, site);
+        bool rev = false;
+        const int allele = match_compact_site_on_read(read_walk, boundary_positions, site, &rev);
         if (allele < 0) continue;
         emit(worker_id, GraphReadAllele{
             site.site_id,
@@ -481,7 +485,8 @@ size_t scan_gaf_line_compact(std::string_view line,
             read_name,
             allele,
             "",
-            fields.mapq
+            fields.mapq,
+            rev
         });
         ++emitted;
     }
@@ -510,7 +515,8 @@ std::vector<GraphReadAllele> parse_gaf_read_alleles(const std::string& path,
         } catch (const std::exception&) {
             continue;
         }
-        const int allele = match_graph_allele_exact(walk, site.allele_walks);
+        bool rev = false;
+        const int allele = match_graph_allele_exact(walk, site.allele_walks, &rev);
         if (allele < 0) continue;
         rows.push_back(GraphReadAllele{
             site.id,
@@ -519,7 +525,8 @@ std::vector<GraphReadAllele> parse_gaf_read_alleles(const std::string& path,
             qname,
             allele,
             walk_text,
-            mapq
+            mapq,
+            rev
         });
     }
     return rows;
@@ -610,7 +617,8 @@ size_t scan_gaf_for_catalog_emit_string(const std::string& gaf_file,
             const GraphWalk subwalk = extract_subwalk_between(read_walk, left_bnd, right_bnd);
             if (subwalk.empty()) continue;
 
-            const int allele = match_graph_allele_exact(subwalk, site.allele_walks);
+            bool rev = false;
+            const int allele = match_graph_allele_exact(subwalk, site.allele_walks, &rev);
             if (allele < 0) continue;
 
             emit(GraphReadAllele{
@@ -620,7 +628,8 @@ size_t scan_gaf_for_catalog_emit_string(const std::string& gaf_file,
                 read_name,
                 allele,
                 graph_walk_to_string(subwalk),
-                fields.mapq
+                fields.mapq,
+                rev
             });
             ++emitted;
         }
@@ -940,7 +949,7 @@ std::string query_gbz_interval_gfa(const GraphQueryConfig& config,
 }
 
 void write_graph_read_alleles_tsv_header(std::ostream& out) {
-    out << "SITE_ID\tCHROM\tPOS\tREAD\tMAPQ\tALLELE\tWALK\n";
+    out << "SITE_ID\tCHROM\tPOS\tREAD\tMAPQ\tALLELE\tWALK\tREVERSE\n";
 }
 
 void write_graph_read_alleles_tsv_rows(std::ostream& out,
@@ -952,7 +961,8 @@ void write_graph_read_alleles_tsv_rows(std::ostream& out,
             << row.read_name << '\t'
             << row.mapq << '\t'
             << row.allele << '\t'
-            << row.walk << '\n';
+            << row.walk << '\t'
+            << (row.reverse ? '1' : '0') << '\n';
     }
 }
 

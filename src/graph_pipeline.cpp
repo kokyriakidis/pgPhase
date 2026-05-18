@@ -46,6 +46,7 @@ struct GraphOptions {
     hts_pos_t graph_chunk_size = 500000;
     int threads = 1;
     int verbose = 0;
+    bool ont = false;
 };
 
 enum LongOption {
@@ -57,7 +58,8 @@ enum LongOption {
     kGraphContigOption,
     kGraphIntervalOption,
     kGraphChunkSizeOption,
-    kThreadsOption
+    kThreadsOption,
+    kOntOption
 };
 
 void print_help() {
@@ -80,6 +82,7 @@ void print_help() {
         << "                              (from ##contig length). Length <= --chunk-size => 1 chunk.\n"
         << "      --chunk-size INT          Target chunk width in bp [500000]\n"
         << "  -t, --threads INT             Worker threads [1]\n"
+        << "      --ont                     ONT read mode (enables strand-bias filter)\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
         << "  -h, --help                    Print this help\n";
 }
@@ -249,6 +252,7 @@ int phase_graph(int argc, char* argv[]) {
         {"interval",           required_argument, nullptr, kGraphIntervalOption},
         {"chunk-size",         required_argument, nullptr, kGraphChunkSizeOption},
         {"threads",            required_argument, nullptr, 't'},
+        {"ont",                no_argument,       nullptr, kOntOption},
         {"verbose",            required_argument, nullptr, 'V'},
         {"help",               no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -274,6 +278,7 @@ int phase_graph(int argc, char* argv[]) {
                 }
                 break;
             case kGraphChunkSizeOption: opts.graph_chunk_size = std::stoll(optarg); break;
+            case kOntOption: opts.ont = true; break;
             case 't': opts.threads = std::stoi(optarg); break;
             case 'V': opts.verbose = std::stoi(optarg); break;
             case 'h': print_help(); return 0;
@@ -306,7 +311,7 @@ int phase_graph(int argc, char* argv[]) {
         filter_opts.touch_read_phase = true;
 
         Options phase_opts;
-        phase_opts.read_technology = ReadTechnology::Hifi;
+        phase_opts.read_technology = opts.ont ? ReadTechnology::Ont : ReadTechnology::Hifi;
         phase_opts.output_aln = "graph";
         phase_opts.verbose = opts.verbose;
 
