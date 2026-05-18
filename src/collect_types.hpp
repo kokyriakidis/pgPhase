@@ -59,10 +59,6 @@ constexpr int kNoisyRegFlankLen = 10;
 constexpr int kLongcalldMinSvLen = 30;
 constexpr double kDefaultStrandBiasPvalOnt = 0.01;
 constexpr int kDefaultNoisyRegMaxXgaps = 5;
-/** If `>0`, a merged noisy region is kept only if at least this many (non-skipped) reads overlap it.
- * 0 = no extra gate (longcallD `pre_process_noisy_regs` has no separate total-depth check). Use 5 to match
- * the published “total read coverage” noisy-region description. */
-constexpr int kDefaultMinNoisyRegTotalDepth = 0;
 
 ///@}
 
@@ -161,7 +157,6 @@ struct Options {
     ReadTechnology read_technology = ReadTechnology::Hifi;
     double strand_bias_pval = kDefaultStrandBiasPvalOnt;
     int noisy_reg_max_xgaps = kDefaultNoisyRegMaxXgaps;
-    int min_noisy_reg_total_depth = kDefaultMinNoisyRegTotalDepth;
     // Step 4: noisy-region MSA options (mirrors longcallD call_var_opt_t fields).
     int max_noisy_reg_len = 50000; ///< Skip regions longer than this bp (LONGCALLD_MAX_NOISY_REG_LEN).
     int max_noisy_reg_cov = 1000;  ///< Skip regions with more overlapping reads than this (LONGCALLD_MAX_NOISY_REG_COV).
