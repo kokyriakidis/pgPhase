@@ -10,6 +10,10 @@
 
 #include "collect_phase.hpp"
 
+#include <algorithm>
+#include <climits>
+#include <cmath>
+#include <cstdio>
 #include <ctime>
 #include <fstream>
 #include <sstream>
@@ -314,6 +318,10 @@ void write_phased_variants_vcf_header(std::ostream& out, const Options& opts, co
     out << "##INFO=<ID=AF,Number=1,Type=Float,Description=\"Alternate allele fraction\">\n";
     out << "##INFO=<ID=CAT,Number=1,Type=String,Description=\"pgPhase candidate category\">\n";
     out << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">\n";
+    out << "##FORMAT=<ID=DP,Number=1,Type=Integer,Description=\"Read depth\">\n";
+    out << "##FORMAT=<ID=AD,Number=R,Type=Integer,Description=\"Allelic depths for the ref and alt alleles\">\n";
+    out << "##FORMAT=<ID=VAF,Number=A,Type=Float,Description=\"Variant allele fraction\">\n";
+    out << "##FORMAT=<ID=GQ,Number=1,Type=Integer,Description=\"Genotype quality\">\n";
     out << "##FORMAT=<ID=PS,Number=1,Type=Integer,Description=\"Phase set anchor coordinate\">\n";
     for (int32_t tid = 0; tid < header->n_targets; ++tid) {
         out << "##contig=<ID=" << header->target_name[tid] << ",length=" << header->target_len[tid] << ">\n";
@@ -322,12 +330,51 @@ void write_phased_variants_vcf_header(std::ostream& out, const Options& opts, co
 }
 
 namespace {
+
+// longcallD defaults from call_var_main.c:217-218.
+// p_error = 0.001; log_p = log10(p_error); log_1p = log10(1-p_error); log_2 = log10(2).
+constexpr double kPError = 0.001;
+const double kLogP = std::log10(kPError);
+const double kLog1P = std::log10(1.0 - kPError);
+const double kLog2 = std::log10(2.0);
+constexpr int kMaxQual = 60;
+constexpr int kMaxGQ = 60;
+
+// longcallD cal_var_QUAL1 (math_utils.c / collect_var.c:1454).
+static int cal_var_QUAL1(int ref_depth, int alt_depth) {
+    const int q = static_cast<int>(-10.0 * (ref_depth * kLog1P + alt_depth * kLogP));
+    return std::min(kMaxQual, q);
+}
+
+// longcallD cal_sample_GQ (math_utils.c / collect_var.c:1435).
+static int cal_sample_GQ(int ref_depth, int alt_depth) {
+    int PL[3];
+    PL[0] = static_cast<int>(-10.0 * (ref_depth * kLog1P + alt_depth * kLogP));
+    PL[1] = static_cast<int>( 10.0 * (ref_depth + alt_depth) * kLog2);
+    PL[2] = static_cast<int>(-10.0 * (ref_depth * kLogP + alt_depth * kLog1P));
+    int min_pl = INT_MAX, sec_min_pl = INT_MAX;
+    for (int i = 0; i < 3; ++i) {
+        if (PL[i] < min_pl) {
+            sec_min_pl = min_pl;
+            min_pl = PL[i];
+        } else if (PL[i] < sec_min_pl) {
+            sec_min_pl = PL[i];
+        }
+    }
+    return std::min(kMaxGQ, sec_min_pl - min_pl);
+}
+
 struct VcfRecordCore {
     hts_pos_t pos = 0;
     std::string ref_seq;
     std::string alt_seq;
     std::string filter;
     std::string info;
+    int qual = 0;   // longcallD QUAL
+    int gq = 0;     // longcallD GQ
+    int dp = 0;     // total_cov
+    int ad_ref = 0; // ref allele depth
+    int ad_alt = 0; // alt allele depth
 };
 
 /** longcallD `vcf_utils.c` `write_var_to_vcf`: skip when `opt->out_amb_base == 0` and any nt ≥ 4 (non-ACGT). */
@@ -493,6 +540,12 @@ static VcfRecordCore build_vcf_record_core(const CandidateVariant& candidate,
          << ";LQC=" << counts.low_qual_cov << ";AF=" << counts.allele_fraction
          << ";CAT=" << category_name(counts.category);
     core.info = info.str();
+
+    core.dp = counts.total_cov;
+    core.ad_ref = counts.ref_cov;
+    core.ad_alt = counts.alt_cov;
+    core.qual = cal_var_QUAL1(core.ad_ref, core.ad_alt);
+    core.gq = cal_sample_GQ(core.ad_ref, core.ad_alt);
     return core;
 }
 } // namespace
@@ -528,7 +581,7 @@ void write_variants_vcf_records(std::ostream& out,
         const VcfRecordCore core = build_vcf_record_core(candidate, opts, header, ref);
         if (!passes_longcalld_vcf_amb_base_gate(opts, core)) continue;
         out << chrom << '\t' << core.pos << "\t.\t" << core.ref_seq << '\t' << core.alt_seq
-            << "\t.\t" << core.filter << '\t' << core.info << '\n';
+            << '\t' << core.qual << '\t' << core.filter << '\t' << core.info << '\n';
     }
 }
 
@@ -548,18 +601,41 @@ void write_phased_variants_vcf_records(std::ostream& out,
         if (!passes_longcalld_vcf_amb_base_gate(opts, core)) continue;
 
         const auto [hap_alt, hap_ref] = derive_hap_alt_ref_from_consensus(candidate);
-        std::string gt = "./.";
-        if (hap_alt == 1 && hap_ref == 2) gt = "1|0";
-        else if (hap_alt == 2 && hap_ref == 1) gt = "0|1";
-        else if (hap_alt == 3) gt = "1|1";
-        else if (candidate.counts.category == VariantCategory::NonVariant) gt = "0/0";
 
-        std::string ps = ".";
-        if ((gt == "1|0" || gt == "0|1") && candidate.phase_set > 0) {
-            ps = std::to_string(candidate.phase_set);
+        // longcallD write_var_to_vcf: GT separator is '|' when PS != 0, else '/'.
+        // For unphased ('/' separator), GT alleles are sorted (lower first).
+        int gt1 = 0, gt2 = 0;
+        bool is_hom = false;
+        if (hap_alt == 1 && hap_ref == 2) { gt1 = 1; gt2 = 0; }
+        else if (hap_alt == 2 && hap_ref == 1) { gt1 = 0; gt2 = 1; }
+        else if (hap_alt == 3) { gt1 = 1; gt2 = 1; is_hom = true; }
+        // else: gt1=0, gt2=0 (ref/ref or no-call)
+
+        const hts_pos_t ps_val = candidate.phase_set;
+        char gt_sep = '|';
+        if (ps_val == 0) {
+            gt_sep = '/';
+            if (gt1 > gt2) std::swap(gt1, gt2);
         }
+
+        // VAF: alt / total (matches longcallD vcf_utils.c)
+        const float vaf = core.dp > 0
+                              ? static_cast<float>(core.ad_alt) / static_cast<float>(core.dp)
+                              : 0.0f;
+
+        // FORMAT: GT:DP:AD:VAF:GQ[:PS]  (PS only for phased hets, matching longcallD)
+        const bool emit_ps = (!is_hom && ps_val != 0);
         out << chrom << '\t' << core.pos << "\t.\t" << core.ref_seq << '\t' << core.alt_seq
-            << "\t.\t" << core.filter << '\t' << core.info << "\tGT:PS\t" << gt << ':' << ps << '\n';
+            << '\t' << core.qual << '\t' << core.filter << '\t' << core.info;
+        out << "\tGT:DP:AD:VAF:GQ";
+        if (emit_ps) out << ":PS";
+        out << '\t' << gt1 << gt_sep << gt2 << ':' << core.dp
+            << ':' << core.ad_ref << ',' << core.ad_alt;
+        char vaf_buf[16];
+        std::snprintf(vaf_buf, sizeof(vaf_buf), "%.3f", static_cast<double>(vaf));
+        out << ':' << vaf_buf << ':' << core.gq;
+        if (emit_ps) out << ':' << ps_val;
+        out << '\n';
     }
 }
 
