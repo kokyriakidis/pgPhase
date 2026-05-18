@@ -736,6 +736,7 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         GraphVariantEmitRow row;
         row.chrom = site.ref_contig.empty() ? site.chrom : site.ref_contig;
         row.pos = site.pos;
+        row.snarl_id = ci < out.site_ids.size() ? out.site_ids[ci] : ".";
         row.ref = site.ref;
 
         int orig_walk_idx = 1;
@@ -983,7 +984,7 @@ void write_graph_bam_phase_sites_tsv(std::ostream& out,
 }
 
 void write_graph_bam_variants_tsv_header(std::ostream& out) {
-    out << "CHROM\tPOS\tTYPE\tREF\tALT\tDP\tREF_COUNT\tALT_COUNT\tLOW_QUAL_COUNT"
+    out << "CHROM\tPOS\tSNARL_ID\tTYPE\tREF\tALT\tDP\tREF_COUNT\tALT_COUNT\tLOW_QUAL_COUNT"
            "\tFORWARD_REF\tREVERSE_REF\tFORWARD_ALT\tREVERSE_ALT"
            "\tAF\tCATEGORY\tINIT_CAT\tPHASE_SET\tHAP_ALT\tHAP_REF\n";
 }
@@ -992,6 +993,7 @@ static void write_graph_bam_variant_tsv_line(std::ostream& out,
                                              const CandidateVariant& cand,
                                              const std::string& chrom,
                                              hts_pos_t pos,
+                                             const std::string& snarl_id,
                                              const std::string& ref_seq,
                                              const std::string& alt_seq) {
     if (ref_seq.empty()) return;
@@ -1012,7 +1014,7 @@ static void write_graph_bam_variant_tsv_line(std::ostream& out,
     if (h1 < 0) h1 = 0;
     if (h2 < 0) h2 = 0;
 
-    out << chrom << '\t' << pos << '\t' << type_name(vtype) << '\t'
+    out << chrom << '\t' << pos << '\t' << snarl_id << '\t' << type_name(vtype) << '\t'
         << ref_seq << '\t' << alt_seq << '\t'
         << cand.counts.total_cov << '\t' << cand.counts.ref_cov << '\t'
         << cand.counts.alt_cov << '\t' << cand.counts.low_qual_cov << '\t'
@@ -1042,7 +1044,8 @@ static void write_graph_bam_variant_one_row(std::ostream& out,
     const int alt_seq_idx = orig_walk_idx - 1;
     if (alt_seq_idx < 0 || alt_seq_idx >= static_cast<int>(site.alts.size())) return;
     const std::string& alt_seq = site.alts[static_cast<size_t>(alt_seq_idx)];
-    write_graph_bam_variant_tsv_line(out, cand, chrom, site.pos, ref_seq, alt_seq);
+    const std::string& snarl_id = ci < gc.site_ids.size() ? gc.site_ids[ci] : std::string(".");
+    write_graph_bam_variant_tsv_line(out, cand, chrom, site.pos, snarl_id, ref_seq, alt_seq);
 }
 
 void write_graph_bam_variants_tsv_rows(
@@ -1096,7 +1099,7 @@ void write_graph_bam_variants_tsv_rows(std::ostream& out,
     for (size_t ci = 0; ci < gc.chunk.candidates.size(); ++ci) {
         const GraphVariantEmitRow& row = gc.variant_emit_rows[ci];
         write_graph_bam_variant_tsv_line(out, gc.chunk.candidates[ci],
-                                         row.chrom, row.pos, row.ref, row.alt);
+                                         row.chrom, row.pos, row.snarl_id, row.ref, row.alt);
     }
 }
 
