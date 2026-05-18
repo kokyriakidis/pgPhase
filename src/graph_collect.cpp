@@ -902,6 +902,7 @@ static void print_graph_collect_help() {
         << "      --sample NAME             Reference sample name for GBZ interval queries\n"
         << "                                (auto-derived from FASTA if not provided)\n"
         << "      --gbz-query-bin FILE      Path to GBZ-base query binary [query]\n"
+        << "      --ont                     ONT read mode (enables strand-bias filter)\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
         << "  -h, --help                    Print this help\n";
 }
@@ -920,6 +921,7 @@ enum GraphCollectOption {
     kGcAutosome,
     kGcSample,
     kGcGbzQueryBin,
+    kGcOnt,
 };
 
 } // namespace
@@ -959,6 +961,7 @@ int collect_graph_variation(int argc, char* argv[]) {
         {"gaf-db",            required_argument, nullptr, kGcGafDb},
         {"sample",            required_argument, nullptr, kGcSample},
         {"gbz-query-bin",     required_argument, nullptr, kGcGbzQueryBin},
+        {"ont",               no_argument,       nullptr, kGcOnt},
         {"verbose",           required_argument, nullptr, 'V'},
         {"help",              no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -987,6 +990,7 @@ int collect_graph_variation(int argc, char* argv[]) {
             case kGcGafDb:        opts.gaf_db = optarg; break;
             case kGcSample:       opts.graph_sample = optarg; break;
             case kGcGbzQueryBin:  opts.gbz_query_bin = optarg; break;
+            case kGcOnt:          opts.read_technology = ReadTechnology::Ont; break;
             case 'V': opts.verbose = std::stoi(optarg); break;
             case 'h': print_graph_collect_help(); return 0;
             default:  print_graph_collect_help(); return 1;
