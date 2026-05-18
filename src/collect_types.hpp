@@ -187,6 +187,7 @@ struct Options {
     std::string output_tsv = "output.tsv";
     std::string output_vcf;
     std::string output_phased_vcf;
+    std::string output_phased_bam;
     /** If non-empty, output phased SAM/BAM/CRAM with HP/PS tags (longcallD-style -S/-b/-C). */
     std::string output_aln;
     /** Output alignment format selected by -S/-b/-C (longcallD style). */
@@ -217,28 +218,11 @@ struct Options {
     std::string gaf_db;
     /** Optional precomputed vg deconstruct VCF used as a development/debug graph-site catalog. */
     std::string graph_sites_vcf;
-    /** Optional diagnostic dump of the parsed graph-site catalog. */
-    std::string graph_sites_tsv;
-    /** Optional diagnostic dump of exact read->graph-site allele observations. */
-    std::string graph_read_support_tsv;
-    /** Optional diagnostic dump of per-graph-site allele counts from exact read support. */
-    std::string graph_site_counts_tsv;
-    /** Optional diagnostic dump of sparse per-read graph-site allele profiles. */
-    std::string graph_read_profile_tsv;
-    /** Optional experimental graph-site hap consensus output after graph-only phasing. */
-    std::string graph_phase_sites_tsv;
-    /** Optional experimental graph read HAP/PHASE_SET output after graph-only phasing. */
-    std::string graph_phase_reads_tsv;
-    /** When true, chunk stitching flips per-read hap assignments (not just candidates). */
-    bool touch_read_phase = false;
     /** GBZ-base query binary. */
 #ifndef GBZ_QUERY_DEFAULT
 #define GBZ_QUERY_DEFAULT "query"
 #endif
     std::string gbz_query_bin = GBZ_QUERY_DEFAULT;
-    /** GAF-base construction binary. */
-    std::string gaf2db_bin = "gaf2db";
-    int graph_between_limit_nodes = 100000;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
     /** CLI command string used for PG:CL header field in phased SAM/BAM/CRAM output. */
     std::string command_line;
