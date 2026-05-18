@@ -460,17 +460,15 @@ static int get_digar_ave_qual(const DigarOp& d, const std::vector<uint8_t>& qual
 /**
  * @brief Updates strand-aware depth counters for one read observation at a site.
  *
- * Low-quality observations increment only `low_qual_cov`. Palindromic ONT reads contribute to
- * depth and ref/alt counts but not to forward/reverse strand tallies.
+ * Low-quality observations increment only `low_qual_cov`.
+ * Matches longcallD `update_var_site_with_allele`: strand is always counted.
  *
  * @param counts Counters to update.
  * @param reverse Read reverse flag.
  * @param alt True if observation supports alternate allele.
  * @param low_quality True if counted toward `low_qual_cov` only.
- * @param is_ont_palindrome If true, strand subcounts are skipped.
  */
-static void add_coverage(VariantCounts& counts, bool reverse, bool alt, bool low_quality,
-                         bool is_ont_palindrome) {
+static void add_coverage(VariantCounts& counts, bool reverse, bool alt, bool low_quality) {
     if (low_quality) {
         counts.low_qual_cov++;
         return;
@@ -478,10 +476,10 @@ static void add_coverage(VariantCounts& counts, bool reverse, bool alt, bool low
     counts.total_cov++;
     if (alt) {
         counts.alt_cov++;
-        if (!is_ont_palindrome) reverse ? counts.reverse_alt++ : counts.forward_alt++;
+        reverse ? counts.reverse_alt++ : counts.forward_alt++;
     } else {
         counts.ref_cov++;
-        if (!is_ont_palindrome) reverse ? counts.reverse_ref++ : counts.forward_ref++;
+        reverse ? counts.reverse_ref++ : counts.forward_ref++;
     }
 }
 
@@ -539,7 +537,7 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
             const int ret = lcd_exact_comp_var_site_ins_merge(&cand_site, &dig_site, min_sv_len);
             if (ret < 0) {
                 VariantCounts& c = variants[static_cast<size_t>(site_i)].counts;
-                add_coverage(c, read.reverse, false, false, read.is_ont_palindrome);
+                add_coverage(c, read.reverse, false, false);
                 if (read_support_out != nullptr && chunk_region != nullptr) {
                     const auto& k = variants[static_cast<size_t>(site_i)].key;
                     read_support_out->push_back(ReadSupportRow{k.tid,
@@ -559,8 +557,7 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
             } else if (ret == 0) {
                 const bool lq = d.low_quality || ave < min_bq;
                 add_coverage(
-                    variants[static_cast<size_t>(site_i)].counts, read.reverse, true, lq,
-                    read.is_ont_palindrome);
+                    variants[static_cast<size_t>(site_i)].counts, read.reverse, true, lq);
                 if (read_support_out != nullptr && chunk_region != nullptr) {
                     const auto& k = variants[static_cast<size_t>(site_i)].key;
                     read_support_out->push_back(
@@ -589,8 +586,7 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                 break;
             }
             if (variants[static_cast<size_t>(site_i)].key.pos > pos_end) break;
-            add_coverage(variants[static_cast<size_t>(site_i)].counts, read.reverse, false, false,
-                         read.is_ont_palindrome);
+            add_coverage(variants[static_cast<size_t>(site_i)].counts, read.reverse, false, false);
             if (read_support_out != nullptr && chunk_region != nullptr) {
                 const auto& k = variants[static_cast<size_t>(site_i)].key;
                 read_support_out->push_back(ReadSupportRow{k.tid,
@@ -1008,13 +1004,13 @@ void pre_process_noisy_regs_pgphase(BamChunk& chunk, const Options& opts) {
 
     const int min_noisy_reg_reads = opts.min_alt_depth;
     const float min_noisy_reg_ratio = static_cast<float>(opts.min_af);
-    const int min_overlap_reads = opts.min_noisy_reg_total_depth;
     int n_skipped = 0;
     for (int i = 0; i < noisy_regs->n_r; ++i) {
         const int n_noisy = noisy_reg_to_noisy[static_cast<size_t>(i)];
         const int n_total = noisy_reg_to_total[static_cast<size_t>(i)];
-        if ((min_overlap_reads > 0 && n_total < min_overlap_reads) ||
-            n_noisy < min_noisy_reg_reads ||
+        // Matches longcallD pre_process_noisy_regs: skip if too few noisy reads
+        // or if noisy/total ratio is below threshold.
+        if (n_noisy < min_noisy_reg_reads ||
             (n_total > 0 &&
              static_cast<float>(n_noisy) / static_cast<float>(n_total) < min_noisy_reg_ratio)) {
             skip_noisy_reg[static_cast<size_t>(i)] = 1;
