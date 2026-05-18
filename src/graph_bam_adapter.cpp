@@ -221,6 +221,9 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
 
     std::unordered_map<std::string, int> site_to_candidate;
     std::vector<std::vector<int>> allele_counts;
+    // Per-site, per-allele strand counts — accumulated from raw rows before dedup.
+    std::vector<std::vector<int>> fwd_strand_counts;
+    std::vector<std::vector<int>> rev_strand_counts;
     std::vector<int> parent_candidate;
     std::vector<std::vector<int>> conditional_parent_alleles;
     std::vector<size_t> catalog_site_idx_phase1;
@@ -244,6 +247,8 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         }
         site_to_candidate.emplace(sid, static_cast<int>(out.chunk.candidates.size()));
         allele_counts.emplace_back(static_cast<size_t>(n_alleles), 0);
+        fwd_strand_counts.emplace_back(static_cast<size_t>(n_alleles), 0);
+        rev_strand_counts.emplace_back(static_cast<size_t>(n_alleles), 0);
         parent_candidate.push_back(-1);
         conditional_parent_alleles.push_back(site.conditional_parent_alleles);
         const std::string& site_contig = site.ref_contig.empty() ? site.chrom : site.ref_contig;
@@ -275,6 +280,10 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         const int site_i = it->second;
         CandidateVariant& candidate = out.chunk.candidates[static_cast<size_t>(site_i)];
         if (row.allele < 0 || row.allele >= candidate.counts.n_uniq_alles) continue;
+        // Accumulate per-observation strand counts (before read-level dedup).
+        auto& sc = row.reverse ? rev_strand_counts[static_cast<size_t>(site_i)]
+                               : fwd_strand_counts[static_cast<size_t>(site_i)];
+        ++sc[static_cast<size_t>(row.allele)];
         std::unordered_map<int, int>& by_site = allele_by_read_site[row.read_name];
         auto obs_it = by_site.find(site_i);
         if (obs_it == by_site.end()) {
@@ -309,13 +318,19 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     for (size_t site_i = 0; site_i < out.chunk.candidates.size(); ++site_i) {
         CandidateVariant& candidate = out.chunk.candidates[site_i];
         const std::vector<int>& counts = allele_counts[site_i];
+        const std::vector<int>& fwd = fwd_strand_counts[site_i];
+        const std::vector<int>& rev = rev_strand_counts[site_i];
         candidate.counts.alle_covs = counts;
         candidate.counts.ref_cov = counts.empty() ? 0 : counts[0];
         candidate.counts.alt_cov = 0;
         for (size_t allele = 1; allele < counts.size(); ++allele) candidate.counts.alt_cov += counts[allele];
         candidate.counts.total_cov = candidate.counts.ref_cov + candidate.counts.alt_cov;
-        candidate.counts.forward_ref = candidate.counts.ref_cov;
-        candidate.counts.forward_alt = candidate.counts.alt_cov;
+        candidate.counts.forward_ref = fwd.empty() ? 0 : fwd[0];
+        candidate.counts.reverse_ref = rev.empty() ? 0 : rev[0];
+        candidate.counts.forward_alt = 0;
+        candidate.counts.reverse_alt = 0;
+        for (size_t allele = 1; allele < fwd.size(); ++allele) candidate.counts.forward_alt += fwd[allele];
+        for (size_t allele = 1; allele < rev.size(); ++allele) candidate.counts.reverse_alt += rev[allele];
         candidate.counts.allele_fraction =
             candidate.counts.total_cov > 0
                 ? static_cast<double>(candidate.counts.alt_cov) / candidate.counts.total_cov
@@ -332,25 +347,37 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     for (size_t i = 0; i < n_cands; ++i) {
         CandidateVariant& cand = out.chunk.candidates[i];
         std::vector<int>& ac = allele_counts[i];
+        std::vector<int>& fc = fwd_strand_counts[i];
+        std::vector<int>& rc = rev_strand_counts[i];
         allele_remap[i].assign(ac.size(), -1);
         allele_remap[i][0] = 0;  // ref walk always kept at index 0
         std::vector<int> new_ac = {ac[0]};
+        std::vector<int> new_fc = {fc[0]};
+        std::vector<int> new_rc = {rc[0]};
         int next_allele = 1;
         for (size_t a = 1; a < ac.size(); ++a) {
             if (ac[a] >= opts.min_alt_depth) {
                 allele_remap[i][a] = next_allele++;
                 new_ac.push_back(ac[a]);
+                new_fc.push_back(a < fc.size() ? fc[a] : 0);
+                new_rc.push_back(a < rc.size() ? rc[a] : 0);
             }
         }
         allele_counts[i] = new_ac;
+        fwd_strand_counts[i] = new_fc;
+        rev_strand_counts[i] = new_rc;
         cand.counts.alle_covs = new_ac;
         cand.counts.n_uniq_alles = static_cast<int>(new_ac.size());
         cand.counts.ref_cov = new_ac[0];
         cand.counts.alt_cov = 0;
         for (size_t a = 1; a < new_ac.size(); ++a) cand.counts.alt_cov += new_ac[a];
         cand.counts.total_cov = cand.counts.ref_cov + cand.counts.alt_cov;
-        cand.counts.forward_ref = cand.counts.ref_cov;
-        cand.counts.forward_alt = cand.counts.alt_cov;
+        cand.counts.forward_ref = new_fc[0];
+        cand.counts.reverse_ref = new_rc[0];
+        cand.counts.forward_alt = 0;
+        cand.counts.reverse_alt = 0;
+        for (size_t a = 1; a < new_fc.size(); ++a) cand.counts.forward_alt += new_fc[a];
+        for (size_t a = 1; a < new_rc.size(); ++a) cand.counts.reverse_alt += new_rc[a];
         cand.counts.allele_fraction = cand.counts.total_cov > 0
             ? static_cast<double>(cand.counts.alt_cov) / cand.counts.total_cov
             : 0.0;
@@ -394,6 +421,8 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     std::vector<CandidateVariant> new_cands;
     std::vector<std::string>      new_ids;
     std::vector<std::vector<int>> new_allele_counts;
+    std::vector<std::vector<int>> new_fwd_strand;
+    std::vector<std::vector<int>> new_rev_strand;
     std::vector<int>              new_par;
     std::vector<std::vector<int>> new_cpa;
     std::vector<std::vector<int>> new_orig_idx;
@@ -401,6 +430,8 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     new_cands.reserve(n_cands);
     new_ids.reserve(n_cands);
     new_allele_counts.reserve(n_cands);
+    new_fwd_strand.reserve(n_cands);
+    new_rev_strand.reserve(n_cands);
     new_par.reserve(n_cands);
     new_cpa.reserve(n_cands);
     new_orig_idx.reserve(n_cands);
@@ -411,6 +442,8 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
             out.filtered_sites.push_back({out.site_ids[i], ac[0], 0, ac[0], 0.0, "ref_only"});
             continue;
         }
+        const std::vector<int>& fc = fwd_strand_counts[i];
+        const std::vector<int>& rc_s = rev_strand_counts[i];
         const int ref_c = ac[0];
         for (size_t a = 1; a < ac.size(); ++a) {
             const int alt_c   = ac[a];
@@ -436,6 +469,11 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
                 continue;
             }
 
+            const int fwd_ref = fc.empty() ? 0 : fc[0];
+            const int rev_ref = rc_s.empty() ? 0 : rc_s[0];
+            const int fwd_alt = a < fc.size() ? fc[a] : 0;
+            const int rev_alt = a < rc_s.size() ? rc_s[a] : 0;
+
             const int new_idx = static_cast<int>(new_cands.size());
             old_site_to_pairs[i].push_back({new_idx, static_cast<int>(a)});
 
@@ -445,12 +483,16 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
             pair_cand.counts.ref_cov         = ref_c;
             pair_cand.counts.alt_cov         = alt_c;
             pair_cand.counts.total_cov       = total_c;
-            pair_cand.counts.forward_ref     = ref_c;
-            pair_cand.counts.forward_alt     = alt_c;
+            pair_cand.counts.forward_ref     = fwd_ref;
+            pair_cand.counts.reverse_ref     = rev_ref;
+            pair_cand.counts.forward_alt     = fwd_alt;
+            pair_cand.counts.reverse_alt     = rev_alt;
             pair_cand.counts.allele_fraction = af;
             new_cands.push_back(pair_cand);
             new_ids.push_back(pair_id);
             new_allele_counts.push_back({ref_c, alt_c});
+            new_fwd_strand.push_back({fwd_ref, fwd_alt});
+            new_rev_strand.push_back({rev_ref, rev_alt});
             new_par.push_back(-1);
             new_cpa.push_back({});
             new_orig_idx.push_back({0, orig_alt});
@@ -484,6 +526,8 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     out.chunk.candidates       = std::move(new_cands);
     out.site_ids               = std::move(new_ids);
     allele_counts              = std::move(new_allele_counts);
+    fwd_strand_counts          = std::move(new_fwd_strand);
+    rev_strand_counts          = std::move(new_rev_strand);
     parent_candidate           = std::move(new_par);
     conditional_parent_alleles = std::move(new_cpa);
     allele_orig_idx            = std::move(new_orig_idx);
