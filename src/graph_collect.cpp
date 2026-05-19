@@ -334,15 +334,12 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
                     GraphSiteCatalog chunk_catalog = filter_graph_catalog_for_interval(
                         catalog, contig_name, region.beg - 1, region.end);
 
-                    const bool capture_walks = (pgbam_sidecar != nullptr);
-                    ReadWalkMap read_walks;
                     std::vector<GraphReadAllele> chunk_rows;
                     if (!chunk_catalog.sites.empty()) {
                         chunk_rows = query_gbz_interval_gaf_ffi(
                             gbz_h, gaf_h, ref_sample, query_contig,
                             region.beg - 1, region.end,
-                            chunk_catalog, qconfig.min_mapq,
-                            capture_walks ? &read_walks : nullptr);
+                            chunk_catalog, qconfig.min_mapq);
                     }
 
                     graph_chunks[offset] = build_graph_bam_chunk(
@@ -352,8 +349,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
                         region.beg - 1,
                         region.end,
                         region.chunk_id,
-                        opts,
-                        capture_walks ? &read_walks : nullptr);
+                        opts);
 
                     assign_hap_based_on_germline_het_vars_kmeans(
                         graph_chunks[offset].chunk, opts, kCandGermlineClean);
@@ -430,15 +426,12 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
                     GraphSiteCatalog chunk_catalog = filter_graph_catalog_for_interval(
                         catalog, contig_name, region.beg - 1, region.end);
 
-                    const bool capture_walks = (pgbam_sidecar != nullptr);
-                    ReadWalkMap read_walks;
                     std::vector<GraphReadAllele> chunk_rows;
                     if (!chunk_catalog.sites.empty()) {
                         chunk_rows = scan_indexed_gaf_chunk(
                             gaf_file, query_contig,
                             region.beg - 1, region.end,
-                            chunk_catalog, min_mapq,
-                            capture_walks ? &read_walks : nullptr);
+                            chunk_catalog, min_mapq);
                     }
 
                     graph_chunks[offset] = build_graph_bam_chunk(
@@ -448,8 +441,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
                         region.beg - 1,
                         region.end,
                         region.chunk_id,
-                        opts,
-                        capture_walks ? &read_walks : nullptr);
+                        opts);
 
                     assign_hap_based_on_germline_het_vars_kmeans(
                         graph_chunks[offset].chunk, opts, kCandGermlineClean);
