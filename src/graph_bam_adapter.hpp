@@ -64,7 +64,8 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
                                                hts_pos_t beg,
                                                hts_pos_t end,
                                                int chunk_id,
-                                               const Options& opts);
+                                               const Options& opts,
+                                               const ReadWalkMap* read_walks = nullptr);
 
 // ── Overlap / stitch helpers ──────────────────────────────────────────────────
 

@@ -49,6 +49,11 @@ bool stitch_adjacent_chunks_with_pgbam(BamChunk& pre,
                                        int min_winning_threads,
                                        int polarity_margin);
 
+/**
+ * @brief Load a .pgbam sidecar file (PGS1 format) into a set_id → thread-ID map.
+ */
+PgbamSidecarData load_pgbam_sidecar(const std::string& path);
+
 } // namespace pgphase_collect
 
 #endif

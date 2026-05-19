@@ -13,6 +13,7 @@
 #include "collect_bam_output.hpp"
 #include "collect_output.hpp"
 #include "collect_phase.hpp"
+#include "collect_phase_pgbam.hpp"
 #include "collect_var.hpp"
 
 #include <algorithm>
@@ -34,75 +35,6 @@
 #include <htslib/sam.h>
 
 namespace pgphase_collect {
-
-static uint32_t read_u32_le_or_throw(std::istream& in, const char* what) {
-    uint8_t b[4] = {0, 0, 0, 0};
-    in.read(reinterpret_cast<char*>(b), 4);
-    if (!in) throw std::runtime_error(std::string("failed reading ") + what);
-    return static_cast<uint32_t>(b[0]) |
-           (static_cast<uint32_t>(b[1]) << 8) |
-           (static_cast<uint32_t>(b[2]) << 16) |
-           (static_cast<uint32_t>(b[3]) << 24);
-}
-
-static uint64_t read_u64_le_or_throw(std::istream& in, const char* what) {
-    uint8_t b[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    in.read(reinterpret_cast<char*>(b), 8);
-    if (!in) throw std::runtime_error(std::string("failed reading ") + what);
-    return static_cast<uint64_t>(b[0]) |
-           (static_cast<uint64_t>(b[1]) << 8) |
-           (static_cast<uint64_t>(b[2]) << 16) |
-           (static_cast<uint64_t>(b[3]) << 24) |
-           (static_cast<uint64_t>(b[4]) << 32) |
-           (static_cast<uint64_t>(b[5]) << 40) |
-           (static_cast<uint64_t>(b[6]) << 48) |
-           (static_cast<uint64_t>(b[7]) << 56);
-}
-
-static std::string read_sized_string_or_throw(std::istream& in, const char* what) {
-    const uint32_t n = read_u32_le_or_throw(in, what);
-    std::string s(static_cast<size_t>(n), '\0');
-    if (n > 0) {
-        in.read(&s[0], static_cast<std::streamsize>(n));
-        if (!in) throw std::runtime_error(std::string("failed reading ") + what);
-    }
-    return s;
-}
-
-static PgbamSidecarData load_pgbam_sidecar(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) throw std::runtime_error("cannot open pgbam sidecar: " + path);
-    char magic[4] = {0, 0, 0, 0};
-    in.read(magic, 4);
-    if (!in || !(magic[0] == 'P' && magic[1] == 'G' && magic[2] == 'S' && magic[3] == '1')) {
-        throw std::runtime_error("invalid pgbam sidecar magic in: " + path);
-    }
-    const uint32_t version = read_u32_le_or_throw(in, "pgbam sidecar version");
-    if (version != 1) {
-        throw std::runtime_error("unsupported pgbam sidecar version in: " + path);
-    }
-    uint8_t used_r_index = 0;
-    in.read(reinterpret_cast<char*>(&used_r_index), 1);
-    if (!in) throw std::runtime_error("failed reading pgbam sidecar r-index flag");
-    (void)used_r_index;
-    (void)read_sized_string_or_throw(in, "pgbam sidecar fingerprint");
-
-    PgbamSidecarData data;
-    while (in.peek() != std::char_traits<char>::eof()) {
-        const uint32_t set_id = read_u32_le_or_throw(in, "pgbam set_id");
-        const uint32_t n_threads = read_u32_le_or_throw(in, "pgbam set thread count");
-        std::vector<uint64_t> threads;
-        threads.reserve(static_cast<size_t>(n_threads));
-        for (uint32_t i = 0; i < n_threads; ++i) {
-            threads.push_back(read_u64_le_or_throw(in, "pgbam thread_id"));
-        }
-        const auto inserted = data.set_to_threads.emplace(set_id, std::move(threads));
-        if (!inserted.second) {
-            throw std::runtime_error("duplicate set_id in pgbam sidecar: " + std::to_string(set_id));
-        }
-    }
-    return data;
-}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Region chunking

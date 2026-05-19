@@ -2,6 +2,7 @@
 
 #include "collect_output.hpp"
 #include "collect_phase.hpp"
+#include "collect_phase_pgbam.hpp"
 #include "collect_pipeline.hpp"
 #include "collect_types.hpp"
 #include "collect_var.hpp"
@@ -257,7 +258,8 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
     const GraphQueryConfig& qconfig,
     const std::string& ref_sample,
     const std::unordered_map<std::string, std::string>& fai_full_to_suffix,
-    const Options& opts)
+    const Options& opts,
+    const PgbamSidecarData* pgbam_sidecar)
 {
     const size_t batch_size = batch_end - batch_begin;
     std::vector<GraphBamChunkBuildResult> graph_chunks(batch_size);
@@ -332,12 +334,15 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
                     GraphSiteCatalog chunk_catalog = filter_graph_catalog_for_interval(
                         catalog, contig_name, region.beg - 1, region.end);
 
+                    const bool capture_walks = (pgbam_sidecar != nullptr);
+                    ReadWalkMap read_walks;
                     std::vector<GraphReadAllele> chunk_rows;
                     if (!chunk_catalog.sites.empty()) {
                         chunk_rows = query_gbz_interval_gaf_ffi(
                             gbz_h, gaf_h, ref_sample, query_contig,
                             region.beg - 1, region.end,
-                            chunk_catalog, qconfig.min_mapq);
+                            chunk_catalog, qconfig.min_mapq,
+                            capture_walks ? &read_walks : nullptr);
                     }
 
                     graph_chunks[offset] = build_graph_bam_chunk(
@@ -347,7 +352,8 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
                         region.beg - 1,
                         region.end,
                         region.chunk_id,
-                        opts);
+                        opts,
+                        capture_walks ? &read_walks : nullptr);
 
                     assign_hap_based_on_germline_het_vars_kmeans(
                         graph_chunks[offset].chunk, opts, kCandGermlineClean);
@@ -370,7 +376,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
     bam_chunks.reserve(batch_size);
     for (GraphBamChunkBuildResult& gc : graph_chunks)
         bam_chunks.push_back(std::move(gc.chunk));
-    stitch_chunk_haps(bam_chunks, &opts, nullptr);
+    stitch_chunk_haps(bam_chunks, &opts, pgbam_sidecar);
     for (size_t i = 0; i < batch_size; ++i)
         graph_chunks[i].chunk = std::move(bam_chunks[i]);
 
@@ -389,7 +395,8 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
     const std::string& gaf_file,
     int min_mapq,
     const std::unordered_map<std::string, std::string>& fai_full_to_suffix,
-    const Options& opts)
+    const Options& opts,
+    const PgbamSidecarData* pgbam_sidecar)
 {
     const size_t batch_size = batch_end - batch_begin;
     std::vector<GraphBamChunkBuildResult> graph_chunks(batch_size);
@@ -423,12 +430,15 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
                     GraphSiteCatalog chunk_catalog = filter_graph_catalog_for_interval(
                         catalog, contig_name, region.beg - 1, region.end);
 
+                    const bool capture_walks = (pgbam_sidecar != nullptr);
+                    ReadWalkMap read_walks;
                     std::vector<GraphReadAllele> chunk_rows;
                     if (!chunk_catalog.sites.empty()) {
                         chunk_rows = scan_indexed_gaf_chunk(
                             gaf_file, query_contig,
                             region.beg - 1, region.end,
-                            chunk_catalog, min_mapq);
+                            chunk_catalog, min_mapq,
+                            capture_walks ? &read_walks : nullptr);
                     }
 
                     graph_chunks[offset] = build_graph_bam_chunk(
@@ -438,7 +448,8 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
                         region.beg - 1,
                         region.end,
                         region.chunk_id,
-                        opts);
+                        opts,
+                        capture_walks ? &read_walks : nullptr);
 
                     assign_hap_based_on_germline_het_vars_kmeans(
                         graph_chunks[offset].chunk, opts, kCandGermlineClean);
@@ -458,7 +469,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
     bam_chunks.reserve(batch_size);
     for (GraphBamChunkBuildResult& gc : graph_chunks)
         bam_chunks.push_back(std::move(gc.chunk));
-    stitch_chunk_haps(bam_chunks, &opts, nullptr);
+    stitch_chunk_haps(bam_chunks, &opts, pgbam_sidecar);
     for (size_t i = 0; i < batch_size; ++i)
         graph_chunks[i].chunk = std::move(bam_chunks[i]);
 
@@ -479,6 +490,16 @@ void run_collect_graph_variation(const Options& opts) {
         if (!opts.gbz_db.empty() || !opts.gaf_db.empty()) {
             std::cerr << "Warning: --gaf provided; ignoring --gbz-db/--gaf-db\n";
         }
+    }
+
+    // Load optional .pgbam sidecar for fallback chunk stitching.
+    std::unique_ptr<PgbamSidecarData> pgbam_sidecar;
+    if (!opts.pgbam_file.empty()) {
+        pgbam_sidecar = std::make_unique<PgbamSidecarData>(load_pgbam_sidecar(opts.pgbam_file));
+        if (opts.verbose >= 1)
+            std::cerr << "Loaded pgbam sidecar with "
+                      << pgbam_sidecar->set_to_threads.size() << " sets from "
+                      << opts.pgbam_file << "\n";
     }
 
     // 1. Reference FASTA index first — needed to resolve autosome contig names for
@@ -699,10 +720,12 @@ void run_collect_graph_variation(const Options& opts) {
             use_indexed_gaf
                 ? process_graph_chunk_batch_indexed_gaf(
                       catalog, chunks, batch_begin, batch_end, header.get(),
-                      opts.gaf_file, opts.min_mapq, fai_full_to_suffix, opts)
+                      opts.gaf_file, opts.min_mapq, fai_full_to_suffix, opts,
+                      pgbam_sidecar.get())
                 : process_graph_chunk_batch(
                       catalog, chunks, batch_begin, batch_end, header.get(),
-                      qconfig, ref_sample, fai_full_to_suffix, opts);
+                      qconfig, ref_sample, fai_full_to_suffix, opts,
+                      pgbam_sidecar.get());
 
         CandidateTable variants =
             graph_chunks_to_candidate_table(graph_chunks, site_id_to_site, contig_to_tid, opts);
@@ -778,6 +801,18 @@ static void print_graph_collect_help() {
         << "                                (auto-derived from FASTA if not provided)\n"
         << "      --gbz-query-bin FILE      Path to GBZ-base query binary [query]\n"
         << "      --ont                     ONT read mode (enables strand-bias filter)\n"
+        << "\n"
+        << "Pgbam stitching:\n"
+        << "      --pgbam-file FILE         Optional .pgbam sidecar for fallback chunk stitching\n"
+        << "      --pgbam-primary-margin INT         Thread polarity margin for primary stitching [2]\n"
+        << "      --pgbam-primary-min-winning INT    Winning shared polarized threads for primary stitching [2]\n"
+        << "      --no-pgbam-cleanup-pass            Disable final .pgbam cleanup pass\n"
+        << "      --pgbam-cleanup-margin INT         Thread polarity margin for cleanup pass [2]\n"
+        << "      --pgbam-cleanup-min-winning INT    Winning shared polarized threads for cleanup pass [1]\n"
+        << "      --no-pgbam-relaxed-cleanup-pass    Disable relaxed .pgbam cleanup pass\n"
+        << "      --pgbam-relaxed-cleanup-margin INT Thread polarity margin for relaxed cleanup [1]\n"
+        << "      --pgbam-relaxed-cleanup-min-winning INT Winning threads for relaxed cleanup [1]\n"
+        << "\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
         << "  -h, --help                    Print this help\n"
         << "\n"
@@ -817,6 +852,15 @@ enum GraphCollectOption {
     kGcPhasedBam,
     kGcRef,
     kGcSites,
+    kGcPgbamFile,
+    kGcPgbamPrimaryMargin,
+    kGcPgbamPrimaryMinWinning,
+    kGcNoPgbamCleanupPass,
+    kGcPgbamCleanupMargin,
+    kGcPgbamCleanupMinWinning,
+    kGcNoPgbamRelaxedCleanupPass,
+    kGcPgbamRelaxedCleanupMargin,
+    kGcPgbamRelaxedCleanupMinWinning,
 };
 
 } // namespace
@@ -860,6 +904,15 @@ int collect_graph_variation(int argc, char* argv[]) {
         {"ont",               no_argument,       nullptr, kGcOnt},
         {"ref",               required_argument, nullptr, kGcRef},
         {"sites",             required_argument, nullptr, kGcSites},
+        {"pgbam-file",                required_argument, nullptr, kGcPgbamFile},
+        {"pgbam-primary-margin",      required_argument, nullptr, kGcPgbamPrimaryMargin},
+        {"pgbam-primary-min-winning", required_argument, nullptr, kGcPgbamPrimaryMinWinning},
+        {"no-pgbam-cleanup-pass",     no_argument,       nullptr, kGcNoPgbamCleanupPass},
+        {"pgbam-cleanup-margin",      required_argument, nullptr, kGcPgbamCleanupMargin},
+        {"pgbam-cleanup-min-winning", required_argument, nullptr, kGcPgbamCleanupMinWinning},
+        {"no-pgbam-relaxed-cleanup-pass", no_argument,   nullptr, kGcNoPgbamRelaxedCleanupPass},
+        {"pgbam-relaxed-cleanup-margin", required_argument, nullptr, kGcPgbamRelaxedCleanupMargin},
+        {"pgbam-relaxed-cleanup-min-winning", required_argument, nullptr, kGcPgbamRelaxedCleanupMinWinning},
         {"verbose",           required_argument, nullptr, 'V'},
         {"help",              no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -892,6 +945,15 @@ int collect_graph_variation(int argc, char* argv[]) {
             case kGcOnt:          opts.read_technology = ReadTechnology::Ont; break;
             case kGcRef:          opts.ref_fasta = optarg; break;
             case kGcSites:        opts.graph_sites_vcf = optarg; break;
+            case kGcPgbamFile:      opts.pgbam_file = optarg; break;
+            case kGcPgbamPrimaryMargin: opts.pgbam_primary_polarity_margin = std::stoi(optarg); break;
+            case kGcPgbamPrimaryMinWinning: opts.pgbam_primary_min_winning_threads = std::stoi(optarg); break;
+            case kGcNoPgbamCleanupPass: opts.pgbam_cleanup_pass = false; break;
+            case kGcPgbamCleanupMargin: opts.pgbam_cleanup_polarity_margin = std::stoi(optarg); break;
+            case kGcPgbamCleanupMinWinning: opts.pgbam_cleanup_min_winning_threads = std::stoi(optarg); break;
+            case kGcNoPgbamRelaxedCleanupPass: opts.pgbam_relaxed_cleanup_pass = false; break;
+            case kGcPgbamRelaxedCleanupMargin: opts.pgbam_relaxed_cleanup_polarity_margin = std::stoi(optarg); break;
+            case kGcPgbamRelaxedCleanupMinWinning: opts.pgbam_relaxed_cleanup_min_winning_threads = std::stoi(optarg); break;
             case 'V': opts.verbose = std::stoi(optarg); break;
             case 'h': print_graph_collect_help(); return 0;
             default:  print_graph_collect_help(); return 1;
