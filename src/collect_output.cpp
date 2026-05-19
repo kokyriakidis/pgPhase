@@ -1,6 +1,6 @@
 /**
  * @file collect_output.cpp
- * @brief TSV, optional VCF, and read-support writers for collect-bam-variation candidates.
+ * @brief TSV and optional VCF writers for collect-bam-variation candidates.
  *
  * @details Outputs describe pre-phasing candidates (not diploid genotypes). Opening the primary BAM
  * for SQ names may throw `std::runtime_error` on I/O failure.
@@ -75,87 +75,6 @@ std::string category_name(VariantCategory category) {
             return "NON_VAR";
     }
     return "UNKNOWN";
-}
-
-/**
- * @brief Writes the TSV header for read support output.
- *
- * Defines the columns for the `--read-support` output format, which consists
- * of one line per read x candidate observation.
- *
- * @param out Output stream to write the header to.
- */
-void write_read_support_header(std::ostream& out) {
-    out << "CHROM\tPOS\tTYPE\tREF_LEN\tALT\tQNAME\tIS_ALT\tLOW_QUAL\tREVERSE\tMAPQ\tCHUNK_BEG\tCHUNK_END\n";
-}
-
-/**
- * @brief Writes body lines for read support observations.
- *
- * Outputs one chunk's read x site observations including the sequence name
- * (CHROM) resolved from the BAM header.
- *
- * @param out Output stream to write the rows to.
- * @param header BAM header used to resolve reference sequence IDs to names.
- * @param rows A vector of `ReadSupportRow` structures containing the observation data.
- */
-void write_phase_read_tsv_header(std::ostream& out) {
-    out << "CHUNK_ID\tREG_CHUNK_I\tCHROM\tCHUNK_BEG\tCHUNK_END\t"
-        << "QNAME\tREAD_CHROM\tINPUT_IDX\tREAD_BEG\tREAD_END\tMAPQ\tREVERSE\tSKIPPED\t"
-        << "HAP\tPHASE_SET\n";
-}
-
-void write_phase_read_tsv_rows(std::ostream& out, const bam_hdr_t* header, const BamChunk& chunk) {
-    const RegionChunk& reg = chunk.region;
-    const char* chunk_chrom =
-        (reg.tid >= 0 && reg.tid < header->n_targets) ? header->target_name[reg.tid] : ".";
-    for (size_t i = 0; i < chunk.reads.size(); ++i) {
-        const ReadRecord& r = chunk.reads[i];
-        const char* read_chrom =
-            (r.tid >= 0 && r.tid < header->n_targets) ? header->target_name[r.tid] : ".";
-        const int hap = i < chunk.haps.size() ? chunk.haps[i] : 0;
-        const hts_pos_t ps = i < chunk.phase_sets.size() ? chunk.phase_sets[i] : static_cast<hts_pos_t>(-1);
-        out << reg.chunk_id << '\t' << reg.reg_chunk_i << '\t' << chunk_chrom << '\t' << reg.beg << '\t'
-            << reg.end << '\t' << r.qname << '\t' << read_chrom << '\t' << r.input_index << '\t' << r.beg
-            << '\t' << r.end << '\t' << r.mapq << '\t' << (r.reverse ? 1 : 0) << '\t' << (r.is_skipped ? 1 : 0)
-            << '\t' << hap << '\t' << ps << '\n';
-    }
-}
-
-void write_read_support_rows(std::ostream& out,
-                             const bam_hdr_t* header,
-                             const std::vector<ReadSupportRow>& rows) {
-    for (const ReadSupportRow& r : rows) {
-        const char* chrom = header->target_name[r.tid];
-        out << chrom << '\t' << r.pos << '\t' << type_name(r.type) << '\t' << r.ref_len << '\t'
-            << (r.alt.empty() ? "." : r.alt) << '\t' << r.qname << '\t' << r.is_alt << '\t' << r.is_low_qual
-            << '\t' << (r.reverse ? 1 : 0) << '\t' << r.mapq << '\t' << r.chunk_beg << '\t' << r.chunk_end
-            << '\n';
-    }
-}
-
-/**
- * @brief Writes the full read support TSV file from all processed chunks.
- *
- * Concatenates per-chunk batches of read observations into the final TSV file specified in `opts`.
- * Order matches the streaming chunk processing.
- *
- * @param opts Configuration options containing the primary BAM file and read support output path.
- * @param by_chunk A vector of vectors, where each inner vector represents a chunk's read observations.
- * @throws std::runtime_error If the BAM header cannot be read or the output file cannot be opened.
- */
-void write_read_support_tsv(const Options& opts, const std::vector<std::vector<ReadSupportRow>>& by_chunk) {
-    SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
-    std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
-    if (!header) throw std::runtime_error("failed to read BAM header");
-
-    std::ofstream out(opts.read_support_tsv);
-    if (!out) throw std::runtime_error("failed to open read support output: " + opts.read_support_tsv);
-
-    write_read_support_header(out);
-    for (const std::vector<ReadSupportRow>& batch : by_chunk) {
-        write_read_support_rows(out, header.get(), batch);
-    }
 }
 
 /**

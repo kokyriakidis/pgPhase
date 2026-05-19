@@ -131,14 +131,7 @@ void write_graph_bam_variants_tsv_rows(
 void write_graph_bam_variants_tsv_rows(std::ostream& out,
                                        const GraphBamChunkBuildResult& gc);
 
-// ── Phase-read TSV / phase-BAM (streaming phase-graph path) ─────────────────
-
-void write_graph_bam_phase_reads_tsv_header(std::ostream& out);
-
-/** Same columns as `write_phase_read_tsv_rows` with \p chunk_chrom instead of a BAM header. */
-void write_graph_chunk_phase_read_tsv_rows(std::ostream& out,
-                                           const std::string& chunk_chrom,
-                                           const BamChunk& chunk);
+// ── Phase-BAM (streaming phase-graph path) ──────────────────────────────────
 
 // After merging a stitched chunk into rows_by_read, drop reads that cannot appear
 // in next_chunk_qnames (typically qnames in the next genomic chunk). Pass nullptr
@@ -184,10 +177,6 @@ void write_graph_bam_phase_sites_tsv(std::ostream& out,
 void write_graph_bam_variants_tsv(std::ostream& out,
                                   const std::vector<GraphBamChunkBuildResult>& graph_chunks,
                                   const GraphSiteCatalog& catalog);
-
-void write_graph_bam_phase_reads_tsv(std::ostream& out,
-                                     const std::vector<GraphBamChunkBuildResult>& graph_chunks,
-                                     const std::vector<std::string>& all_read_names = {});
 
 // Writes an unaligned BAM (name-sorted) with HP and PS aux tags per read.
 // Reads with no phased assignment get no HP/PS tag.

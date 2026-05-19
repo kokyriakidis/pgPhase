@@ -63,16 +63,14 @@ std::vector<RegionChunk> load_region_chunks(const Options& opts);
  *
  * @param opts Thread count and paths.
  * @param chunks Region list from `load_region_chunks`.
- * @param read_support_batches If non-null, receives per-chunk read-support batches when the caller collects them.
  * @return Merged candidates in chunk processing order.
  */
 CandidateTable collect_chunks_parallel(
     const Options& opts,
-    const std::vector<RegionChunk>& chunks,
-    std::vector<std::vector<ReadSupportRow>>* read_support_batches);
+    const std::vector<RegionChunk>& chunks);
 
 /**
- * @brief Streaming driver: batch by `reg_chunk_i`, write TSV/VCF/read-support incrementally.
+ * @brief Streaming driver: batch by `reg_chunk_i`, write TSV/VCF incrementally.
  * @param opts Output paths, reference, and BAM list.
  */
 void run_collect_bam_variation(const Options& opts);

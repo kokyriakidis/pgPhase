@@ -874,27 +874,6 @@ void merge_graph_chunk_into_read_rows(
     }
 }
 
-void write_graph_bam_phase_reads_tsv_header(std::ostream& out) {
-    write_phase_read_tsv_header(out);
-}
-
-void write_graph_chunk_phase_read_tsv_rows(std::ostream& out,
-                                           const std::string& chunk_chrom,
-                                           const BamChunk& chunk) {
-    const RegionChunk& reg = chunk.region;
-    const std::string chunk_txt = chunk_chrom.empty() ? "." : chunk_chrom;
-    for (size_t i = 0; i < chunk.reads.size(); ++i) {
-        const ReadRecord& r = chunk.reads[i];
-        const int hap                = i < chunk.haps.size() ? chunk.haps[i] : 0;
-        const hts_pos_t ps =
-            i < chunk.phase_sets.size() ? chunk.phase_sets[i] : static_cast<hts_pos_t>(-1);
-        out << reg.chunk_id << '\t' << reg.reg_chunk_i << '\t' << chunk_txt << '\t' << reg.beg << '\t'
-            << reg.end << '\t' << r.qname << '\t' << chunk_txt << '\t' << r.input_index << '\t' << r.beg
-            << '\t' << r.end << '\t' << r.mapq << '\t' << (r.reverse ? 1 : 0) << '\t'
-            << (r.is_skipped ? 1 : 0) << '\t' << hap << '\t' << ps << '\n';
-    }
-}
-
 void write_graph_bam_site_counts_tsv_header(std::ostream& out) {
     out << "CHUNK_ID\tSITE_INDEX\tSITE_ID\tPOS\tN_ALLELES\tDEPTH\tALLELE_COUNTS\n";
 }
@@ -1233,18 +1212,6 @@ void write_graph_bam_phase_bam_from_rows(
 }
 
 // ── Legacy multi-chunk entry points (used by collect_pipeline.cpp) ────────────
-
-void write_graph_bam_phase_reads_tsv(std::ostream& out,
-                                     const std::vector<GraphBamChunkBuildResult>& graph_chunks,
-                                     const std::vector<std::string>& all_read_names) {
-    (void)all_read_names;
-    write_phase_read_tsv_header(out);
-    for (const auto& gc : graph_chunks) {
-        const std::string cc =
-            gc.graph_phase_contig.empty() ? std::string() : gc.graph_phase_contig;
-        write_graph_chunk_phase_read_tsv_rows(out, cc, gc.chunk);
-    }
-}
 
 void write_graph_bam_phase_bam(const std::string& out_path,
                                const std::vector<GraphBamChunkBuildResult>& graph_chunks,

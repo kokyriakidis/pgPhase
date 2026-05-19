@@ -36,35 +36,6 @@ std::string type_name(VariantType type);
 std::string category_name(VariantCategory category);
 
 /**
- * @brief Writes the column header for `--read-support` TSV.
- * @param out Stream receiving the single header line.
- */
-void write_read_support_header(std::ostream& out);
-
-/**
- * @brief Appends read×candidate observation lines (CHROM from \a header).
- * @param out Output stream.
- * @param header BAM header for `target_name[tid]`.
- * @param rows Batch of support rows for one chunk or merge step.
- */
-void write_read_support_rows(std::ostream& out,
-                             const bam_hdr_t* header,
-                             const std::vector<ReadSupportRow>& rows);
-
-/**
- * @brief Header line for `--phase-read-tsv` (per-read fields after `assign_hap_based_on_germline_het_vars_kmeans`).
- */
-void write_phase_read_tsv_header(std::ostream& out);
-
-/**
- * @brief Appends one line per read in \a chunk with haplotype scaffold columns.
- * @param out Output stream.
- * @param header BAM header for sequence names.
- * @param chunk Chunk after `collect_var_main` (phasing may be a no-op if there are no scaffold variants).
- */
-void write_phase_read_tsv_rows(std::ostream& out, const bam_hdr_t* header, const BamChunk& chunk);
-
-/**
  * @brief Writes the main candidate-table TSV header (one line).
  * @param out Output stream.
  */
@@ -117,14 +88,6 @@ void write_phased_variants_vcf_records(std::ostream& out,
                                        const bam_hdr_t* header,
                                        ReferenceCache& ref,
                                        const CandidateTable& variants);
-
-/**
- * @brief Writes a standalone read-support file from precomputed per-chunk batches.
- * @param opts Must set `read_support_tsv` and BAM/ref paths.
- * @param by_chunk Observations grouped by chunk order.
- * @throws std::runtime_error On BAM/header or file open failure.
- */
-void write_read_support_tsv(const Options& opts, const std::vector<std::vector<ReadSupportRow>>& by_chunk);
 
 /**
  * @brief Writes `opts.output_tsv` (header + all rows) in one shot.
