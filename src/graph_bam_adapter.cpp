@@ -249,8 +249,7 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
                                                hts_pos_t beg,
                                                hts_pos_t end,
                                                int chunk_id,
-                                               const Options& opts,
-                                               const ReadWalkMap* read_walks) {
+                                               const Options& opts) {
     // Build a local contig→tid map.  The graph pipeline processes one contig at a
     // time, so this map always has a single entry and every site resolves to tid=0.
     // The map keeps key.tid and region.tid in sync and makes multi-contig extension
@@ -712,13 +711,6 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         const auto mapq_it = read_max_mapq.find(read_name);
         const int mapq = mapq_it != read_max_mapq.end() ? mapq_it->second : 255;
         add_read_profile(out, read_name, dedup, mapq);
-        // Attach GBWT node handles for pgbam stitching (graph pipeline only).
-        if (read_walks) {
-            auto walk_it = read_walks->find(read_name);
-            if (walk_it != read_walks->end()) {
-                out.chunk.reads.back().graph_threads = walk_it->second;
-            }
-        }
     }
 
     out.chunk.haps.assign(out.chunk.reads.size(), 0);

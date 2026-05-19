@@ -358,9 +358,6 @@ struct ReadRecord {
     int n_clean_agree_snps = 0;    // populated during phasing (Step 2)
     int n_clean_conflict_snps = 0; // populated during phasing (Step 2)
     int total_cand_events = 0; // longcallD n_total_cand_vars (includes long-clip noisy windows)
-    // Graph-pipeline only: GBWT node handles from the read's alignment path.
-    // Used by pgbam stitching as a direct thread source when no BAM alignment / hs tag is available.
-    std::vector<uint64_t> graph_threads;
 };
 
 /**

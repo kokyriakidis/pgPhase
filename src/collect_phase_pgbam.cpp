@@ -67,22 +67,14 @@ static void collect_read_threads(const ReadRecord& read,
                                  const PgbamSidecarData& sidecar,
                                  std::vector<uint64_t>& threads) {
     threads.clear();
-    // BAM-pipeline path: extract hs aux tag → sidecar lookup.
     std::vector<uint32_t> hs_ids;
-    if (extract_hs_set_ids(read, hs_ids) && !hs_ids.empty()) {
-        for (uint32_t set_id : hs_ids) {
-            auto it = sidecar.set_to_threads.find(set_id);
-            if (it == sidecar.set_to_threads.end()) continue;
-            threads.insert(threads.end(), it->second.begin(), it->second.end());
-        }
-        sort_unique_threads(threads);
-        return;
+    if (!extract_hs_set_ids(read, hs_ids) || hs_ids.empty()) return;
+    for (uint32_t set_id : hs_ids) {
+        auto it = sidecar.set_to_threads.find(set_id);
+        if (it == sidecar.set_to_threads.end()) continue;
+        threads.insert(threads.end(), it->second.begin(), it->second.end());
     }
-    // Graph-pipeline path: use pre-populated GBWT node handles directly.
-    if (!read.graph_threads.empty()) {
-        threads = read.graph_threads;
-        sort_unique_threads(threads);
-    }
+    sort_unique_threads(threads);
 }
 
 static int intersection_size(const std::vector<uint64_t>& lhs, const std::vector<uint64_t>& rhs) {

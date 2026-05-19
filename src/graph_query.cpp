@@ -378,8 +378,7 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
                        hts_pos_t beg,
                        hts_pos_t end,
                        const GraphSiteCatalog& catalog,
-                       int min_mapq,
-                       ReadWalkMap* read_walks_out) {
+                       int min_mapq) {
     if (contig.empty() || end <= beg) return {};
     if (catalog.sites.empty()) return {};
 
@@ -433,27 +432,10 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
     } line_guard{&line};
 
     while (tbx_itr_next(raw_fp, raw_tbx, raw_itr, &line) >= 0) {
-        const size_t rows_before = rows.size();
-        std::string emit_read_name;
         scan_gaf_line_compact(
             std::string_view(line.s, line.l), 3, compact_index, min_mapq, 0,
             read_walk, boundary_positions, candidates, site_marks, mark_stamp,
-            [&](size_t, GraphReadAllele&& row) {
-                if (read_walks_out && emit_read_name.empty())
-                    emit_read_name = row.read_name;
-                rows.push_back(std::move(row));
-            });
-        // Capture the walk (widened from CompactHandle to uint64_t) for reads
-        // that matched at least one site.
-        if (read_walks_out && rows.size() > rows_before && !emit_read_name.empty()) {
-            auto [it, inserted] = read_walks_out->emplace(
-                std::move(emit_read_name), std::vector<uint64_t>{});
-            if (inserted) {
-                it->second.reserve(read_walk.size());
-                for (CompactHandle h : read_walk)
-                    it->second.push_back(static_cast<uint64_t>(h));
-            }
-        }
+            [&](size_t, GraphReadAllele&& row) { rows.push_back(std::move(row)); });
     }
 
     return rows;
@@ -470,7 +452,6 @@ struct CompactFFIContext {
     const CompactGraphSiteIndex* index;
     int min_mapq;
     std::vector<GraphReadAllele>* results;
-    ReadWalkMap* read_walks;  // optional: capture per-read GBWT node handles
     // Per-callback scratch buffers (avoid repeated allocation).
     std::vector<CompactHandle> read_walk;
     std::unordered_map<CompactHandle, std::vector<size_t>> boundary_positions;
@@ -522,7 +503,6 @@ extern "C" void structured_alignment_callback(
 
     const std::string read_name(reinterpret_cast<const char*>(name), name_len);
 
-    const size_t results_before = ctx->results->size();
     for (size_t compact_site_index : ctx->candidates) {
         const CompactGraphSite& site = index.sites[compact_site_index];
         bool rev = false;
@@ -541,14 +521,6 @@ extern "C" void structured_alignment_callback(
             rev
         });
     }
-
-    // Capture the full GBWT node handle walk for reads that matched at least one site.
-    if (ctx->read_walks && ctx->results->size() > results_before) {
-        auto [it, inserted] = ctx->read_walks->emplace(read_name, std::vector<uint64_t>{});
-        if (inserted) {
-            it->second.assign(nodes, nodes + node_count);
-        }
-    }
 }
 
 } // namespace
@@ -561,8 +533,7 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
                             hts_pos_t beg,
                             hts_pos_t end,
                             const GraphSiteCatalog& catalog,
-                            int min_mapq,
-                            ReadWalkMap* read_walks_out)
+                            int min_mapq)
 {
     if (!gbz_handle) throw std::runtime_error("null GBZ handle for FFI query");
     if (!gaf_handle) throw std::runtime_error("null GAF handle for FFI query");
@@ -587,7 +558,6 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
     ctx.index = &compact_index;
     ctx.min_mapq = min_mapq;
     ctx.results = &results;
-    ctx.read_walks = read_walks_out;
     ctx.site_marks.resize(compact_index.sites.size(), 0);
 
     char* err = nullptr;
