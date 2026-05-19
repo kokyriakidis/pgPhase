@@ -17,7 +17,6 @@
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -27,7 +26,6 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <htslib/faidx.h>
@@ -62,236 +60,6 @@ static GraphSiteCatalog filter_graph_catalog_for_interval(const GraphSiteCatalog
         if (graph_site_starts_in_interval(site, contig, beg, end)) out.sites.push_back(site);
     }
     return out;
-}
-
-static std::string graph_temp_dir_path(const std::string& prefix) {
-    static std::atomic<int> counter{0};
-    std::ostringstream out;
-    out << "/tmp/" << prefix << "_" << getpid() << "_" << counter++;
-    return out.str();
-}
-
-static std::vector<std::string> split_tab_fields(const std::string& line) {
-    std::vector<std::string> fields;
-    std::string field;
-    std::istringstream in(line);
-    while (std::getline(in, field, '\t')) fields.push_back(field);
-    return fields;
-}
-
-struct GraphObservationChunkIndex {
-    std::string dir;
-    std::vector<std::string> chunk_paths;
-    std::vector<std::vector<std::string>> worker_chunk_paths;
-    bool owns_files = true;
-
-    GraphObservationChunkIndex() = default;
-    GraphObservationChunkIndex(const GraphObservationChunkIndex&) = delete;
-    GraphObservationChunkIndex& operator=(const GraphObservationChunkIndex&) = delete;
-    GraphObservationChunkIndex(GraphObservationChunkIndex&& other) noexcept
-        : dir(std::move(other.dir)),
-          chunk_paths(std::move(other.chunk_paths)),
-          worker_chunk_paths(std::move(other.worker_chunk_paths)),
-          owns_files(other.owns_files) {
-        other.owns_files = false;
-    }
-    GraphObservationChunkIndex& operator=(GraphObservationChunkIndex&& other) noexcept {
-        if (this != &other) {
-            cleanup();
-            dir = std::move(other.dir);
-            chunk_paths = std::move(other.chunk_paths);
-            worker_chunk_paths = std::move(other.worker_chunk_paths);
-            owns_files = other.owns_files;
-            other.owns_files = false;
-        }
-        return *this;
-    }
-    ~GraphObservationChunkIndex() { cleanup(); }
-
-    void cleanup() {
-        if (!owns_files) return;
-        for (const std::string& path : chunk_paths) std::remove(path.c_str());
-        for (const auto& worker_paths : worker_chunk_paths) {
-            for (const std::string& path : worker_paths) std::remove(path.c_str());
-        }
-        if (!dir.empty()) rmdir(dir.c_str());
-        owns_files = false;
-    }
-
-    static void load_rows_from_path(const std::string& path,
-                                    std::vector<GraphReadAllele>& rows) {
-        std::ifstream in(path);
-        if (!in) return;
-        std::string line;
-        while (std::getline(in, line)) {
-            if (line.empty()) continue;
-            const std::vector<std::string> fields = split_tab_fields(line);
-            if (fields.size() < 6) continue;
-            // Shard format: site_id chrom pos read_name mapq allele [reverse [walk]]
-            const bool rev = fields.size() >= 7 && fields[6] == "1";
-            rows.push_back(GraphReadAllele{
-                fields[0],
-                fields[1],
-                static_cast<hts_pos_t>(std::stoll(fields[2])),
-                fields[3],
-                std::stoi(fields[5]),
-                fields.size() >= 8 ? fields[7] : std::string(),
-                std::stoi(fields[4]),
-                rev
-            });
-        }
-    }
-
-    std::vector<GraphReadAllele> load_chunk(size_t chunk_index) const {
-        std::vector<GraphReadAllele> rows;
-        if (!worker_chunk_paths.empty()) {
-            for (const auto& worker_paths : worker_chunk_paths) {
-                if (chunk_index >= worker_paths.size()) {
-                    throw std::runtime_error("graph observation index chunk out of range");
-                }
-                load_rows_from_path(worker_paths[chunk_index], rows);
-            }
-            return rows;
-        }
-        if (chunk_index >= chunk_paths.size()) {
-            throw std::runtime_error("graph observation index chunk out of range");
-        }
-        load_rows_from_path(chunk_paths[chunk_index], rows);
-        return rows;
-    }
-};
-
-class GraphObservationShardWriter {
-public:
-    explicit GraphObservationShardWriter(const std::vector<std::string>& paths)
-        : paths_(paths) {}
-
-    void write(size_t chunk_index, const GraphReadAllele& row) {
-        std::ofstream& out = stream_for(chunk_index);
-        out << row.site_id << '\t'
-            << row.chrom << '\t'
-            << row.pos << '\t'
-            << row.read_name << '\t'
-            << row.mapq << '\t'
-            << row.allele << '\t'
-            << (row.reverse ? '1' : '0') << '\n';
-        if (!out) throw std::runtime_error("failed to write graph observation shard");
-    }
-
-private:
-    struct OpenShard {
-        std::ofstream out;
-        std::list<size_t>::iterator lru_it;
-    };
-
-    std::ofstream& stream_for(size_t chunk_index) {
-        auto it = open_.find(chunk_index);
-        if (it != open_.end()) {
-            lru_.erase(it->second.lru_it);
-            lru_.push_front(chunk_index);
-            it->second.lru_it = lru_.begin();
-            return it->second.out;
-        }
-
-        if (open_.size() >= kMaxOpenShards) {
-            const size_t evict = lru_.back();
-            lru_.pop_back();
-            open_.erase(evict);
-        }
-        lru_.push_front(chunk_index);
-        OpenShard shard{std::ofstream(paths_[chunk_index], std::ios::app), lru_.begin()};
-        if (!shard.out) {
-            throw std::runtime_error("failed to open graph observation shard: " +
-                                     paths_[chunk_index]);
-        }
-        auto [inserted, ok] = open_.emplace(chunk_index, std::move(shard));
-        if (!ok) throw std::runtime_error("failed to cache graph observation shard");
-        return inserted->second.out;
-    }
-
-    static constexpr size_t kMaxOpenShards = 64;
-    const std::vector<std::string>& paths_;
-    std::list<size_t> lru_;
-    std::unordered_map<size_t, OpenShard> open_;
-};
-
-static GraphObservationChunkIndex build_graph_observation_chunk_index(
-    const std::string& gaf_file,
-    GraphSiteCatalog& catalog,
-    const std::vector<RegionChunk>& chunks,
-    const bam_hdr_t* header,
-    int min_mapq,
-    int threads,
-    int verbose) {
-
-    GraphObservationChunkIndex index;
-    index.dir = graph_temp_dir_path("pgphase_graph_obs");
-    if (mkdir(index.dir.c_str(), 0700) != 0) {
-        throw std::runtime_error("failed to create graph observation index directory: " +
-                                 index.dir);
-    }
-    const size_t scanner_threads = std::max<size_t>(1, static_cast<size_t>(threads));
-    index.worker_chunk_paths.resize(scanner_threads);
-    for (size_t worker = 0; worker < scanner_threads; ++worker) {
-        index.worker_chunk_paths[worker].reserve(chunks.size());
-        for (size_t i = 0; i < chunks.size(); ++i) {
-            index.worker_chunk_paths[worker].push_back(
-                index.dir + "/worker_" + std::to_string(worker) +
-                "_chunk_" + std::to_string(i) + ".tsv");
-        }
-    }
-
-    std::unordered_map<std::string, std::vector<size_t>> chunks_by_contig;
-    for (size_t i = 0; i < chunks.size(); ++i) {
-        chunks_by_contig[header->target_name[chunks[i].tid]].push_back(i);
-    }
-
-    std::unordered_map<std::string, size_t> site_to_chunk;
-    site_to_chunk.reserve(catalog.sites.size());
-    for (size_t site_i = 0; site_i < catalog.sites.size(); ++site_i) {
-        const GraphSite& site = catalog.sites[site_i];
-        const std::string site_contig = site.ref_contig.empty() ? site.chrom : site.ref_contig;
-        auto chunk_it = chunks_by_contig.find(site_contig);
-        if (chunk_it == chunks_by_contig.end()) continue;
-        for (size_t chunk_index : chunk_it->second) {
-            const RegionChunk& chunk = chunks[chunk_index];
-            if (graph_site_starts_in_interval(site, site_contig, chunk.beg - 1, chunk.end)) {
-                site_to_chunk.emplace(graph_site_key_str(site, site_i), chunk_index);
-                break;
-            }
-        }
-    }
-
-    if (verbose >= 1) {
-        std::cerr << "Building graph observation index from " << gaf_file
-                  << " for " << site_to_chunk.size() << " chunk-assigned sites"
-                  << " using " << scanner_threads << " scanner thread(s)\n";
-    }
-
-    std::vector<std::unique_ptr<GraphObservationShardWriter>> writers;
-    writers.reserve(scanner_threads);
-    for (size_t worker = 0; worker < scanner_threads; ++worker) {
-        writers.push_back(std::make_unique<GraphObservationShardWriter>(
-            index.worker_chunk_paths[worker]));
-    }
-
-    std::atomic<size_t> kept{0};
-    const size_t matched = scan_gaf_for_catalog_emit_parallel_releasing_walks(
-        gaf_file, catalog, min_mapq, scanner_threads,
-        [&](size_t worker_id, GraphReadAllele&& row) {
-            auto it = site_to_chunk.find(row.site_id);
-            if (it == site_to_chunk.end()) return;
-            writers[worker_id]->write(it->second, row);
-            kept.fetch_add(1, std::memory_order_relaxed);
-        });
-
-    if (verbose >= 1) {
-        std::cerr << "Graph observation index kept "
-                  << kept.load(std::memory_order_relaxed)
-                  << " chunk-local read-site rows (" << matched
-                  << " matched before chunk filtering)\n";
-    }
-    return index;
 }
 
 static bam_hdr_t* build_synthetic_header(faidx_t* fai) {
@@ -609,13 +377,18 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
     return graph_chunks;
 }
 
-static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_from_observation_index(
+// Per-chunk tabix queries on an indexed GAF file.  Each worker seeks directly
+// to the overlapping region — only the relevant reads are decompressed and
+// parsed, making this efficient even for very large (100+ GB) GAF files.
+static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_gaf(
     const GraphSiteCatalog& catalog,
     const std::vector<RegionChunk>& chunks,
     size_t batch_begin,
     size_t batch_end,
     const bam_hdr_t* header,
-    const GraphObservationChunkIndex& observation_index,
+    const std::string& gaf_file,
+    int min_mapq,
+    const std::unordered_map<std::string, std::string>& fai_full_to_suffix,
     const Options& opts)
 {
     const size_t batch_size = batch_end - batch_begin;
@@ -634,13 +407,29 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_from_obse
                 while (true) {
                     const size_t offset = next_offset.fetch_add(1);
                     if (offset >= batch_size) break;
-                    const size_t chunk_index = batch_begin + offset;
-                    const RegionChunk& region = chunks[chunk_index];
+                    const RegionChunk& region = chunks[batch_begin + offset];
                     const std::string contig_name = header->target_name[region.tid];
+
+                    // The tabix index uses reference-suffix names ("chr20"),
+                    // while the header may use pangenome names ("CHM13#0#chr20").
+                    // scan_indexed_gaf_chunk handles this via
+                    // tbx_seq_tid_with_pangenome_fallback, but we also try
+                    // the suffix directly for a faster first lookup.
+                    const std::string query_contig = [&]() -> std::string {
+                        auto it = fai_full_to_suffix.find(contig_name);
+                        return (it != fai_full_to_suffix.end()) ? it->second : contig_name;
+                    }();
+
                     GraphSiteCatalog chunk_catalog = filter_graph_catalog_for_interval(
                         catalog, contig_name, region.beg - 1, region.end);
-                    std::vector<GraphReadAllele> chunk_rows =
-                        observation_index.load_chunk(chunk_index);
+
+                    std::vector<GraphReadAllele> chunk_rows;
+                    if (!chunk_catalog.sites.empty()) {
+                        chunk_rows = scan_indexed_gaf_chunk(
+                            gaf_file, query_contig,
+                            region.beg - 1, region.end,
+                            chunk_catalog, min_mapq);
+                    }
 
                     graph_chunks[offset] = build_graph_bam_chunk(
                         chunk_catalog,
@@ -677,12 +466,16 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_from_obse
 }
 
 void run_collect_graph_variation(const Options& opts) {
-    const bool use_raw_gaf_index = !opts.gaf_file.empty();
-    if (!use_raw_gaf_index) {
+    const bool use_indexed_gaf = !opts.gaf_file.empty();
+    if (!use_indexed_gaf) {
         if (opts.gbz_db.empty())
             throw std::runtime_error("--gbz-db is required for collect-graph-variation without --gaf");
         if (opts.gaf_db.empty())
             throw std::runtime_error("--gaf-db is required for collect-graph-variation without --gaf");
+    } else {
+        // The --gaf path requires a tabix-indexed, bgzip-compressed GAF with
+        // annotated coordinate columns so per-chunk region queries are efficient.
+        require_indexed_gaf(opts.gaf_file);
     }
 
     // 1. Reference FASTA index first — needed to resolve autosome contig names for
@@ -765,9 +558,11 @@ void run_collect_graph_variation(const Options& opts) {
 
     // 3. Load graph site catalog — region-filtered if any filters are active.
     //    For bgzipped + tabix-indexed VCFs this seeks directly to each region.
+    // Both paths (indexed GAF and GBZ-DB FFI) need allele traversal strings
+    // for compact site index construction / structured callback matching.
     GraphSiteCatalog catalog = load_graph_site_catalog_from_vcf(opts.graph_sites_vcf,
                                                                  region_filters,
-                                                                 !use_raw_gaf_index);
+                                                                 true);
     if (opts.verbose >= 1) {
         std::cerr << "Loaded " << catalog.sites.size() << " graph sites from "
                   << opts.graph_sites_vcf << "\n";
@@ -817,11 +612,10 @@ void run_collect_graph_variation(const Options& opts) {
                   << opts.chunk_size << " bp, " << opts.threads << " thread(s))\n";
     }
 
-    // 7. Build per-chunk query config for the legacy GBZ/GAF-base path.
+    // 7. Build per-chunk query config for the GBZ/GAF-base FFI path.
     GraphQueryConfig qconfig;
     qconfig.gbz_db   = opts.gbz_db;
     qconfig.gaf_db   = opts.gaf_db;
-    qconfig.query_bin = opts.gbz_query_bin;
     qconfig.min_mapq  = opts.min_mapq;
 
     // Derive the reference sample name for GBZ interval queries.
@@ -837,7 +631,7 @@ void run_collect_graph_variation(const Options& opts) {
                 ref_sample = name.substr(0, h);
         }
     }
-    if (!use_raw_gaf_index && opts.verbose >= 1 && !ref_sample.empty())
+    if (!use_indexed_gaf && opts.verbose >= 1 && !ref_sample.empty())
         std::cerr << "Using reference sample \"" << ref_sample << "\" for GBZ interval queries\n";
 
     // 8. site_id → GraphSite* (for biallelic conversion after phasing).
@@ -845,14 +639,6 @@ void run_collect_graph_variation(const Options& opts) {
     site_id_to_site.reserve(catalog.sites.size());
     for (size_t i = 0; i < catalog.sites.size(); ++i) {
         site_id_to_site[graph_site_key_str(catalog.sites[i], i)] = &catalog.sites[i];
-    }
-
-    std::unique_ptr<GraphObservationChunkIndex> observation_index;
-    if (use_raw_gaf_index) {
-        observation_index = std::make_unique<GraphObservationChunkIndex>(
-            build_graph_observation_chunk_index(opts.gaf_file, catalog, chunks,
-                                                header.get(), opts.min_mapq,
-                                                opts.threads, opts.verbose));
     }
 
     // 9. Open output streams.
@@ -907,10 +693,10 @@ void run_collect_graph_variation(const Options& opts) {
         }
 
         std::vector<GraphBamChunkBuildResult> graph_chunks =
-            use_raw_gaf_index
-                ? process_graph_chunk_batch_from_observation_index(
+            use_indexed_gaf
+                ? process_graph_chunk_batch_indexed_gaf(
                       catalog, chunks, batch_begin, batch_end, header.get(),
-                      *observation_index, opts)
+                      opts.gaf_file, opts.min_mapq, fai_full_to_suffix, opts)
                 : process_graph_chunk_batch(
                       catalog, chunks, batch_begin, batch_end, header.get(),
                       qconfig, ref_sample, fai_full_to_suffix, opts);
