@@ -476,6 +476,9 @@ void run_collect_graph_variation(const Options& opts) {
         // The --gaf path requires a tabix-indexed, bgzip-compressed GAF with
         // annotated coordinate columns so per-chunk region queries are efficient.
         require_indexed_gaf(opts.gaf_file);
+        if (!opts.gbz_db.empty() || !opts.gaf_db.empty()) {
+            std::cerr << "Warning: --gaf provided; ignoring --gbz-db/--gaf-db\n";
+        }
     }
 
     // 1. Reference FASTA index first — needed to resolve autosome contig names for
