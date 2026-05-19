@@ -491,19 +491,14 @@ static void add_coverage(VariantCounts& counts, bool reverse, bool alt, bool low
  * (`bam_utils.c`): merge walk skipping only `BAM_CEQUAL` digars, comparing candidate vs digar
  * with `exact_comp_var_site_ins` on merge-shaped `var_site_t` (clips participate in ordering).
  * Low-quality alt when `digar.low_quality` or mean BQ \< \a min_bq; implicit ref for trailing
- * sites before `read.end`. Optionally appends `ReadSupportRow` rows when both
- * \a read_support_out and \a chunk_region are non-null.
+ * sites before `read.end`.
  *
  * @param reads Parsed chunk reads.
  * @param variants Sorted candidate table (same order as site collection).
- * @param chunk_region If non-null with \a read_support_out, written into support rows.
- * @param read_support_out Optional per-read x site observation log.
  * @param min_bq Minimum base quality threshold for counting an alt as high-quality.
  */
 void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         CandidateTable& variants,
-                                        const RegionChunk* chunk_region,
-                                        std::vector<ReadSupportRow>* read_support_out,
                                         int min_bq,
                                         int min_sv_len) {
     const int n = static_cast<int>(variants.size());
@@ -539,42 +534,11 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
             if (ret < 0) {
                 VariantCounts& c = variants[static_cast<size_t>(site_i)].counts;
                 add_coverage(c, read.reverse, false, false);
-                if (read_support_out != nullptr && chunk_region != nullptr) {
-                    const auto& k = variants[static_cast<size_t>(site_i)].key;
-                    read_support_out->push_back(ReadSupportRow{k.tid,
-                                                               k.pos,
-                                                               k.type,
-                                                               k.ref_len,
-                                                               k.alt,
-                                                               read.qname,
-                                                               0,
-                                                               0,
-                                                               read.reverse,
-                                                               read.mapq,
-                                                               chunk_region->beg,
-                                                               chunk_region->end});
-                }
                 ++site_i;
             } else if (ret == 0) {
                 const bool lq = d.low_quality || ave < min_bq;
                 add_coverage(
                     variants[static_cast<size_t>(site_i)].counts, read.reverse, true, lq);
-                if (read_support_out != nullptr && chunk_region != nullptr) {
-                    const auto& k = variants[static_cast<size_t>(site_i)].key;
-                    read_support_out->push_back(
-                        ReadSupportRow{k.tid,
-                                       k.pos,
-                                       k.type,
-                                       k.ref_len,
-                                       k.alt,
-                                       read.qname,
-                                       1,
-                                       lq ? 1 : 0,
-                                       read.reverse,
-                                       read.mapq,
-                                       chunk_region->beg,
-                                       chunk_region->end});
-                }
                 ++site_i;
             } else {
                 ++digar_i;
@@ -588,21 +552,6 @@ void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
             }
             if (variants[static_cast<size_t>(site_i)].key.pos > pos_end) break;
             add_coverage(variants[static_cast<size_t>(site_i)].counts, read.reverse, false, false);
-            if (read_support_out != nullptr && chunk_region != nullptr) {
-                const auto& k = variants[static_cast<size_t>(site_i)].key;
-                read_support_out->push_back(ReadSupportRow{k.tid,
-                                                           k.pos,
-                                                           k.type,
-                                                           k.ref_len,
-                                                           k.alt,
-                                                           read.qname,
-                                                           0,
-                                                           0,
-                                                           read.reverse,
-                                                           read.mapq,
-                                                           chunk_region->beg,
-                                                           chunk_region->end});
-            }
         }
     }
 }
@@ -2045,7 +1994,6 @@ static void dump_all_noisy_regions(const BamChunk& chunk, const Options& opts, c
  * @param chunk Chunk with reads and region pre-filled by the caller.
  * @param opts Thresholds (min BQ, AF, strand p-value, SV length, verbosity, …).
  * @param header BAM header for contig names used in verbose logging.
- * @param read_support_out If non-null, per-read allele observations are appended here.
  */
 /** longcallD `collect_var.c` `make_variants` lines 1481–1488 (`active_reg_beg` / `active_reg_end`). */
 static bool lcd_make_variants_active_region_contains(hts_pos_t active_reg_beg,
@@ -2059,8 +2007,7 @@ static bool lcd_make_variants_active_region_contains(hts_pos_t active_reg_beg,
 
 void collect_var_main(BamChunk& chunk,
                       const Options& opts,
-                      const bam_hdr_t* header,
-                      std::vector<ReadSupportRow>* read_support_out) {
+                      const bam_hdr_t* header) {
     // 1.1. collect X/I/D candidate sites from parsed read digars.
     collect_candidate_sites_from_records(
         chunk.region, chunk.reads, chunk.candidates, opts.min_sv_len);
@@ -2068,8 +2015,6 @@ void collect_var_main(BamChunk& chunk,
     // 1.2. collect reference and alternate allele support for every candidate site.
     collect_allele_counts_from_records(chunk.reads,
                                        chunk.candidates,
-                                       &chunk.region,
-                                       read_support_out,
                                        opts.min_bq,
                                        opts.min_sv_len);
 

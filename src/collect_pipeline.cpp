@@ -3,7 +3,7 @@
  * @brief Region chunking, parallel candidate collection, streaming writers, and CLI for collect-bam-variation.
  *
  * @details Coordinates are 1-based inclusive (BED is converted in `load_bed_regions`). Chunks are batched by
- * `reg_chunk_i` in `run_collect_bam_variation` so TSV/VCF/read-support can be streamed without holding
+ * `reg_chunk_i` in `run_collect_bam_variation` so TSV/VCF can be streamed without holding
  * all candidates in memory.
  */
 
@@ -537,17 +537,15 @@ static void mid_free_chunk(BamChunk& chunk, const Options& opts) {
  * @param region Genomic slice to process.
  * @param opts Pipeline and quality options.
  * @param context Per-thread BAM/FAI context.
- * @param read_support_out Optional buffer for read-support rows from this chunk.
  * @return `BamChunk` with filled `candidates` and related fields; intermediates freed.
  */
 static BamChunk process_chunk(const RegionChunk& region,
                               const Options& opts,
-                              WorkerContext& context,
-                              std::vector<ReadSupportRow>* read_support_out) {
+                              WorkerContext& context) {
     BamChunk chunk;
     chunk.region = region;
     load_and_prepare_chunk(chunk, opts, context);
-    collect_var_main(chunk, opts, context.primary_header(), read_support_out);
+    collect_var_main(chunk, opts, context.primary_header());
     mid_free_chunk(chunk, opts);
     return chunk;
 }
@@ -615,13 +613,10 @@ static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
 }
 
 /**
- * @brief Parallel batch result: one `BamChunk` per chunk offset, optional read-support batches.
- *
- * `read_support_batches[i]` corresponds to `chunks[i]` when read-support collection is enabled.
+ * @brief Parallel batch result: one `BamChunk` per chunk offset.
  */
 struct ChunkBatchResult {
     std::vector<BamChunk> chunks;
-    std::vector<std::vector<ReadSupportRow>> read_support_batches;
 };
 
 /**
@@ -634,21 +629,18 @@ struct ChunkBatchResult {
  * @param chunks Full chunk list; only indices `[batch_begin, batch_end)` are processed.
  * @param batch_begin First index in `chunks` (inclusive).
  * @param batch_end One past the last index (exclusive).
- * @param collect_read_support If true, each slot in `read_support_batches` receives that chunk's rows.
- * @return Per-chunk `BamChunk` results in offset order, plus optional read-support batches.
+ * @return Per-chunk `BamChunk` results in offset order.
  */
 static ChunkBatchResult collect_chunk_batch_parallel(const Options& opts,
                                                      const std::vector<RegionChunk>& chunks,
                                                      size_t batch_begin,
-                                                     size_t batch_end,
-                                                     bool collect_read_support) {
+                                                     size_t batch_end) {
     if (batch_begin > batch_end || batch_end > chunks.size()) {
         throw std::runtime_error("invalid chunk batch range");
     }
     const size_t batch_size = batch_end - batch_begin;
     ChunkBatchResult result;
     result.chunks.resize(batch_size);
-    if (collect_read_support) result.read_support_batches.resize(batch_size);
     if (batch_size == 0) return result;
 
     const size_t worker_count = std::min<size_t>(static_cast<size_t>(opts.threads), batch_size);
@@ -666,10 +658,8 @@ static ChunkBatchResult collect_chunk_batch_parallel(const Options& opts,
                 while (true) {
                     const size_t offset = next_offset.fetch_add(1);
                     if (offset >= batch_size) break;
-                    std::vector<ReadSupportRow>* rs_ptr = nullptr;
-                    if (collect_read_support) rs_ptr = &result.read_support_batches[offset];
                     result.chunks[offset] =
-                        process_chunk(chunks[batch_begin + offset], opts, context, rs_ptr);
+                        process_chunk(chunks[batch_begin + offset], opts, context);
                 }
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);
@@ -699,17 +689,14 @@ static ChunkBatchResult collect_chunk_batch_parallel(const Options& opts,
  *
  * @param opts Run flags config struct.
  * @param chunks A pre-split list of genomic ranges to distribute.
- * @param read_support_batches Output buffer to stash parsed variant-to-read links.
  */
 CandidateTable collect_chunks_parallel(
     const Options& opts,
-    const std::vector<RegionChunk>& chunks,
-    std::vector<std::vector<ReadSupportRow>>* read_support_batches) {
+    const std::vector<RegionChunk>& chunks) {
     if (chunks.empty()) return CandidateTable{};
     ChunkBatchResult result =
-        collect_chunk_batch_parallel(opts, chunks, 0, chunks.size(), read_support_batches != nullptr);
+        collect_chunk_batch_parallel(opts, chunks, 0, chunks.size());
     stitch_chunk_haps(result.chunks, &opts, nullptr);
-    if (read_support_batches != nullptr) *read_support_batches = std::move(result.read_support_batches);
     return merge_chunk_candidates(result.chunks);
 }
 
@@ -717,7 +704,7 @@ CandidateTable collect_chunks_parallel(
  * @brief End-to-end collect-bam-variation driver with streaming output.
  *
  * Groups chunks by `reg_chunk_i`, processes each batch in parallel, merges candidates in memory
- * only within the batch, then appends TSV rows and optional VCF / read-support lines. Does not
+ * only within the batch, then appends TSV rows and optional VCF lines. Does not
  * hold the full genome candidate set in RAM.
  *
  * @param opts Output paths, reference, BAM list, and threading configuration.
@@ -755,31 +742,12 @@ void run_collect_bam_variation(const Options& opts) {
         write_phased_variants_vcf_header(phased_vcf_out, opts, header.get());
     }
 
-    std::ofstream read_support_out;
-    if (!opts.read_support_tsv.empty()) {
-        read_support_out.open(opts.read_support_tsv);
-        if (!read_support_out) {
-            throw std::runtime_error("failed to open read support output: " + opts.read_support_tsv);
-        }
-        write_read_support_header(read_support_out);
-    }
-
-    std::ofstream phase_read_out;
-    if (!opts.phase_read_tsv.empty()) {
-        phase_read_out.open(opts.phase_read_tsv);
-        if (!phase_read_out) {
-            throw std::runtime_error("failed to open phase-read output: " + opts.phase_read_tsv);
-        }
-        write_phase_read_tsv_header(phase_read_out);
-    }
     std::unique_ptr<PhasedAlignmentWriter> phased_aln_writer;
     if (!opts.output_aln.empty()) {
         phased_aln_writer = std::make_unique<PhasedAlignmentWriter>(opts, header.get());
     }
 
     size_t n_variants = 0;
-    size_t n_read_support_rows = 0;
-    size_t n_phase_read_rows = 0;
     size_t n_out_aln_reads = 0;
     size_t batch_begin = 0;
     while (batch_begin < chunks.size()) {
@@ -790,7 +758,7 @@ void run_collect_bam_variation(const Options& opts) {
         }
 
         ChunkBatchResult batch = collect_chunk_batch_parallel(
-            opts, chunks, batch_begin, batch_end, !opts.read_support_tsv.empty());
+            opts, chunks, batch_begin, batch_end);
         stitch_chunk_haps(batch.chunks, &opts, pgbam_sidecar.get());
         CandidateTable variants = merge_chunk_candidates(batch.chunks);
         n_variants += variants.size();
@@ -800,18 +768,6 @@ void run_collect_bam_variation(const Options& opts) {
         }
         if (!opts.output_phased_vcf.empty()) {
             write_phased_variants_vcf_records(phased_vcf_out, opts, header.get(), ref, variants);
-        }
-        if (!opts.read_support_tsv.empty()) {
-            for (const std::vector<ReadSupportRow>& rows : batch.read_support_batches) {
-                n_read_support_rows += rows.size();
-                write_read_support_rows(read_support_out, header.get(), rows);
-            }
-        }
-        if (!opts.phase_read_tsv.empty()) {
-            for (const BamChunk& ch : batch.chunks) {
-                n_phase_read_rows += ch.reads.size();
-                write_phase_read_tsv_rows(phase_read_out, header.get(), ch);
-            }
         }
         if (phased_aln_writer) {
             n_out_aln_reads += static_cast<size_t>(phased_aln_writer->write_chunks(batch.chunks));
@@ -829,14 +785,6 @@ void run_collect_bam_variation(const Options& opts) {
     }
     if (!opts.output_phased_vcf.empty()) {
         std::cerr << "Wrote phased candidate VCF to " << opts.output_phased_vcf << "\n";
-    }
-    if (!opts.read_support_tsv.empty()) {
-        std::cerr << "Wrote " << n_read_support_rows << " read x candidate observations to "
-                  << opts.read_support_tsv << "\n";
-    }
-    if (!opts.phase_read_tsv.empty()) {
-        std::cerr << "Wrote " << n_phase_read_rows << " per-read phasing rows to " << opts.phase_read_tsv
-                  << "\n";
     }
     if (!opts.output_aln.empty()) {
         // Ensure output handle is closed/flushed before indexing.
@@ -882,7 +830,6 @@ enum LongOption {
     kMinAltDepthOption = 1000,
     kMinAfOption,
     kMaxAfOption,
-    kReadSupportOption,
     kNoisyRegMergeDisOption,
     kMinSvLenOption,
     kChunkSizeOption,
@@ -896,7 +843,6 @@ enum LongOption {
     kDebugSiteOption,
     kInputIsListOption,
     kRefineAlnOption,
-    kPhaseReadTsvOption,
     kPhasedVcfOutputOption,
     kPgbamFileOption,
     kPgbamPrimaryMarginOption,
@@ -971,8 +917,7 @@ static void print_collect_help() {
         << "                                note: multiple input BAM/CRAM files will be merged in SAM/BAM/CRAM output\n"
         << "      --refine-aln              refine alignment in SAM/BAM/CRAM output;\n"
         << "                                coordinate-sorts with samtools sort before BAM/CRAM indexing (samtools on PATH)\n"
-        << "      --read-support FILE       Per-read ref/alt observations at candidates (for phasing)\n"
-        << "      --phase-read-tsv FILE     Per-read HAP / PHASE_SET after k-means phasing\n"
+
         << "      --pgbam-file FILE         Optional .pgbam sidecar for fallback chunk stitching when common-read signal is absent\n"
         << "      --pgbam-primary-margin INT         Thread polarity margin for primary .pgbam stitching [2]\n"
         << "      --pgbam-primary-min-winning INT    Winning shared polarized threads for primary .pgbam stitching [2]\n"
@@ -1062,8 +1007,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"out-bam",                   required_argument, nullptr, 'b'},
         {"out-cram",                  required_argument, nullptr, 'C'},
         {"refine-aln",                no_argument,       nullptr, kRefineAlnOption},
-        {"read-support",              required_argument, nullptr, kReadSupportOption},
-        {"phase-read-tsv",            required_argument, nullptr, kPhaseReadTsvOption},
+
         {"pgbam-file",                required_argument, nullptr, kPgbamFileOption},
         {"pgbam-primary-margin",      required_argument, nullptr, kPgbamPrimaryMarginOption},
         {"pgbam-primary-min-winning", required_argument, nullptr, kPgbamPrimaryMinWinningOption},
@@ -1137,8 +1081,7 @@ int collect_bam_variation(int argc, char* argv[]) {
                 break;
             case kPhasedVcfOutputOption: opts.output_phased_vcf = optarg; break;
             case kRefineAlnOption:      opts.refine_aln = true; break;
-            case kReadSupportOption:    opts.read_support_tsv = optarg; break;
-            case kPhaseReadTsvOption:   opts.phase_read_tsv = optarg; break;
+
             case kPgbamFileOption:      opts.pgbam_file = optarg; break;
             case kPgbamPrimaryMarginOption: opts.pgbam_primary_polarity_margin = std::stoi(optarg); break;
             case kPgbamPrimaryMinWinningOption: opts.pgbam_primary_min_winning_threads = std::stoi(optarg); break;

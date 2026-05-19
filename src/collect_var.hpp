@@ -106,18 +106,14 @@ void collect_candidate_sites_from_records(const RegionChunk& chunk,
                                           int min_sv_len);
 
 /**
- * @brief Fills allele/strand depth from digars vs sorted candidates; optional read-support log.
+ * @brief Fills allele/strand depth from digars vs sorted candidates.
  * @param reads Chunk reads.
  * @param variants Sorted candidate table.
- * @param chunk_region If non-null with `read_support_out`, stamped into support rows.
- * @param read_support_out Optional observation list.
  * @param min_bq Minimum base quality for high-quality alt tally.
  * @param min_sv_len Passed to `exact_comp_var_site_ins` (LCD `opt->min_sv_len`).
  */
 void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         CandidateTable& variants,
-                                        const RegionChunk* chunk_region,
-                                        std::vector<ReadSupportRow>* read_support_out,
                                         int min_bq,
                                         int min_sv_len);
 
@@ -206,12 +202,10 @@ void classify_chunk_candidates(BamChunk& chunk, const Options& opts, const bam_h
  * @param chunk Prepared chunk to fill/classify in place.
  * @param opts Collection and classification options.
  * @param header Primary BAM header for classification context.
- * @param read_support_out Optional buffer receiving read×candidate observations.
  */
 void collect_var_main(BamChunk& chunk,
                       const Options& opts,
-                      const bam_hdr_t* header,
-                      std::vector<ReadSupportRow>* read_support_out = nullptr);
+                      const bam_hdr_t* header);
 
 } // namespace pgphase_collect
 

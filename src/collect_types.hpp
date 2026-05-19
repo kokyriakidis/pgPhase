@@ -194,10 +194,7 @@ struct Options {
     OutputAlignmentFormat output_aln_format = OutputAlignmentFormat::None;
     /** If true, refine phased read alignments from per-read digars before writing output alignment. */
     bool refine_aln = false;
-    /** If non-empty, write per-read allele observations for downstream phasing. */
-    std::string read_support_tsv;
-    /** If non-empty, write per-read HAP / PHASE_SET after k-means phasing (per chunk). */
-    std::string phase_read_tsv;
+
     /** Optional pgbam sidecar file used for fallback chunk stitching when overlap reads have no signal. */
     std::string pgbam_file;
     int pgbam_primary_polarity_margin = 2;
@@ -334,23 +331,7 @@ struct CgrangesDeleter {
     void operator()(cgranges_t* p) const { if (p) cr_destroy(p); }
 };
 
-/**
- * @brief One line of `--read-support` TSV: read evidence at a candidate locus.
- */
-struct ReadSupportRow {
-    int tid = -1;
-    hts_pos_t pos = 0;
-    VariantType type = VariantType::Snp;
-    int ref_len = 0;
-    std::string alt;
-    std::string qname;
-    int is_alt = 0;       // 1 = read carries alt allele at site, 0 = ref
-    int is_low_qual = 0;  // 1 = alt/low-qual observation (matches low_qual_cov path)
-    bool reverse = false;
-    int mapq = 0;
-    hts_pos_t chunk_beg = 0;
-    hts_pos_t chunk_end = 0;
-};
+
 
 /**
  * @brief One input read after parsing: coordinates, digars, qualities, noisy subregions.
