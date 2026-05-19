@@ -5,9 +5,14 @@
 #include "graph_sites.hpp"
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace pgphase_collect {
+
+/// Per-read GBWT node handle walks, keyed by read name.
+/// Used to populate ReadRecord::graph_threads for pgbam stitching.
+using ReadWalkMap = std::unordered_map<std::string, std::vector<uint64_t>>;
 
 struct GraphReadAllele {
     std::string site_id;
@@ -36,7 +41,8 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
                        hts_pos_t beg,
                        hts_pos_t end,
                        const GraphSiteCatalog& catalog,
-                       int min_mapq);
+                       int min_mapq,
+                       ReadWalkMap* read_walks_out = nullptr);
 
 // Validates that the GAF file is bgzip-compressed and has a .tbi index.
 void require_indexed_gaf(const std::string& indexed_gaf_file);
@@ -52,7 +58,8 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
                             hts_pos_t beg,
                             hts_pos_t end,
                             const GraphSiteCatalog& catalog,
-                            int min_mapq);
+                            int min_mapq,
+                            ReadWalkMap* read_walks_out = nullptr);
 
 } // namespace pgphase_collect
 
