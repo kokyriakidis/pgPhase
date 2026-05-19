@@ -12,7 +12,6 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
 
 #include <htslib/hts.h>
 #include <htslib/kstring.h>
@@ -345,36 +344,6 @@ size_t scan_gaf_line_compact(std::string_view line,
 }
 
 // Returns the sub-walk of `walk` that spans between left_bnd and right_bnd
-// (inclusive), in whichever orientation the read traverses the snarl.
-// Returns empty if the read does not span both boundaries.
-// match_graph_allele_exact handles reverse-complement internally, so we can
-// pass the raw sub-walk without reversing it first.
-GraphWalk extract_subwalk_between(const GraphWalk& walk,
-                                   const GraphWalkStep& left_bnd,
-                                   const GraphWalkStep& right_bnd) {
-    // Forward orientation: find left_bnd then right_bnd
-    for (size_t i = 0; i < walk.size(); ++i) {
-        if (!(walk[i] == left_bnd)) continue;
-        for (size_t j = i; j < walk.size(); ++j) {
-            if (walk[j] == right_bnd)
-                return GraphWalk(walk.begin() + static_cast<std::ptrdiff_t>(i),
-                                 walk.begin() + static_cast<std::ptrdiff_t>(j) + 1);
-        }
-    }
-    // Reverse orientation: read traverses snarl right-to-left
-    const GraphWalkStep right_rev{right_bnd.node, !right_bnd.reverse};
-    const GraphWalkStep left_rev{left_bnd.node, !left_bnd.reverse};
-    for (size_t i = 0; i < walk.size(); ++i) {
-        if (!(walk[i] == right_rev)) continue;
-        for (size_t j = i; j < walk.size(); ++j) {
-            if (walk[j] == left_rev)
-                return GraphWalk(walk.begin() + static_cast<std::ptrdiff_t>(i),
-                                 walk.begin() + static_cast<std::ptrdiff_t>(j) + 1);
-        }
-    }
-    return {};
-}
-
 } // namespace
 
 // pggaf coordinate-indexed GAF tabix often names sequences by reference suffix ("chr20")
@@ -476,18 +445,19 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
 
 namespace {
 
-// Convert a GBWT node handle to a GraphWalkStep.
-// GBWT encoding: handle = 2 * node_id + orientation (Forward=0, Reverse=1).
-inline GraphWalkStep gbwt_handle_to_step(uint64_t handle) {
-    return GraphWalkStep{std::to_string(handle / 2), (handle & 1) != 0};
-}
-
-// Context for the structured alignment callback.
-struct StructuredQueryContext {
-    const std::unordered_map<std::string, std::vector<size_t>>* node_to_sites;
-    const GraphSiteCatalog* catalog;
+// Context for the structured alignment callback using compact numeric matching.
+// GBWT handles (2 * node_id + orientation) map directly to CompactHandle
+// ((node_id << 1) | orientation) — same encoding, no conversion needed.
+struct CompactFFIContext {
+    const CompactGraphSiteIndex* index;
     int min_mapq;
     std::vector<GraphReadAllele>* results;
+    // Per-callback scratch buffers (avoid repeated allocation).
+    std::vector<CompactHandle> read_walk;
+    std::unordered_map<CompactHandle, std::vector<size_t>> boundary_positions;
+    std::vector<size_t> candidates;
+    std::vector<uint32_t> site_marks;
+    uint32_t mark_stamp = 0;
 };
 
 extern "C" void structured_alignment_callback(
@@ -495,46 +465,58 @@ extern "C" void structured_alignment_callback(
     const uint64_t* nodes, size_t node_count,
     int mapq, void* user_data)
 {
-    auto* ctx = static_cast<StructuredQueryContext*>(user_data);
+    auto* ctx = static_cast<CompactFFIContext*>(user_data);
     if (mapq < ctx->min_mapq) return;
     if (node_count == 0) return;
 
-    // Build GraphWalk from GBWT handles.
-    GraphWalk read_walk;
-    read_walk.reserve(node_count);
-    for (size_t i = 0; i < node_count; ++i)
-        read_walk.push_back(gbwt_handle_to_step(nodes[i]));
+    const CompactGraphSiteIndex& index = *ctx->index;
 
-    // Find candidate sites whose boundary node appears in this walk.
-    std::unordered_set<size_t> candidates;
-    for (const GraphWalkStep& step : read_walk) {
-        auto it = ctx->node_to_sites->find(step.node);
-        if (it == ctx->node_to_sites->end()) continue;
-        for (size_t si : it->second) candidates.insert(si);
+    // Convert GBWT handles to CompactHandles (same encoding, just truncate).
+    ctx->read_walk.clear();
+    ctx->read_walk.reserve(node_count);
+    for (size_t i = 0; i < node_count; ++i) {
+        if (nodes[i] / 2 > kMaxCompactNodeId) continue;
+        ctx->read_walk.push_back(static_cast<CompactHandle>(nodes[i]));
     }
-    if (candidates.empty()) return;
+    if (ctx->read_walk.empty()) return;
+
+    // Find candidate sites via boundary handle lookup.
+    ctx->candidates.clear();
+    ctx->boundary_positions.clear();
+    if (++(ctx->mark_stamp) == 0) {
+        std::fill(ctx->site_marks.begin(), ctx->site_marks.end(), 0);
+        ctx->mark_stamp = 1;
+    }
+
+    for (size_t step_i = 0; step_i < ctx->read_walk.size(); ++step_i) {
+        const CompactHandle handle = ctx->read_walk[step_i];
+        auto site_it = index.boundary_to_sites.find(handle);
+        if (site_it == index.boundary_to_sites.end()) continue;
+        ctx->boundary_positions[handle].push_back(step_i);
+        for (size_t site_index : site_it->second) {
+            if (ctx->site_marks[site_index] == ctx->mark_stamp) continue;
+            ctx->site_marks[site_index] = ctx->mark_stamp;
+            ctx->candidates.push_back(site_index);
+        }
+    }
+    if (ctx->candidates.empty()) return;
 
     const std::string read_name(reinterpret_cast<const char*>(name), name_len);
 
-    for (size_t si : candidates) {
-        const GraphSite& site = ctx->catalog->sites[si];
-        const GraphWalkStep& left_bnd  = site.allele_walks[0].front();
-        const GraphWalkStep& right_bnd = site.allele_walks[0].back();
-
-        const GraphWalk subwalk = extract_subwalk_between(read_walk, left_bnd, right_bnd);
-        if (subwalk.empty()) continue;
-
+    for (size_t compact_site_index : ctx->candidates) {
+        const CompactGraphSite& site = index.sites[compact_site_index];
         bool rev = false;
-        const int allele = match_graph_allele_exact(subwalk, site.allele_walks, &rev);
+        const int allele = match_compact_site_on_read(
+            ctx->read_walk, ctx->boundary_positions, site, &rev);
         if (allele < 0) continue;
 
         ctx->results->push_back(GraphReadAllele{
-            graph_site_key_str(site, si),
-            site.ref_contig.empty() ? site.chrom : site.ref_contig,
+            site.site_id,
+            site.chrom,
             site.pos,
             read_name,
             allele,
-            graph_walk_to_string(subwalk),
+            "",
             mapq,
             rev
         });
@@ -559,20 +541,24 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
         throw std::runtime_error("invalid interval for graph query: " + contig +
                                  ":" + std::to_string(beg) + ".." + std::to_string(end));
 
-    // Build boundary-node index for catalog matching.
-    std::unordered_map<std::string, std::vector<size_t>> node_to_sites;
-    for (size_t i = 0; i < catalog.sites.size(); ++i) {
-        const GraphSite& site = catalog.sites[i];
-        if (!graph_site_is_queryable(site)) continue;
-        const GraphWalk& w = site.allele_walks[0];
-        if (w.size() < 2) continue;
-        node_to_sites[w.front().node].push_back(i);
-        if (w.back().node != w.front().node)
-            node_to_sites[w.back().node].push_back(i);
+    // Build compact numeric site index from catalog walks.
+    CompactGraphSiteIndex compact_index;
+    {
+        // build_compact_graph_site_index may release walk strings; we need a
+        // mutable reference but must not modify the caller's catalog.
+        GraphSiteCatalog& mutable_catalog = const_cast<GraphSiteCatalog&>(catalog);
+        if (!build_compact_graph_site_index(mutable_catalog, compact_index, false)) {
+            // Fallback: catalog has no compactable sites.
+            return {};
+        }
     }
 
     std::vector<GraphReadAllele> results;
-    StructuredQueryContext ctx{&node_to_sites, &catalog, min_mapq, &results};
+    CompactFFIContext ctx{};
+    ctx.index = &compact_index;
+    ctx.min_mapq = min_mapq;
+    ctx.results = &results;
+    ctx.site_marks.resize(compact_index.sites.size(), 0);
 
     char* err = nullptr;
     const int rc = pgphase_gbz_query_interval_structured(
