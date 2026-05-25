@@ -19,6 +19,8 @@ outdir      = sys.argv[7]
 samtools    = sys.argv[8] if len(sys.argv) > 8 else "samtools"
 exclude_bed = sys.argv[9] if len(sys.argv) > 9 else ""
 sites_vcf   = sys.argv[10] if len(sys.argv) > 10 else ""
+censat_bed  = sys.argv[11] if len(sys.argv) > 11 else ""
+segdup_bed  = sys.argv[12] if len(sys.argv) > 12 else ""
 
 chrom_filter = set()
 if chroms_arg:
@@ -46,6 +48,52 @@ if exclude_bed:
           file=sys.stderr)
 
 import bisect
+
+# ── load annotation BEDs for per-category accuracy ───────────────────
+def load_annotation_bed(path, label):
+    """Load a BED file into a dict: contig -> sorted list of (start, end)."""
+    regions = collections.defaultdict(list)
+    if not path:
+        return regions
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("#") or line.startswith("track"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                continue
+            regions[parts[0]].append((int(parts[1]), int(parts[2])))
+    for contig in regions:
+        regions[contig].sort()
+    total = sum(len(v) for v in regions.values())
+    print(f"  Loaded {total} {label} regions from {path}", file=sys.stderr)
+    return regions
+
+censat_regions = load_annotation_bed(censat_bed, "censat")
+segdup_regions = load_annotation_bed(segdup_bed, "segdup")
+
+def in_region(regions, contig, pos):
+    """Check if a position falls within any region using binary search."""
+    intervals = regions.get(contig)
+    if not intervals:
+        return False
+    idx = bisect.bisect_right(intervals, (pos, float('inf'))) - 1
+    if idx < 0:
+        return False
+    return intervals[idx][0] <= pos < intervals[idx][1]
+
+def classify_read(contig, pos):
+    """Classify a read position into a genomic category."""
+    is_censat = censat_regions and in_region(censat_regions, contig, pos)
+    is_segdup = segdup_regions and in_region(segdup_regions, contig, pos)
+    if is_censat and is_segdup:
+        return "censat+segdup"
+    elif is_censat:
+        return "censat"
+    elif is_segdup:
+        return "segdup"
+    else:
+        return "unique"
 
 def in_excluded_region(contig, pos):
     """Check if a position falls within any excluded region."""
@@ -281,11 +329,23 @@ for ps in ps_read_list:
 for r in results:
     r["switches"] = ps_switches.get(r["phase_set"], 0)
 
-# ── per-read output with concordance ────────────────────────────────
+# ── per-read output with concordance + category ─────────────────────
+has_annotations = bool(censat_regions or segdup_regions)
+cat_counts = collections.defaultdict(lambda: {"conc": 0, "disc": 0, "total": 0,
+                                               "switches": 0, "pairs": 0})
+
+def full_contig_name(chrom, hap):
+    """Reconstruct full contig name (e.g. chr20_MATERNAL) for annotation lookup."""
+    suffix = {"MAT": "_MATERNAL", "PAT": "_PATERNAL"}.get(hap, "")
+    return chrom + suffix
+
 per_read_file = os.path.join(outdir, "per_read.tsv.gz")
 with gzip.open(per_read_file, "wt") as fh:
-    fh.write("read_name\tHP\tPS\ttruth_hap\ttruth_contig\ttruth_mapq\t"
-             "hapq\ttruth_pos\tstatus\torientation\n")
+    header = ("read_name\tHP\tPS\ttruth_hap\ttruth_contig\ttruth_mapq\t"
+              "hapq\ttruth_pos\tstatus\torientation")
+    if has_annotations:
+        header += "\tcategory"
+    fh.write(header + "\n")
     for qname in sorted(read_truth):
         hp, ps = read_phase[qname]
         t = read_truth[qname]
@@ -297,8 +357,45 @@ with gzip.open(per_read_file, "wt") as fh:
         else:
             status = "DISCORDANT"
         orient_str = orient if orient else "."
-        fh.write(f"{qname}\t{hp}\t{ps}\t{t.hap}\t{t.chrom}\t{t.mapq}\t"
-                 f"{t.hapq}\t{t.pos}\t{status}\t{orient_str}\n")
+
+        # Classify read into genomic category
+        full_contig = full_contig_name(t.chrom, t.hap)
+        cat = classify_read(full_contig, t.pos) if has_annotations else "all"
+
+        if status in ("concordant", "DISCORDANT"):
+            cat_counts[cat]["total"] += 1
+            if status == "concordant":
+                cat_counts[cat]["conc"] += 1
+            else:
+                cat_counts[cat]["disc"] += 1
+
+        line = (f"{qname}\t{hp}\t{ps}\t{t.hap}\t{t.chrom}\t{t.mapq}\t"
+                f"{t.hapq}\t{t.pos}\t{status}\t{orient_str}")
+        if has_annotations:
+            line += f"\t{cat}"
+        fh.write(line + "\n")
+
+# Compute per-category switch errors
+if has_annotations:
+    cat_read_list = collections.defaultdict(lambda: collections.defaultdict(list))
+    for qname in read_truth:
+        hp, ps = read_phase[qname]
+        t = read_truth[qname]
+        orient = ps_orient.get(ps)
+        if orient is None:
+            continue
+        conc = is_concordant(hp, t.hap, orient)
+        full_contig = full_contig_name(t.chrom, t.hap)
+        cat = classify_read(full_contig, t.pos)
+        cat_read_list[cat][ps].append((t.pos, conc))
+
+    for cat in cat_read_list:
+        for ps_reads in cat_read_list[cat].values():
+            reads = sorted(ps_reads, key=lambda x: x[0])
+            for i in range(1, len(reads)):
+                cat_counts[cat]["pairs"] += 1
+                if reads[i][1] != reads[i-1][1]:
+                    cat_counts[cat]["switches"] += 1
 
 # ── per-phase-set TSV ────────────────────────────────────────────────
 ps_fields = ["chrom","phase_set","n_reads","span_bp",
@@ -335,6 +432,21 @@ with open(per_chrom_file, "w") as fh:
         mx = spans[-1] if spans else 0
         fh.write(f"{ch}\t{s['n_ps']}\t{s['perfect']}\t{s['tot']}\t"
                  f"{s['conc']}\t{s['disc']}\t{acc:.4f}\t{med}\t{mx}\n")
+
+# ── per-category TSV ─────────────────────────────────────────────────
+if has_annotations:
+    cat_file = os.path.join(outdir, "per_category.tsv")
+    with open(cat_file, "w") as fh:
+        fh.write("category\treads\tconcordant\tdiscordant\taccuracy\t"
+                 "hamming_error\tswitches\tpairs\tswitch_error\n")
+        for cat in sorted(cat_counts):
+            c = cat_counts[cat]
+            acc = c["conc"] / c["total"] if c["total"] else 0
+            herr = c["disc"] / c["total"] if c["total"] else 0
+            serr = c["switches"] / c["pairs"] if c["pairs"] else 0
+            fh.write(f"{cat}\t{c['total']}\t{c['conc']}\t{c['disc']}\t"
+                     f"{acc:.4f}\t{herr:.4f}\t{c['switches']}\t{c['pairs']}\t"
+                     f"{serr:.4f}\n")
 
 # ── worst phase sets ────────────────────────────────────────────────
 worst_file = os.path.join(outdir, "worst_phase_sets.tsv")
@@ -432,6 +544,19 @@ summary = {
     "phase_block_max_span_bp": all_spans[0] if all_spans else 0,
     "per_chrom": {},
 }
+if has_annotations:
+    summary["per_category"] = {}
+    for cat in sorted(cat_counts):
+        c = cat_counts[cat]
+        summary["per_category"][cat] = {
+            "reads": c["total"],
+            "concordant": c["conc"],
+            "discordant": c["disc"],
+            "accuracy": round(c["conc"] / c["total"], 6) if c["total"] else 0,
+            "switches": c["switches"],
+            "switch_error_rate": round(c["switches"] / c["pairs"], 6) if c["pairs"] else 0,
+        }
+
 summary["phaseable"] = {
     "threshold": PHASEABLE_THRESHOLD,
     "phase_sets": phaseable_ps,
@@ -491,6 +616,18 @@ with open(summary_file, "w") as fh:
         f"  Unphaseable (≤{100*PHASEABLE_THRESHOLD:.0f}%):    {unphaseable_ps} PS, "
         f"{unphaseable_conc+unphaseable_disc:,} reads, {100*unphaseable_acc:.2f}%",
     ]
+    if has_annotations:
+        lines += ["", "  Per-category:"]
+        lines.append(f"    {'Category':<20s} {'Reads':>8s} {'Accuracy':>9s} "
+                     f"{'Hamming':>8s} {'Switch':>8s}")
+        lines.append("    " + "-" * 58)
+        for cat in sorted(cat_counts):
+            c = cat_counts[cat]
+            acc = c["conc"] / c["total"] if c["total"] else 0
+            herr = c["disc"] / c["total"] if c["total"] else 0
+            serr = c["switches"] / c["pairs"] if c["pairs"] else 0
+            lines.append(f"    {cat:<20s} {c['total']:>8,d} {100*acc:>8.2f}% "
+                         f"{100*herr:>7.2f}% {100*serr:>7.2f}%")
     lines += [
         "",
         "  Per-chromosome:",
@@ -632,4 +769,6 @@ print(f"           {per_chrom_file}", file=sys.stderr)
 print(f"           {per_read_file}", file=sys.stderr)
 print(f"           {worst_file}", file=sys.stderr)
 print(f"           {bad_bed_file}", file=sys.stderr)
+if has_annotations:
+    print(f"           {cat_file}", file=sys.stderr)
 print(f"           {igv_dir}/  ({n_igv} blocks)", file=sys.stderr)

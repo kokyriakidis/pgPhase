@@ -33,6 +33,8 @@ MINIMAP2="minimap2"
 DIPLINATOR="diplinator"
 SAMTOOLS="samtools"
 EXCLUDE_BED=""
+CENSAT_BED=""
+SEGDUP_BED=""
 SITES_VCF=""
 
 usage() {
@@ -53,6 +55,8 @@ Optional:
   --min-hapq    INT     Min HapQ from diplinator [0]
   --min-reads   INT     Min reads per phase set to evaluate [5]
   --exclude-bed FILE   BED of difficult regions to exclude from evaluation
+  --censat-bed  FILE   Centromere/satellite BED for per-category accuracy
+  --segdup-bed  FILE   Segmental duplication BED for per-category accuracy
   --sites-vcf   FILE   Sites VCF from graph decomposition (to detect unphaseable blocks)
   --samtools    PATH    Path to samtools executable [samtools]
   --minimap2    PATH    Path to minimap2 executable [minimap2]
@@ -80,6 +84,8 @@ while [[ $# -gt 0 ]]; do
         --min-hapq)    MIN_HAPQ="$2";   shift 2 ;;
         --min-reads)   MIN_READS_PER_PS="$2"; shift 2 ;;
         --exclude-bed) EXCLUDE_BED="$2"; shift 2 ;;
+        --censat-bed)  CENSAT_BED="$2"; shift 2 ;;
+        --segdup-bed)  SEGDUP_BED="$2"; shift 2 ;;
         --sites-vcf)   SITES_VCF="$2";  shift 2 ;;
         --samtools)    SAMTOOLS="$2";   shift 2 ;;
         --minimap2)    MINIMAP2="$2";   shift 2 ;;
@@ -280,7 +286,7 @@ echo "[6/6] Evaluating phase concordance ..."
 python3 "$(dirname "$0")/evaluate_phase_accuracy.py" \
     "$PHASED_BAM" "$TAGGED_BAM" "$MIN_MAPQ" "$MIN_HAPQ" \
     "$MIN_READS_PER_PS" "$CHROMS" "$OUTDIR" "$SAMTOOLS" "$EXCLUDE_BED" \
-    "$SITES_VCF"
+    "$SITES_VCF" "$CENSAT_BED" "$SEGDUP_BED"
 
 echo "      Generating plots ..."
 python3 "$(dirname "$0")/plot_phase_accuracy.py" "$OUTDIR" 2>/dev/null \
