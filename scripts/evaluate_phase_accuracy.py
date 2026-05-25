@@ -249,6 +249,38 @@ def is_concordant(hp, truth_hap, orientation):
     else:  # HP1=PAT,HP2=MAT
         return (hp == 1 and truth_hap == "PAT") or (hp == 2 and truth_hap == "MAT")
 
+# ── compute switch errors per phase set ──────────────────────────────
+# A switch error is a transition between concordant and discordant
+# in consecutive reads sorted by truth position within a phase set.
+# This counts actual phase switches, not individual discordant reads.
+ps_switches = {}
+ps_read_list = collections.defaultdict(list)  # ps -> [(pos, is_concordant)]
+
+for qname in read_truth:
+    hp, ps = read_phase[qname]
+    t = read_truth[qname]
+    orient = ps_orient.get(ps)
+    if orient is None:
+        continue
+    conc = is_concordant(hp, t.hap, orient)
+    ps_read_list[ps].append((t.pos, conc))
+
+total_switches = 0
+total_switch_opportunities = 0
+for ps in ps_read_list:
+    reads = sorted(ps_read_list[ps], key=lambda x: x[0])
+    switches = 0
+    for i in range(1, len(reads)):
+        if reads[i][1] != reads[i-1][1]:
+            switches += 1
+    ps_switches[ps] = switches
+    total_switches += switches
+    total_switch_opportunities += max(len(reads) - 1, 0)
+
+# Attach switch count to results
+for r in results:
+    r["switches"] = ps_switches.get(r["phase_set"], 0)
+
 # ── per-read output with concordance ────────────────────────────────
 per_read_file = os.path.join(outdir, "per_read.tsv.gz")
 with gzip.open(per_read_file, "wt") as fh:
@@ -271,7 +303,7 @@ with gzip.open(per_read_file, "wt") as fh:
 # ── per-phase-set TSV ────────────────────────────────────────────────
 ps_fields = ["chrom","phase_set","n_reads","span_bp",
              "hp1_mat","hp1_pat","hp2_mat","hp2_pat",
-             "concordant","discordant","accuracy","orientation"]
+             "concordant","discordant","accuracy","switches","orientation"]
 if sites_vcf:
     ps_fields.extend(["n_sites", "site_density"])
 per_ps_file = os.path.join(outdir, "per_phase_set.tsv")
@@ -351,7 +383,8 @@ for sp in all_spans:
 
 # ── JSON summary (machine-readable) ─────────────────────────────────
 overall_acc = total_conc / total_reads if total_reads else 0
-switch_rate = total_disc / total_reads if total_reads else 0
+hamming_rate = total_disc / total_reads if total_reads else 0
+switch_rate = total_switches / total_switch_opportunities if total_switch_opportunities else 0
 pct_perfect = 100 * total_perfect / total_ps if total_ps else 0
 
 # Accuracy split by het site availability
@@ -390,6 +423,9 @@ summary = {
     "concordant_reads": total_conc,
     "discordant_reads": total_disc,
     "overall_accuracy": round(overall_acc, 6),
+    "hamming_error_rate": round(hamming_rate, 6),
+    "switch_errors": total_switches,
+    "switch_opportunities": total_switch_opportunities,
     "switch_error_rate": round(switch_rate, 6),
     "phase_block_n50_bp": n50,
     "phase_block_median_span_bp": all_spans[len(all_spans)//2] if all_spans else 0,
@@ -443,7 +479,10 @@ with open(summary_file, "w") as fh:
         f"  HapQ-filtered:            {n_low_hapq:,}",
         f"  Excluded (difficult):     {n_excluded:,}", "",
         f"  Overall accuracy:         {100*overall_acc:.2f}%",
-        f"  Switch error rate:        {100*switch_rate:.2f}%",
+        f"  Hamming error rate:       {100*hamming_rate:.2f}%  "
+        f"({total_disc:,} discordant reads / {total_reads:,})",
+        f"  Switch error rate:        {100*switch_rate:.2f}%  "
+        f"({total_switches:,} switches / {total_switch_opportunities:,} pairs)",
     ]
     lines += [
         "",
