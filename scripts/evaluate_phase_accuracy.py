@@ -175,6 +175,11 @@ for ps in sorted(ps_counts):
     total_ps += 1
     if disc == 0: total_perfect += 1
 
+    # Per-contig min/max for BED output
+    contig_ranges = {}
+    for ch, positions in ps_contig_positions[ps].items():
+        contig_ranges[ch] = (min(positions), max(positions))
+
     results.append({
         "chrom": ",".join(sorted(ps_chroms[ps])),
         "phase_set": ps,
@@ -184,6 +189,7 @@ for ps in sorted(ps_counts):
         "hp2_mat": hp2_mat, "hp2_pat": hp2_pat,
         "concordant": conc, "discordant": disc,
         "accuracy": acc, "orientation": orient,
+        "contig_ranges": contig_ranges,
     })
 
 # ── build orientation map for per-read annotation ───────────────────
@@ -223,7 +229,8 @@ ps_fields = ["chrom","phase_set","n_reads","span_bp",
              "concordant","discordant","accuracy","orientation"]
 per_ps_file = os.path.join(outdir, "per_phase_set.tsv")
 with open(per_ps_file, "w", newline="") as fh:
-    w = csv.DictWriter(fh, delimiter="\t", fieldnames=ps_fields)
+    w = csv.DictWriter(fh, delimiter="\t", fieldnames=ps_fields,
+                       extrasaction="ignore")
     w.writeheader()
     for r in results:
         out = dict(r); out["accuracy"] = f"{r['accuracy']:.4f}"
@@ -254,11 +261,36 @@ with open(per_chrom_file, "w") as fh:
 worst_file = os.path.join(outdir, "worst_phase_sets.tsv")
 worst = sorted(results, key=lambda r: r["accuracy"])[:50]
 with open(worst_file, "w", newline="") as fh:
-    w = csv.DictWriter(fh, delimiter="\t", fieldnames=ps_fields)
+    w = csv.DictWriter(fh, delimiter="\t", fieldnames=ps_fields,
+                       extrasaction="ignore")
     w.writeheader()
     for r in worst:
         out = dict(r); out["accuracy"] = f"{r['accuracy']:.4f}"
         w.writerow(out)
+
+# ── bad regions BED ─────────────────────────────────────────────────
+# Phase sets below threshold accuracy, output as BED9 for IGV.
+# One row per contig span of each bad phase set.
+BAD_ACCURACY_THRESHOLD = 0.60
+bad_bed_file = os.path.join(outdir, "bad_phase_regions.bed")
+n_bad_ps = 0
+n_bad_rows = 0
+with open(bad_bed_file, "w") as fh:
+    for r in sorted(results, key=lambda x: x["accuracy"]):
+        if r["accuracy"] >= BAD_ACCURACY_THRESHOLD:
+            break
+        n_bad_ps += 1
+        for chrom, (start, end) in r["contig_ranges"].items():
+            name = (f"PS={r['phase_set']};acc={r['accuracy']:.2f};"
+                    f"n={r['n_reads']};disc={r['discordant']}")
+            score = int(r["accuracy"] * 1000)
+            fh.write(f"{chrom}\t{start}\t{end}\t{name}\t{score}\t.\t"
+                     f"{start}\t{end}\t255,0,0\n")
+            n_bad_rows += 1
+
+print(f"\n  {n_bad_ps} bad phase sets ({n_bad_rows} regions, "
+      f"accuracy < {BAD_ACCURACY_THRESHOLD:.0%}) in {bad_bed_file}",
+      file=sys.stderr)
 
 # ── N50 of phase block spans ────────────────────────────────────────
 all_spans = sorted([r["span_bp"] for r in results], reverse=True)
@@ -469,4 +501,5 @@ print(f"           {per_ps_file}", file=sys.stderr)
 print(f"           {per_chrom_file}", file=sys.stderr)
 print(f"           {per_read_file}", file=sys.stderr)
 print(f"           {worst_file}", file=sys.stderr)
+print(f"           {bad_bed_file}", file=sys.stderr)
 print(f"           {igv_dir}/  ({n_igv} blocks)", file=sys.stderr)
