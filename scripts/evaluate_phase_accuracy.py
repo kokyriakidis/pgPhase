@@ -37,10 +37,25 @@ proc.wait()
 print(f"  Loaded {len(read_phase)} phased reads.", file=sys.stderr)
 
 # ── parse truth alignments (diplinator-merged BAM) ───────────────────
-# Haplotype origin is in the HO:Z: tag, not the contig name.
-ReadTruth = collections.namedtuple("ReadTruth", "hap contig mapq pos hapq")
+# Haplotype origin is determined from:
+#   1. Contig name suffix (_MATERNAL/_PATERNAL) if present
+#   2. HO:Z: tag (added during merge step) as fallback
+ReadTruth = collections.namedtuple("ReadTruth", "hap chrom mapq pos hapq")
 read_truth = {}
 n_mapped = n_low_mapq = n_low_hapq = 0
+
+def parse_contig(rname):
+    """Extract (haplotype, bare_chrom) from contig name.
+
+    Handles both suffixed (chr20_MATERNAL) and bare (chr20) names.
+    Returns (hap, chrom) where hap is 'MAT'/'PAT' or None.
+    """
+    if rname.endswith("_MATERNAL"):
+        return "MAT", rname[:-9]
+    elif rname.endswith("_PATERNAL"):
+        return "PAT", rname[:-9]
+    return None, rname
+
 proc = subprocess.Popen([samtools, "view", "-F", "0x904", truth_bam],
                         stdout=subprocess.PIPE, text=True)
 for line in proc.stdout:
@@ -50,24 +65,26 @@ for line in proc.stdout:
     if mapq < min_mapq:
         n_low_mapq += 1; continue
 
-    # Extract HO and hq tags
+    # Determine haplotype from contig name or HO tag
+    contig_hap, chrom = parse_contig(rname)
     ho = None
-    hapq = 60  # default if tag missing (mapped to only one haplotype)
+    hapq = 60  # default if tag missing
     for tag in f[11:]:
         if tag.startswith("HO:Z:"): ho = tag[5:]
         elif tag.startswith("hq:i:"): hapq = int(tag[5:])
 
-    if ho is None:
-        continue  # no haplotype-of-origin tag
+    hap = contig_hap or ho
+    if hap is None:
+        continue  # no haplotype information
     if hapq < min_hapq:
         n_low_hapq += 1; continue
 
-    # Chromosome filter: contig names are haploid (e.g. chr1, chr20)
-    if chrom_filter and rname not in chrom_filter:
+    # Chromosome filter uses bare name (e.g. chr20, not chr20_MATERNAL)
+    if chrom_filter and chrom not in chrom_filter:
         continue
 
     if qname in read_phase and qname not in read_truth:
-        read_truth[qname] = ReadTruth(ho, rname, mapq, pos, hapq)
+        read_truth[qname] = ReadTruth(hap, chrom, mapq, pos, hapq)
         n_mapped += 1
 proc.wait()
 print(f"  {n_mapped} mapped to truth (MAPQ>={min_mapq}, HapQ>={min_hapq}), "
@@ -81,8 +98,8 @@ ps_contig_positions = collections.defaultdict(lambda: collections.defaultdict(li
 for qname, t in read_truth.items():
     hp, ps = read_phase[qname]
     ps_counts[ps][(hp, t.hap)] += 1
-    ps_chroms[ps].add(t.contig)
-    ps_contig_positions[ps][t.contig].append(t.pos)
+    ps_chroms[ps].add(t.chrom)
+    ps_contig_positions[ps][t.chrom].append(t.pos)
 
 # ── evaluate each phase set ─────────────────────────────────────────
 results = []
@@ -155,7 +172,7 @@ with gzip.open(per_read_file, "wt") as fh:
         else:
             status = "DISCORDANT"
         orient_str = orient if orient else "."
-        fh.write(f"{qname}\t{hp}\t{ps}\t{t.hap}\t{t.contig}\t{t.mapq}\t"
+        fh.write(f"{qname}\t{hp}\t{ps}\t{t.hap}\t{t.chrom}\t{t.mapq}\t"
                  f"{t.hapq}\t{t.pos}\t{status}\t{orient_str}\n")
 
 # ── per-phase-set TSV ────────────────────────────────────────────────
@@ -294,7 +311,7 @@ for qname in read_truth:
     if orient is None:
         continue
     conc = is_concordant(hp, t.hap, orient)
-    ps_reads[ps].append((qname, hp, t.hap, t.contig, t.pos,
+    ps_reads[ps].append((qname, hp, t.hap, t.chrom, t.pos,
                           "concordant" if conc else "DISCORDANT"))
 
 igv_blocks = sorted(results, key=lambda r: r["accuracy"])[:N_IGV_BLOCKS]
@@ -317,13 +334,13 @@ for i, blk in enumerate(igv_blocks):
     contig_pos = collections.defaultdict(list)
     chrom_set = set()
     with open(bed_file, "w") as fh:
-        for qname, hp, thap, tcontig, tpos, status in reads:
+        for qname, hp, thap, tchrom, tpos, status in reads:
             color = "255,0,0" if status == "DISCORDANT" else "0,0,255"
             label = f"HP{hp}_{thap}_{status}"
-            fh.write(f"{tcontig}\t{tpos}\t{tpos+1}\t{label}:{qname}\t0\t.\t"
+            fh.write(f"{tchrom}\t{tpos}\t{tpos+1}\t{label}:{qname}\t0\t.\t"
                      f"{tpos}\t{tpos+1}\t{color}\n")
-            chrom_set.add(tcontig)
-            contig_pos[tcontig].append(tpos)
+            chrom_set.add(tchrom)
+            contig_pos[tchrom].append(tpos)
 
     # Pick the contig with the most reads for the IGV region
     best_contig = max(contig_pos, key=lambda c: len(contig_pos[c]))
