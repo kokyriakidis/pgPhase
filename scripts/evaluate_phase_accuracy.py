@@ -212,12 +212,16 @@ for ps in sorted(ps_counts):
     for ch, positions in ps_contig_positions[ps].items():
         contig_ranges[ch] = (min(positions), max(positions))
 
-    # Count het sites from graph VCF in this phase set's range.
+    # Count sites from graph VCF in this phase set's range.
     # PS value is the graph-coordinate start; use span as approximate end.
+    # Compute site density (sites/kb) to distinguish well-covered from sparse.
     n_sites = 0
+    site_density = 0.0
     if sites_vcf:
         for ch in ps_chroms[ps]:
-            n_sites += count_sites_in_range(ch, ps, ps + span)
+            n_sites += count_sites_in_range(ch, ps, ps + max(span, 1))
+        if span > 0:
+            site_density = round(n_sites / (span / 1000), 2)
 
     results.append({
         "chrom": ",".join(sorted(ps_chroms[ps])),
@@ -230,6 +234,7 @@ for ps in sorted(ps_counts):
         "accuracy": acc, "orientation": orient,
         "contig_ranges": contig_ranges,
         "n_sites": n_sites,
+        "site_density": site_density,
     })
 
 # ── build orientation map for per-read annotation ───────────────────
@@ -268,7 +273,7 @@ ps_fields = ["chrom","phase_set","n_reads","span_bp",
              "hp1_mat","hp1_pat","hp2_mat","hp2_pat",
              "concordant","discordant","accuracy","orientation"]
 if sites_vcf:
-    ps_fields.append("n_sites")
+    ps_fields.extend(["n_sites", "site_density"])
 per_ps_file = os.path.join(outdir, "per_phase_set.tsv")
 with open(per_ps_file, "w", newline="") as fh:
     w = csv.DictWriter(fh, delimiter="\t", fieldnames=ps_fields,
@@ -350,20 +355,23 @@ switch_rate = total_disc / total_reads if total_reads else 0
 pct_perfect = 100 * total_perfect / total_ps if total_ps else 0
 
 # Accuracy split by het site availability
-sites_conc = sites_disc = sites_ps = 0
-nosites_conc = nosites_disc = nosites_ps = 0
-if sites_vcf:
-    for r in results:
-        if r["n_sites"] > 0:
-            sites_conc += r["concordant"]
-            sites_disc += r["discordant"]
-            sites_ps += 1
-        else:
-            nosites_conc += r["concordant"]
-            nosites_disc += r["discordant"]
-            nosites_ps += 1
-    sites_acc = sites_conc / (sites_conc + sites_disc) if (sites_conc + sites_disc) else 0
-    nosites_acc = nosites_conc / (nosites_conc + nosites_disc) if (nosites_conc + nosites_disc) else 0
+# Detect unphaseable blocks: accuracy not significantly different from 50%.
+# Use a simple threshold: a block is "phaseable" if accuracy > 60%.
+# This separates blocks where phasing worked from those that are random.
+phaseable_conc = phaseable_disc = phaseable_ps = 0
+unphaseable_conc = unphaseable_disc = unphaseable_ps = 0
+PHASEABLE_THRESHOLD = 0.60
+for r in results:
+    if r["accuracy"] > PHASEABLE_THRESHOLD:
+        phaseable_conc += r["concordant"]
+        phaseable_disc += r["discordant"]
+        phaseable_ps += 1
+    else:
+        unphaseable_conc += r["concordant"]
+        unphaseable_disc += r["discordant"]
+        unphaseable_ps += 1
+phaseable_acc = phaseable_conc / (phaseable_conc + phaseable_disc) if (phaseable_conc + phaseable_disc) else 0
+unphaseable_acc = unphaseable_conc / (unphaseable_conc + unphaseable_disc) if (unphaseable_conc + unphaseable_disc) else 0
 
 summary = {
     "chroms": chroms_arg if chroms_arg else "all",
@@ -388,21 +396,21 @@ summary = {
     "phase_block_max_span_bp": all_spans[0] if all_spans else 0,
     "per_chrom": {},
 }
-if sites_vcf:
-    summary["with_sites"] = {
-        "phase_sets": sites_ps,
-        "reads": sites_conc + sites_disc,
-        "concordant": sites_conc,
-        "discordant": sites_disc,
-        "accuracy": round(sites_acc, 6),
-    }
-    summary["without_sites"] = {
-        "phase_sets": nosites_ps,
-        "reads": nosites_conc + nosites_disc,
-        "concordant": nosites_conc,
-        "discordant": nosites_disc,
-        "accuracy": round(nosites_acc, 6),
-    }
+summary["phaseable"] = {
+    "threshold": PHASEABLE_THRESHOLD,
+    "phase_sets": phaseable_ps,
+    "reads": phaseable_conc + phaseable_disc,
+    "concordant": phaseable_conc,
+    "discordant": phaseable_disc,
+    "accuracy": round(phaseable_acc, 6),
+}
+summary["unphaseable"] = {
+    "phase_sets": unphaseable_ps,
+    "reads": unphaseable_conc + unphaseable_disc,
+    "concordant": unphaseable_conc,
+    "discordant": unphaseable_disc,
+    "accuracy": round(unphaseable_acc, 6),
+}
 for ch in sorted(cs):
     s = cs[ch]; acc = s["conc"]/s["tot"] if s["tot"] else 0
     summary["per_chrom"][ch] = {
@@ -437,14 +445,13 @@ with open(summary_file, "w") as fh:
         f"  Overall accuracy:         {100*overall_acc:.2f}%",
         f"  Switch error rate:        {100*switch_rate:.2f}%",
     ]
-    if sites_vcf:
-        lines += [
-            "",
-            f"  With het sites:           {sites_ps} PS, "
-            f"{sites_conc+sites_disc:,} reads, {100*sites_acc:.2f}%",
-            f"  Without het sites:        {nosites_ps} PS, "
-            f"{nosites_conc+nosites_disc:,} reads, {100*nosites_acc:.2f}%",
-        ]
+    lines += [
+        "",
+        f"  Phaseable (>{100*PHASEABLE_THRESHOLD:.0f}%):     {phaseable_ps} PS, "
+        f"{phaseable_conc+phaseable_disc:,} reads, {100*phaseable_acc:.2f}%",
+        f"  Unphaseable (≤{100*PHASEABLE_THRESHOLD:.0f}%):    {unphaseable_ps} PS, "
+        f"{unphaseable_conc+unphaseable_disc:,} reads, {100*unphaseable_acc:.2f}%",
+    ]
     lines += [
         "",
         "  Per-chromosome:",
