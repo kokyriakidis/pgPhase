@@ -18,6 +18,7 @@ chroms_arg  = sys.argv[6]
 outdir      = sys.argv[7]
 samtools    = sys.argv[8] if len(sys.argv) > 8 else "samtools"
 exclude_bed = sys.argv[9] if len(sys.argv) > 9 else ""
+sites_vcf   = sys.argv[10] if len(sys.argv) > 10 else ""
 
 chrom_filter = set()
 if chroms_arg:
@@ -56,6 +57,33 @@ def in_excluded_region(contig, pos):
     if idx < 0:
         return False
     return intervals[idx][0] <= pos < intervals[idx][1]
+
+# ── load sites VCF positions ──────────────────────────────────────────
+# Sites VCF from graph decomposition — used to detect phase sets with
+# no het sites (unphaseable).  Positions are in graph/reference coords.
+sites_by_chrom = collections.defaultdict(list)
+if sites_vcf:
+    import gzip as _gzip
+    _open = _gzip.open if sites_vcf.endswith(".gz") else open
+    with _open(sites_vcf, "rt") as fh:
+        for line in fh:
+            if line.startswith("#"):
+                continue
+            parts = line.split("\t", 3)
+            sites_by_chrom[parts[0]].append(int(parts[1]))
+    for ch in sites_by_chrom:
+        sites_by_chrom[ch].sort()
+    total_sites = sum(len(v) for v in sites_by_chrom.values())
+    print(f"  Loaded {total_sites} sites from {sites_vcf}", file=sys.stderr)
+
+def count_sites_in_range(chrom, start, end):
+    """Count VCF sites in [start, end) using binary search."""
+    positions = sites_by_chrom.get(chrom)
+    if not positions:
+        return 0
+    lo = bisect.bisect_left(positions, start)
+    hi = bisect.bisect_left(positions, end)
+    return hi - lo
 
 # ── load HP/PS per read from phased uBAM ─────────────────────────────
 read_phase = {}
@@ -180,6 +208,13 @@ for ps in sorted(ps_counts):
     for ch, positions in ps_contig_positions[ps].items():
         contig_ranges[ch] = (min(positions), max(positions))
 
+    # Count het sites from graph VCF in this phase set's range.
+    # PS value is the graph-coordinate start; use span as approximate end.
+    n_sites = 0
+    if sites_vcf:
+        for ch in ps_chroms[ps]:
+            n_sites += count_sites_in_range(ch, ps, ps + span)
+
     results.append({
         "chrom": ",".join(sorted(ps_chroms[ps])),
         "phase_set": ps,
@@ -190,6 +225,7 @@ for ps in sorted(ps_counts):
         "concordant": conc, "discordant": disc,
         "accuracy": acc, "orientation": orient,
         "contig_ranges": contig_ranges,
+        "n_sites": n_sites,
     })
 
 # ── build orientation map for per-read annotation ───────────────────
@@ -227,6 +263,8 @@ with gzip.open(per_read_file, "wt") as fh:
 ps_fields = ["chrom","phase_set","n_reads","span_bp",
              "hp1_mat","hp1_pat","hp2_mat","hp2_pat",
              "concordant","discordant","accuracy","orientation"]
+if sites_vcf:
+    ps_fields.append("n_sites")
 per_ps_file = os.path.join(outdir, "per_phase_set.tsv")
 with open(per_ps_file, "w", newline="") as fh:
     w = csv.DictWriter(fh, delimiter="\t", fieldnames=ps_fields,
@@ -307,6 +345,22 @@ overall_acc = total_conc / total_reads if total_reads else 0
 switch_rate = total_disc / total_reads if total_reads else 0
 pct_perfect = 100 * total_perfect / total_ps if total_ps else 0
 
+# Accuracy split by het site availability
+sites_conc = sites_disc = sites_ps = 0
+nosites_conc = nosites_disc = nosites_ps = 0
+if sites_vcf:
+    for r in results:
+        if r["n_sites"] > 0:
+            sites_conc += r["concordant"]
+            sites_disc += r["discordant"]
+            sites_ps += 1
+        else:
+            nosites_conc += r["concordant"]
+            nosites_disc += r["discordant"]
+            nosites_ps += 1
+    sites_acc = sites_conc / (sites_conc + sites_disc) if (sites_conc + sites_disc) else 0
+    nosites_acc = nosites_conc / (nosites_conc + nosites_disc) if (nosites_conc + nosites_disc) else 0
+
 summary = {
     "chroms": chroms_arg if chroms_arg else "all",
     "min_mapq": min_mapq,
@@ -330,6 +384,21 @@ summary = {
     "phase_block_max_span_bp": all_spans[0] if all_spans else 0,
     "per_chrom": {},
 }
+if sites_vcf:
+    summary["with_sites"] = {
+        "phase_sets": sites_ps,
+        "reads": sites_conc + sites_disc,
+        "concordant": sites_conc,
+        "discordant": sites_disc,
+        "accuracy": round(sites_acc, 6),
+    }
+    summary["without_sites"] = {
+        "phase_sets": nosites_ps,
+        "reads": nosites_conc + nosites_disc,
+        "concordant": nosites_conc,
+        "discordant": nosites_disc,
+        "accuracy": round(nosites_acc, 6),
+    }
 for ch in sorted(cs):
     s = cs[ch]; acc = s["conc"]/s["tot"] if s["tot"] else 0
     summary["per_chrom"][ch] = {
@@ -362,7 +431,18 @@ with open(summary_file, "w") as fh:
         f"  HapQ-filtered:            {n_low_hapq:,}",
         f"  Excluded (difficult):     {n_excluded:,}", "",
         f"  Overall accuracy:         {100*overall_acc:.2f}%",
-        f"  Switch error rate:        {100*switch_rate:.2f}%", "",
+        f"  Switch error rate:        {100*switch_rate:.2f}%",
+    ]
+    if sites_vcf:
+        lines += [
+            "",
+            f"  With het sites:           {sites_ps} PS, "
+            f"{sites_conc+sites_disc:,} reads, {100*sites_acc:.2f}%",
+            f"  Without het sites:        {nosites_ps} PS, "
+            f"{nosites_conc+nosites_disc:,} reads, {100*nosites_acc:.2f}%",
+        ]
+    lines += [
+        "",
         "  Per-chromosome:",
     ]
     for ch in sorted(cs):
