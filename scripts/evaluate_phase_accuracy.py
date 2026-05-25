@@ -9,18 +9,53 @@ Reads a diplinator-merged BAM where each read carries:
 """
 import sys, subprocess, collections, csv, json, os, gzip
 
-phased_bam = sys.argv[1]
-truth_bam  = sys.argv[2]
-min_mapq   = int(sys.argv[3])
-min_hapq   = int(sys.argv[4])
-min_reads  = int(sys.argv[5])
-chroms_arg = sys.argv[6]
-outdir     = sys.argv[7]
-samtools   = sys.argv[8] if len(sys.argv) > 8 else "samtools"
+phased_bam  = sys.argv[1]
+truth_bam   = sys.argv[2]
+min_mapq    = int(sys.argv[3])
+min_hapq    = int(sys.argv[4])
+min_reads   = int(sys.argv[5])
+chroms_arg  = sys.argv[6]
+outdir      = sys.argv[7]
+samtools    = sys.argv[8] if len(sys.argv) > 8 else "samtools"
+exclude_bed = sys.argv[9] if len(sys.argv) > 9 else ""
 
 chrom_filter = set()
 if chroms_arg:
     chrom_filter = {c.strip() for c in chroms_arg.split(",") if c.strip()}
+
+# ── load exclude regions ─────────────────────────────────────────────
+# BED file with difficult regions (censat, segdups, etc.)
+# Stored as dict: contig -> sorted list of (start, end)
+exclude_regions = collections.defaultdict(list)
+n_excluded = 0
+if exclude_bed:
+    with open(exclude_bed) as fh:
+        for line in fh:
+            if line.startswith("#") or line.startswith("track"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                continue
+            exclude_regions[parts[0]].append((int(parts[1]), int(parts[2])))
+    # Sort intervals for binary search
+    for contig in exclude_regions:
+        exclude_regions[contig].sort()
+    total_intervals = sum(len(v) for v in exclude_regions.values())
+    print(f"  Loaded {total_intervals} exclude regions from {exclude_bed}",
+          file=sys.stderr)
+
+import bisect
+
+def in_excluded_region(contig, pos):
+    """Check if a position falls within any excluded region."""
+    intervals = exclude_regions.get(contig)
+    if not intervals:
+        return False
+    # Binary search: find rightmost interval with start <= pos
+    idx = bisect.bisect_right(intervals, (pos, float('inf'))) - 1
+    if idx < 0:
+        return False
+    return intervals[idx][0] <= pos < intervals[idx][1]
 
 # ── load HP/PS per read from phased uBAM ─────────────────────────────
 read_phase = {}
@@ -83,12 +118,19 @@ for line in proc.stdout:
     if chrom_filter and chrom not in chrom_filter:
         continue
 
+    # Exclude difficult regions (BED uses full contig name e.g. chr20_MATERNAL)
+    if exclude_regions and in_excluded_region(rname, pos):
+        n_excluded += 1
+        continue
+
     if qname in read_phase and qname not in read_truth:
         read_truth[qname] = ReadTruth(hap, chrom, mapq, pos, hapq)
         n_mapped += 1
 proc.wait()
+excl_msg = f", {n_excluded} in excluded regions" if exclude_bed else ""
 print(f"  {n_mapped} mapped to truth (MAPQ>={min_mapq}, HapQ>={min_hapq}), "
-      f"{n_low_mapq} MAPQ-filtered, {n_low_hapq} HapQ-filtered.", file=sys.stderr)
+      f"{n_low_mapq} MAPQ-filtered, {n_low_hapq} HapQ-filtered{excl_msg}.",
+      file=sys.stderr)
 
 # ── group by phase set ──────────────────────────────────────────────
 ps_counts = collections.defaultdict(lambda: collections.Counter())
@@ -242,6 +284,7 @@ summary = {
     "reads_mapped_to_truth": n_mapped,
     "reads_filtered_mapq": n_low_mapq,
     "reads_filtered_hapq": n_low_hapq,
+    "reads_excluded_regions": n_excluded,
     "phase_sets_evaluated": total_ps,
     "phase_sets_perfect": total_perfect,
     "phase_sets_perfect_pct": round(pct_perfect, 2),
@@ -284,7 +327,8 @@ with open(summary_file, "w") as fh:
         f"  Concordant:               {total_conc:,}",
         f"  Discordant:               {total_disc:,}",
         f"  MAPQ-filtered:            {n_low_mapq:,}",
-        f"  HapQ-filtered:            {n_low_hapq:,}", "",
+        f"  HapQ-filtered:            {n_low_hapq:,}",
+        f"  Excluded (difficult):     {n_excluded:,}", "",
         f"  Overall accuracy:         {100*overall_acc:.2f}%",
         f"  Switch error rate:        {100*switch_rate:.2f}%", "",
         "  Per-chromosome:",
