@@ -70,7 +70,11 @@ if sites_vcf:
             if line.startswith("#"):
                 continue
             parts = line.split("\t", 3)
-            sites_by_chrom[parts[0]].append(int(parts[1]))
+            chrom = parts[0]
+            # Strip graph-coordinate prefixes (e.g. CHM13#0#chr20 → chr20)
+            if "#" in chrom:
+                chrom = chrom.rsplit("#", 1)[-1]
+            sites_by_chrom[chrom].append(int(parts[1]))
     for ch in sites_by_chrom:
         sites_by_chrom[ch].sort()
     total_sites = sum(len(v) for v in sites_by_chrom.values())
