@@ -121,42 +121,63 @@ else
 fi
 
 # ── step 3: align to each haplotype separately ───────────────────────
-# Diplinator requires name-sorted input (minimap2 default output order).
+# Diplinator requires name-sorted input.  Write SAM directly (minimap2
+# outputs in query-name order) so diplinator sees the correct format.
+# Also produce BAM and PAF for downstream use.
+MAT_SAM="$OUTDIR/vs_mat.sam"
+PAT_SAM="$OUTDIR/vs_pat.sam"
 MAT_BAM="$OUTDIR/vs_mat.bam"
 PAT_BAM="$OUTDIR/vs_pat.bam"
 MAT_PAF="$OUTDIR/vs_mat.paf"
 PAT_PAF="$OUTDIR/vs_pat.paf"
 
-if [[ ! -f "$MAT_BAM" ]]; then
+if [[ ! -f "$MAT_SAM" ]]; then
     echo "[3/7] Mapping to maternal haplotype ..."
     "$MINIMAP2" -Y --cs --eqx -ax lr:hqae -e 100 --secondary=no \
         -t "$THREADS" "$MAT_REF" "$PHASED_FQ" \
-        | "$SAMTOOLS" view -b -@ "$THREADS" -o "$MAT_BAM"
+        -o "$MAT_SAM"
 else
-    echo "[3/7] Maternal BAM exists, skipping."
+    echo "[3/7] Maternal SAM exists, skipping."
 fi
 
-if [[ ! -f "$PAT_BAM" ]]; then
+if [[ ! -f "$PAT_SAM" ]]; then
     echo "      Mapping to paternal haplotype ..."
     "$MINIMAP2" -Y --cs --eqx -ax lr:hqae -e 100 --secondary=no \
         -t "$THREADS" "$PAT_REF" "$PHASED_FQ" \
-        | "$SAMTOOLS" view -b -@ "$THREADS" -o "$PAT_BAM"
+        -o "$PAT_SAM"
+else
+    echo "      Paternal SAM exists, skipping."
+fi
+
+# Convert SAM → BAM (coordinate-sorted, for downstream merge/tagging/IGV)
+if [[ ! -f "$MAT_BAM" ]]; then
+    echo "      Converting maternal SAM to sorted BAM ..."
+    "$SAMTOOLS" sort -@ "$THREADS" -o "$MAT_BAM" "$MAT_SAM"
+    "$SAMTOOLS" index -@ "$THREADS" "$MAT_BAM"
+else
+    echo "      Maternal BAM exists, skipping."
+fi
+
+if [[ ! -f "$PAT_BAM" ]]; then
+    echo "      Converting paternal SAM to sorted BAM ..."
+    "$SAMTOOLS" sort -@ "$THREADS" -o "$PAT_BAM" "$PAT_SAM"
+    "$SAMTOOLS" index -@ "$THREADS" "$PAT_BAM"
 else
     echo "      Paternal BAM exists, skipping."
 fi
 
-# Convert BAM → PAF (paftools.js sam2paf preserves ms:i: tag;
+# Convert SAM → PAF (paftools.js sam2paf preserves ms:i: tag;
 # diplinator can use it via --paf --ms).
 if [[ ! -f "$MAT_PAF" ]]; then
-    echo "      Converting maternal BAM to PAF ..."
-    "$SAMTOOLS" view -h "$MAT_BAM" | paftools.js sam2paf - > "$MAT_PAF"
+    echo "      Converting maternal SAM to PAF ..."
+    paftools.js sam2paf "$MAT_SAM" > "$MAT_PAF"
 else
     echo "      Maternal PAF exists, skipping."
 fi
 
 if [[ ! -f "$PAT_PAF" ]]; then
-    echo "      Converting paternal BAM to PAF ..."
-    "$SAMTOOLS" view -h "$PAT_BAM" | paftools.js sam2paf - > "$PAT_PAF"
+    echo "      Converting paternal SAM to PAF ..."
+    paftools.js sam2paf "$PAT_SAM" > "$PAT_PAF"
 else
     echo "      Paternal PAF exists, skipping."
 fi
@@ -169,8 +190,8 @@ if [[ ! -f "$DIPLO_MAT" ]] || [[ ! -f "$DIPLO_PAT" ]]; then
     echo "[4/7] Running diplinator ..."
     # Diplinator writes output files in the current directory as
     # diplinator_<label>.sam, so run from OUTDIR.
-    MAT_ABS="$(realpath "$MAT_BAM")"
-    PAT_ABS="$(realpath "$PAT_BAM")"
+    MAT_ABS="$(realpath "$MAT_SAM")"
+    PAT_ABS="$(realpath "$PAT_SAM")"
     # Resolve diplinator to an absolute path so it works after cd.
     if [[ "$DIPLINATOR" == */* ]]; then
         DIPLO_ABS="$(realpath "$DIPLINATOR")"
