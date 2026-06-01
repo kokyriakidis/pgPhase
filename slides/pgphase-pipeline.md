@@ -140,6 +140,72 @@ Final outputs from the graph-based pipeline
 
 ---
 
+<!-- _class: content -->
+
+# Evaluation: Overall Phase Accuracy
+
+HG002 T2T diploid assembly · chr20 · HiFi 30× · diplinator truth set
+
+| Metric | pgphase (graph) | longcallD (linear) | WhatsHap |
+|---|:---:|:---:|:---:|
+| **Overall accuracy** | **XX.XX%** | XX.XX% | XX.XX% |
+| **Hamming error rate** | **X.XX%** | X.XX% | X.XX% |
+| **Switch error rate** | **X.XX%** | X.XX% | X.XX% |
+| **Phase block N50** | **X.X Mb** | X.X Mb | X.X Mb |
+| **Perfect phase sets** | XX / XX (XX%) | XX / XX (XX%) | XX / XX (XX%) |
+| **Reads evaluated** | XX,XXX | XX,XXX | XX,XXX |
+
+> *Replace XX values with actual benchmark results from `summary.json`*
+
+---
+
+<!-- _class: content -->
+
+# Evaluation: Per-Category Accuracy
+
+Accuracy breakdown by genomic region (censat, segdup, unique)
+
+| Category | Reads | Accuracy | Hamming Error | Switch Error |
+|---|:---:|:---:|:---:|:---:|
+| **unique** | XX,XXX | XX.XX% | X.XX% | X.XX% |
+| **segdup** | X,XXX | XX.XX% | X.XX% | X.XX% |
+| **censat** | X,XXX | XX.XX% | X.XX% | X.XX% |
+| **censat+segdup** | XXX | XX.XX% | X.XX% | X.XX% |
+
+### Phaseable vs Unphaseable
+
+| | Phase Sets | Reads | Accuracy |
+|---|:---:|:---:|:---:|
+| **Phaseable (>60%)** | XX | XX,XXX | XX.XX% |
+| **Unphaseable (≤60%)** | XX | X,XXX | XX.XX% |
+
+> *Phaseable threshold: phase sets with >60% accuracy. Unphaseable blocks often lack het sites in the graph.*
+
+---
+
+<!-- _class: content -->
+
+# Evaluation: Graph vs Linear Pipeline
+
+Key advantages of the graph-based approach
+
+| Aspect | Graph (pgphase) | Linear (longcallD) |
+|---|---|---|
+| **Reference bias** | Eliminated — reads traverse haplotype paths | Present — mismatches at variant sites |
+| **Minimizer seeding** | Not affected by known variants | Windows shift at every mismatch |
+| **Variant discovery** | Snarl topology defines sites | Pileup-based candidate detection |
+| **Complex regions** | Graph encodes known structural variation | Relies on realignment heuristics |
+| **Phasing** | Same k-means approach | Same k-means approach |
+| **Noisy regions** | abPOA + WFA2 consensus | abPOA + WFA2 consensus |
+
+### Expected Improvements
+
+- Higher accuracy in **segdup** and **censat** regions where reference bias is strongest
+- Better variant discovery at **multi-allelic sites** encoded as graph snarls
+- Reduced false negatives from **minimizer window shifts** at variant-dense regions
+
+---
+
 <!-- _class: title -->
 
 # Thank You
