@@ -1838,13 +1838,14 @@ static void collect_read_var_profile(const Options& opts, BamChunk& chunk) {
         cgranges_t* noisy_cr = intervals_to_cr(read.noisy_regions);
         if (noisy_cr != nullptr) cr_index(noisy_cr);
         // longcallD `bam_utils.h` `is_in_noisy_reg(pos, noisy_regs)`: cr_overlap(..., pos, pos+1).
+        // Buffer hoisted outside the lambda so cr_overlap reuses it across calls
+        // instead of malloc/free per call.
+        int64_t* noisy_ovlp_b = nullptr;
+        int64_t noisy_max_b = 0;
         const auto is_in_noisy_reg = [&](hts_pos_t pos) -> bool {
             if (noisy_cr == nullptr) return false;
-            int64_t* ovlp_b = nullptr;
-            int64_t max_b = 0;
             const int64_t ovlp_n =
-                cr_overlap(noisy_cr, "cr", static_cast<int32_t>(pos), static_cast<int32_t>(pos + 1), &ovlp_b, &max_b);
-            free(ovlp_b);
+                cr_overlap(noisy_cr, "cr", static_cast<int32_t>(pos), static_cast<int32_t>(pos + 1), &noisy_ovlp_b, &noisy_max_b);
             return ovlp_n > 0;
         };
 
@@ -1911,6 +1912,7 @@ static void collect_read_var_profile(const Options& opts, BamChunk& chunk) {
             append_observation(site_i, 0, -1);
         }
 
+        free(noisy_ovlp_b);
         if (noisy_cr != nullptr) cr_destroy(noisy_cr);
 
         if (cur.start_var_idx >= 0) {
