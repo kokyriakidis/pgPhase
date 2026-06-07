@@ -2,8 +2,8 @@
 
 Variant calling and haplotype phasing for long reads, with two pipelines:
 
-- **`collect-bam-variation`** — call and phase SNPs/indels from BAM/CRAM alignments (HiFi, ONT, short reads).
 - **`collect-graph-variation`** — call and phase variants from a pangenome graph (GBZ + GAF).
+- **`collect-bam-variation`** — call and phase SNPs/indels from BAM/CRAM alignments (HiFi, ONT, short reads).
 - **`build-snarl-catalog`** — preprocess a GBZ pangenome graph into a phasing site catalog VCF for `collect-graph-variation`.
 
 ## Prerequisites
@@ -39,30 +39,6 @@ make portable-bundle
 ```
 
 ## Quick start
-
-### BAM pipeline (HiFi)
-
-```bash
-pgphase collect-bam-variation \
-    --ref ref.fa \
-    --bam hifi.bam \
-    --hifi \
-    --phased-vcf-out phased.vcf \
-    -o candidates.tsv \
-    -t 8
-```
-
-### BAM pipeline (ONT)
-
-```bash
-pgphase collect-bam-variation \
-    --ref ref.fa \
-    --bam ont.bam \
-    --ont \
-    --phased-vcf-out phased.vcf \
-    -o candidates.tsv \
-    -t 16
-```
 
 ### Graph pipeline
 
@@ -100,7 +76,50 @@ pgphase collect-graph-variation \
 
 The sites VCF must be bgzip-compressed with a tabix index (`.tbi` or `.csi`).
 
+### BAM pipeline (HiFi)
+
+```bash
+pgphase collect-bam-variation \
+    --ref ref.fa \
+    --bam hifi.bam \
+    --hifi \
+    --phased-vcf-out phased.vcf \
+    -o candidates.tsv \
+    -t 8
+```
+
+### BAM pipeline (ONT)
+
+```bash
+pgphase collect-bam-variation \
+    --ref ref.fa \
+    --bam ont.bam \
+    --ont \
+    --phased-vcf-out phased.vcf \
+    -o candidates.tsv \
+    -t 16
+```
+
 ## Subcommands
+
+### `collect-graph-variation`
+
+Collects and phases variants using a pangenome graph site catalog and GAF read alignments.
+
+| Option | Description | Default |
+|---|---|---|
+| `--ref FILE` | Reference FASTA (indexed) | required |
+| `--sites FILE` | Sites VCF (bgzipped + tabix-indexed) | required |
+| `--gaf FILE` | Raw GAF alignments | — |
+| `--gbz-db FILE` | GBZ graph database | — |
+| `--gaf-db FILE` | GAF-base read alignment database | — |
+| `--sample NAME` | Reference sample name for GBZ queries | auto-detected |
+| `--phased-vcf-out FILE` | Phased VCF | — |
+| `--phased-bam-out FILE` | Unaligned BAM with HP/PS tags | — |
+| `-r STR` | Restrict to region (repeatable) | whole genome |
+| `-t INT` | Worker threads | 1 |
+
+Provide either `--gaf` (builds an observation index on the fly) or `--gbz-db` + `--gaf-db`.
 
 ### `collect-bam-variation`
 
@@ -125,23 +144,6 @@ Key options:
 | `--pgbam-file FILE` | `.pgbam` sidecar for chunk stitching | — |
 
 Run `pgphase collect-bam-variation --help` for the full option list.
-
-### `collect-graph-variation`
-
-Collects and phases variants using a pangenome graph site catalog and GAF read alignments.
-
-| Option | Description | Default |
-|---|---|---|
-| `--ref FILE` | Reference FASTA (indexed) | required |
-| `--sites FILE` | Sites VCF (bgzipped + tabix-indexed) | required |
-| `--gaf FILE` | Raw GAF alignments | — |
-| `--gbz-db FILE` | GBZ graph database | — |
-| `--gaf-db FILE` | GAF-base read alignment database | — |
-| `--phased-vcf-out FILE` | Phased VCF | — |
-| `--phased-bam-out FILE` | Unaligned BAM with HP/PS tags | — |
-| `-t INT` | Worker threads | 1 |
-
-Provide either `--gaf` (builds an observation index on the fly) or `--gbz-db` + `--gaf-db`.
 
 ### `build-snarl-catalog`
 
