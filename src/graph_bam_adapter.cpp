@@ -495,8 +495,6 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     std::vector<std::vector<int>> new_allele_counts;
     std::vector<std::vector<int>> new_fwd_strand;
     std::vector<std::vector<int>> new_rev_strand;
-    std::vector<int>              new_par;
-    std::vector<std::vector<int>> new_cpa;
     std::vector<std::vector<int>> new_orig_idx;
     // Most sites are biallelic (1 surviving alt); reserve n_cands as a lower bound.
     new_cands.reserve(n_cands);
@@ -504,8 +502,6 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     new_allele_counts.reserve(n_cands);
     new_fwd_strand.reserve(n_cands);
     new_rev_strand.reserve(n_cands);
-    new_par.reserve(n_cands);
-    new_cpa.reserve(n_cands);
     new_orig_idx.reserve(n_cands);
 
     for (size_t i = 0; i < n_cands; ++i) {
@@ -584,33 +580,7 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
             new_allele_counts.push_back({ref_c, alt_c});
             new_fwd_strand.push_back({fwd_ref, fwd_alt});
             new_rev_strand.push_back({rev_ref, rev_alt});
-            new_par.push_back(-1);
-            new_cpa.push_back({});
             new_orig_idx.push_back({0, orig_alt});
-        }
-    }
-
-    // Remap parent/conditional-parent-allele indices into the new biallelic pair space.
-    // After Phase 1, conditional_parent_alleles[i] holds phase-1 parent allele indices.
-    for (size_t i = 0; i < n_cands; ++i) {
-        const int old_par = parent_candidate[i];
-        if (old_par < 0 || conditional_parent_alleles[i].empty()) continue;
-        const auto& parent_pairs = old_site_to_pairs[static_cast<size_t>(old_par)];
-        for (const NewPairEntry& child_entry : old_site_to_pairs[i]) {
-            int assigned_par = -1;
-            std::vector<int> cpa_entry;
-            for (int p_phase1 : conditional_parent_alleles[i]) {
-                for (const NewPairEntry& pe : parent_pairs) {
-                    if (pe.old_alt_phase1 == p_phase1) {
-                        assigned_par = pe.new_idx;
-                        cpa_entry.push_back(1);
-                        break;
-                    }
-                }
-                if (assigned_par >= 0) break;
-            }
-            new_par[static_cast<size_t>(child_entry.new_idx)]  = assigned_par;
-            new_cpa[static_cast<size_t>(child_entry.new_idx)]  = std::move(cpa_entry);
         }
     }
 
@@ -619,8 +589,6 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     allele_counts              = std::move(new_allele_counts);
     fwd_strand_counts          = std::move(new_fwd_strand);
     rev_strand_counts          = std::move(new_rev_strand);
-    parent_candidate           = std::move(new_par);
-    conditional_parent_alleles = std::move(new_cpa);
     allele_orig_idx            = std::move(new_orig_idx);
 
     // Classify candidates before building read profiles so that pruned sites

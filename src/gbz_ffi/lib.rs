@@ -105,8 +105,8 @@ pub extern "C" fn pgphase_gbz_gaf_validate(
     if gbz_handle.is_null() || gaf_handle.is_null() {
         return set_error_int(err_out, "null GBZ or GAF handle");
     }
-    let gbz_session = unsafe { &mut *(gbz_handle as *mut GbzSession) };
-    let gaf_session = unsafe { &(*(gaf_handle as *mut GafSession)) };
+    let gbz_session = unsafe { &*(gbz_handle as *const GbzSession) };
+    let gaf_session = unsafe { &*(gaf_handle as *const GafSession) };
 
     let mut graph_iface = match GraphInterface::new(&gbz_session.db) {
         Ok(g) => g,
@@ -165,8 +165,8 @@ pub extern "C" fn pgphase_gbz_query_interval(
     if gbz_handle.is_null() || gaf_handle.is_null() {
         return set_error_int(err_out, "null GBZ or GAF handle");
     }
-    let gbz_session = unsafe { &mut *(gbz_handle as *mut GbzSession) };
-    let gaf_session = unsafe { &(*(gaf_handle as *mut GafSession)) };
+    let gbz_session = unsafe { &*(gbz_handle as *const GbzSession) };
+    let gaf_session = unsafe { &*(gaf_handle as *const GafSession) };
 
     // Parse string arguments.
     let contig_str = match unsafe { CStr::from_ptr(contig) }.to_str() {
@@ -260,8 +260,8 @@ pub extern "C" fn pgphase_gbz_query_interval_structured(
     if gbz_handle.is_null() || gaf_handle.is_null() {
         return set_error_int(err_out, "null GBZ or GAF handle");
     }
-    let gbz_session = unsafe { &mut *(gbz_handle as *mut GbzSession) };
-    let gaf_session = unsafe { &(*(gaf_handle as *mut GafSession)) };
+    let gbz_session = unsafe { &*(gbz_handle as *const GbzSession) };
+    let gaf_session = unsafe { &*(gaf_handle as *const GafSession) };
 
     let contig_str = match unsafe { CStr::from_ptr(contig) }.to_str() {
         Ok(s) => s,

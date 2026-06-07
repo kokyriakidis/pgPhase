@@ -729,17 +729,12 @@ void run_collect_graph_variation(const Options& opts) {
         if (!opts.output_phased_vcf.empty())
             write_phased_variants_vcf_records(phased_vcf_out, opts, header.get(), ref, variants);
 
-        // Phased BAM: accumulate post-stitch read assignments, flush reads
-        // that won't appear in the next batch.
+        // Phased BAM: accumulate post-stitch read assignments, then flush.
+        // Batches are per-contig so cross-batch read overlap is impossible;
+        // flush everything after each batch.
         if (emit_phased_bam) {
             for (const GraphBamChunkBuildResult& gc : graph_chunks)
                 merge_graph_chunk_into_read_rows(phased_bam_rows, gc);
-            // Collect read names in the next batch to avoid flushing overlap reads early.
-            std::unordered_set<std::string> next_batch_qnames;
-            if (batch_end < chunks.size()) {
-                // Peek: next batch shares the same reg_chunk_i? If not, no overlap.
-                // Cross-contig batches never share reads, so flush all.
-            }
             flush_graph_phase_bam_after_merge(
                 phased_bam_fp.get(), phased_bam_hdr.get(),
                 phased_bam_rows, nullptr, phased_bam_emitted);

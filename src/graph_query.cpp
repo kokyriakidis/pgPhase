@@ -143,6 +143,7 @@ struct CompactGraphSite {
     CompactHandle left_rev = 0;
     CompactHandle right_rev = 0;
     std::vector<std::vector<CompactHandle>> allele_walks;
+    size_t max_walk_len = 0;  // longest allele walk (for early-break bound)
 };
 
 struct CompactGraphSiteIndex {
@@ -158,13 +159,12 @@ bool add_boundary_site(std::unordered_map<CompactHandle, std::vector<size_t>>& b
     return true;
 }
 
-bool build_compact_graph_site_index(GraphSiteCatalog& catalog,
-                                    CompactGraphSiteIndex& out,
-                                    bool release_catalog_walks) {
+bool build_compact_graph_site_index(const GraphSiteCatalog& catalog,
+                                    CompactGraphSiteIndex& out) {
     out = {};
     out.sites.reserve(catalog.sites.size());
     for (size_t i = 0; i < catalog.sites.size(); ++i) {
-        GraphSite& site = catalog.sites[i];
+        const GraphSite& site = catalog.sites[i];
         if (!graph_site_is_queryable(site)) continue;
         if (site.allele_walks.empty() || site.allele_walks[0].size() < 2) continue;
 
@@ -175,9 +175,16 @@ bool build_compact_graph_site_index(GraphSiteCatalog& catalog,
         compact.pos = site.pos;
         compact.allele_walks.reserve(site.allele_walks.size());
         for (const GraphWalk& walk : site.allele_walks) {
+            if (walk.empty()) {
+                // Spanning deletion (*) — push empty walk so allele indices
+                // stay aligned with the original site; it will never match.
+                compact.allele_walks.push_back({});
+                continue;
+            }
             std::vector<CompactHandle> handles;
             if (!graph_walk_to_compact_handles(walk, handles)) return false;
             if (handles.empty()) return false;
+            compact.max_walk_len = std::max(compact.max_walk_len, handles.size());
             compact.allele_walks.push_back(std::move(handles));
         }
         compact.left = compact.allele_walks[0].front();
@@ -191,13 +198,6 @@ bool build_compact_graph_site_index(GraphSiteCatalog& catalog,
         add_boundary_site(out.boundary_to_sites, out.sites.back().right, compact_index);
         add_boundary_site(out.boundary_to_sites, out.sites.back().left_rev, compact_index);
         add_boundary_site(out.boundary_to_sites, out.sites.back().right_rev, compact_index);
-
-        if (release_catalog_walks) {
-            const size_t allele_count = site.allele_walks.size();
-            std::vector<GraphWalk> released(allele_count);
-            site.allele_walks.swap(released);
-            std::vector<std::string>().swap(site.allele_traversals);
-        }
     }
     return !out.sites.empty();
 }
@@ -254,8 +254,8 @@ int match_compact_site_on_read(
                                                       site, false);
                 if (allele >= 0) { if (reverse_out) *reverse_out = false; return allele; }
                 if (allele == kGraphAlleleAmbiguous) return allele;
-                if (!site.allele_walks.empty() &&
-                    right_pos - left_pos + 1 > site.allele_walks[0].size()) {
+                if (site.max_walk_len > 0 &&
+                    right_pos - left_pos + 1 > site.max_walk_len) {
                     break;
                 }
             }
@@ -272,8 +272,8 @@ int match_compact_site_on_read(
                                                       site, true);
                 if (allele >= 0) { if (reverse_out) *reverse_out = true; return allele; }
                 if (allele == kGraphAlleleAmbiguous) return allele;
-                if (!site.allele_walks.empty() &&
-                    left_pos - right_pos + 1 > site.allele_walks[0].size()) {
+                if (site.max_walk_len > 0 &&
+                    left_pos - right_pos + 1 > site.max_walk_len) {
                     break;
                 }
             }
@@ -382,9 +382,8 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
     if (contig.empty() || end <= beg) return {};
     if (catalog.sites.empty()) return {};
 
-    GraphSiteCatalog& mutable_catalog = const_cast<GraphSiteCatalog&>(catalog);
     CompactGraphSiteIndex compact_index;
-    if (!build_compact_graph_site_index(mutable_catalog, compact_index, false)) {
+    if (!build_compact_graph_site_index(catalog, compact_index)) {
         throw std::runtime_error(
             "indexed GAF chunk scan requires queryable graph sites with numeric node IDs");
     }
@@ -472,10 +471,15 @@ extern "C" void structured_alignment_callback(
     const CompactGraphSiteIndex& index = *ctx->index;
 
     // Convert GBWT handles to CompactHandles (same encoding, just truncate).
+    // Skip the entire read if any node exceeds the CompactHandle range to
+    // avoid corrupting the walk (matches parse_gaf_path_compact behavior).
     ctx->read_walk.clear();
     ctx->read_walk.reserve(node_count);
     for (size_t i = 0; i < node_count; ++i) {
-        if (nodes[i] / 2 > kMaxCompactNodeId) continue;
+        if (nodes[i] / 2 > kMaxCompactNodeId) {
+            ctx->read_walk.clear();
+            return;
+        }
         ctx->read_walk.push_back(static_cast<CompactHandle>(nodes[i]));
     }
     if (ctx->read_walk.empty()) return;
@@ -543,14 +547,9 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
 
     // Build compact numeric site index from catalog walks.
     CompactGraphSiteIndex compact_index;
-    {
-        // build_compact_graph_site_index may release walk strings; we need a
-        // mutable reference but must not modify the caller's catalog.
-        GraphSiteCatalog& mutable_catalog = const_cast<GraphSiteCatalog&>(catalog);
-        if (!build_compact_graph_site_index(mutable_catalog, compact_index, false)) {
-            // Fallback: catalog has no compactable sites.
-            return {};
-        }
+    if (!build_compact_graph_site_index(catalog, compact_index)) {
+        // Fallback: catalog has no compactable sites.
+        return {};
     }
 
     std::vector<GraphReadAllele> results;
