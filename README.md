@@ -114,6 +114,7 @@ Collects and phases variants using a pangenome graph site catalog and GAF read a
 | `--gbz-db FILE` | GBZ graph database | — |
 | `--gaf-db FILE` | GAF-base read alignment database | — |
 | `--sample NAME` | Reference sample name for GBZ queries | auto-detected |
+| `--ont` | ONT read mode (enables strand-bias filter) | off |
 | `--phased-vcf-out FILE` | Phased VCF | — |
 | `--phased-bam-out FILE` | Unaligned BAM with HP/PS tags | — |
 | `-r STR` | Restrict to region (repeatable) | whole genome |
