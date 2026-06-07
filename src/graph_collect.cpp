@@ -826,7 +826,9 @@ static void print_graph_collect_help() {
         << "      --sample NAME             Reference sample name for GBZ interval queries\n"
         << "                                (auto-derived from FASTA if not provided)\n"
         << "      --gbz-query-bin FILE      Path to GBZ-base query binary [query]\n"
+        << "      --hifi                    HiFi read mode [default]\n"
         << "      --ont                     ONT read mode (enables strand-bias filter)\n"
+        << "      --strand-bias-pval FLOAT  Max p-value for ONT strand-bias filter [0.01]\n"
         << "\n"
         << "Pgbam stitching:\n"
         << "      --pgbam-file FILE         Optional .pgbam sidecar for fallback chunk stitching\n"
@@ -875,6 +877,8 @@ enum GraphCollectOption {
     kGcSample,
     kGcGbzQueryBin,
     kGcOnt,
+    kGcHifi,
+    kGcStrandBiasPval,
     kGcPhasedBam,
     kGcRef,
     kGcSites,
@@ -927,7 +931,9 @@ int collect_graph_variation(int argc, char* argv[]) {
         {"gaf-db",            required_argument, nullptr, kGcGafDb},
         {"sample",            required_argument, nullptr, kGcSample},
         {"gbz-query-bin",     required_argument, nullptr, kGcGbzQueryBin},
+        {"hifi",              no_argument,       nullptr, kGcHifi},
         {"ont",               no_argument,       nullptr, kGcOnt},
+        {"strand-bias-pval",  required_argument, nullptr, kGcStrandBiasPval},
         {"ref",               required_argument, nullptr, kGcRef},
         {"sites",             required_argument, nullptr, kGcSites},
         {"pgbam-file",                required_argument, nullptr, kGcPgbamFile},
@@ -968,7 +974,9 @@ int collect_graph_variation(int argc, char* argv[]) {
             case kGcGafDb:        opts.gaf_db = optarg; break;
             case kGcSample:       opts.graph_sample = optarg; break;
             case kGcGbzQueryBin:  opts.gbz_query_bin = optarg; break;
+            case kGcHifi:         opts.read_technology = ReadTechnology::Hifi; break;
             case kGcOnt:          opts.read_technology = ReadTechnology::Ont; break;
+            case kGcStrandBiasPval: opts.strand_bias_pval = std::stod(optarg); break;
             case kGcRef:          opts.ref_fasta = optarg; break;
             case kGcSites:        opts.graph_sites_vcf = optarg; break;
             case kGcPgbamFile:      opts.pgbam_file = optarg; break;
@@ -1002,7 +1010,8 @@ int collect_graph_variation(int argc, char* argv[]) {
 
     if (opts.threads < 1 || opts.min_mapq < 0 || opts.min_depth < 0 ||
         opts.min_alt_depth < 0 || opts.min_af < 0.0 || opts.max_af < opts.min_af ||
-        opts.min_sv_len < 0 || opts.chunk_size < 1 || opts.verbose < 0) {
+        opts.min_sv_len < 0 || opts.chunk_size < 1 || opts.verbose < 0 ||
+        opts.strand_bias_pval < 0.0 || opts.strand_bias_pval > 1.0) {
         std::cerr << "Error: invalid numeric threshold\n";
         return 1;
     }

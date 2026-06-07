@@ -114,7 +114,10 @@ Collects and phases variants using a pangenome graph site catalog and GAF read a
 | `--gbz-db FILE` | GBZ graph database | — |
 | `--gaf-db FILE` | GAF-base read alignment database | — |
 | `--sample NAME` | Reference sample name for GBZ queries | auto-detected |
+| `--hifi` | HiFi read mode | default |
 | `--ont` | ONT read mode (enables strand-bias filter) | off |
+| `--strand-bias-pval FLOAT` | Max p-value for ONT strand-bias filter | 0.01 |
+| `-q INT` | Minimum mapping quality | 30 |
 | `--phased-vcf-out FILE` | Phased VCF | — |
 | `--phased-bam-out FILE` | Unaligned BAM with HP/PS tags | — |
 | `-r STR` | Restrict to region (repeatable) | whole genome |
