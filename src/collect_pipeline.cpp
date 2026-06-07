@@ -343,17 +343,10 @@ std::vector<RegionChunk> load_region_chunks(const Options& opts) {
 // Pipeline
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * @brief Initializes longcallD-shaped per-read arrays after reads are loaded.
- *
- * Fills overlap read-id lists per input BAM (`up_ovlp_read_i`, `down_ovlp_read_i`) from
- * `read_overlaps_prev_region` / `read_overlaps_next_region`, skip-count placeholders, and
- * zeroed `haps` / `phase_sets` before `collect_var_main` repopulates them during k-means phasing.
- *
- * @param chunk Chunk whose `reads` and `region` are already valid.
- * @param n_bams Number of input BAM files in this worker.
- */
-static void initialize_longcalld_chunk_state(BamChunk& chunk, size_t n_bams) {
+// Initialize per-chunk bookkeeping after reads are loaded: identify which
+// reads overlap adjacent chunks (for stitching), and zero-fill hap/PS arrays
+// before k-means populates them.
+static void initialize_chunk_overlap_state(PhasingChunk& chunk, size_t n_bams) {
     chunk.up_ovlp_read_i.assign(n_bams, {});
     chunk.down_ovlp_read_i.assign(n_bams, {});
     chunk.n_up_ovlp_skip_reads.assign(n_bams, 0);
@@ -373,17 +366,10 @@ static void initialize_longcalld_chunk_state(BamChunk& chunk, size_t n_bams) {
     }
 }
 
-/**
- * @brief Loads all input BAMs for one region chunk and finishes digar/reference setup.
- *
- * Queries each BAM for overlapping reads, merges and sorts `chunk.reads`, initializes
- * per-read overlap indices and placeholder phasing fields, then calls `finalize_bam_chunk`.
- *
- * @param chunk Chunk state; `chunk.region` must already be set.
- * @param opts Read filters, reference path, and technology flags.
- * @param context Open BAM handles, indexes, headers, and shared reference cache.
- */
-static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerContext& context) {
+// Load reads from all input BAMs for one region chunk, identify overlap reads
+// for stitching, and finalize the chunk (populate reference slice, compute
+// quality stats, build digar-derived data structures).
+static void load_and_prepare_chunk(PhasingChunk& chunk, const Options& opts, WorkerContext& context) {
     chunk.reads.clear();
     std::vector<OverlapSkipCounts> overlap_skip_counts(context.bams.size());
     for (size_t input_i = 0; input_i < context.bams.size(); ++input_i) {
@@ -401,7 +387,7 @@ static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerC
                            std::make_move_iterator(reads.begin()),
                            std::make_move_iterator(reads.end()));
     }
-    initialize_longcalld_chunk_state(chunk, context.bams.size());
+    initialize_chunk_overlap_state(chunk, context.bams.size());
     for (size_t input_i = 0; input_i < overlap_skip_counts.size(); ++input_i) {
         chunk.n_up_ovlp_skip_reads[input_i] = overlap_skip_counts[input_i].upstream;
         chunk.n_down_ovlp_skip_reads[input_i] = overlap_skip_counts[input_i].downstream;
@@ -409,27 +395,13 @@ static void load_and_prepare_chunk(BamChunk& chunk, const Options& opts, WorkerC
     finalize_bam_chunk(chunk, context.ref, context.primary_header());
 }
 
-/**
- * @brief Releases bulky per-chunk intermediates after k-means phasing.
- *
- * Exact match to longcallD `bam_chunk_mid_free` (bam_utils.c). Frees:
- *   - per-read: digars, qual, noisy_regions  (= bam_chunk_free_digar)
- *   - chunk: low_complexity_regions           (= cr_destroy(low_comp_cr))
- *   - chunk: var_noisy_read_cov/err_cr, var_noisy_read_marks
- *                                             (= bam_chunk_clear_var_noisy_read_cache)
- *   - chunk: noisy_regions                   (= cr_destroy(chunk_noisy_regs) + noisy_reg_to_reads)
- *   - chunk: read_var_cr
- *
- * Intentionally NOT freed here (matching longcallD):
- *   - reads[].alignment  — kept for future phased-BAM output (= bam1_t** reads)
- *   - reads[].qual is freed above; alignment (bam1_t) is kept
- *   - ref_seq, ref_beg/end — freed in post_free; used by make_var_main equivalent
- *   - ordered_read_ids   — kept; longcallD stitching iterates through it
- *   - read_var_profile   — longcallD never frees it in mid or post_free
- *   - haps, phase_sets, up/down_ovlp_read_i, candidates — needed for stitching/output
- */
-static void mid_free_chunk(BamChunk& chunk, const Options& opts) {
-    // mirrors bam_chunk_free_digar: per-read digar ops, base quals, noisy sub-intervals
+// Release bulky per-chunk intermediates after variant calling + k-means
+// phasing but before stitching/output.  Frees digars, quality arrays,
+// noisy-region interval trees, and low-complexity regions.  Keeps reads
+// (for phased-BAM output), candidates, read profiles, haps/phase_sets,
+// and overlap indices (all needed by stitching and VCF emission).
+static void mid_free_chunk(PhasingChunk& chunk, const Options& opts) {
+    // Per-read digar ops, base quals, and noisy sub-intervals.
     const bool keep_digars_for_refine = !opts.output_aln.empty() && opts.refine_aln;
     if (!keep_digars_for_refine) {
         for (ReadRecord& r : chunk.reads) {
@@ -441,40 +413,30 @@ static void mid_free_chunk(BamChunk& chunk, const Options& opts) {
             r.noisy_regions.shrink_to_fit();
         }
     }
-    // mirrors cr_destroy(low_comp_cr)
+    // Low-complexity interval list (used only during classification).
     chunk.low_complexity_regions.clear();
     chunk.low_complexity_regions.shrink_to_fit();
-    // mirrors bam_chunk_clear_var_noisy_read_cache
+    // Noisy-read coverage/error interval trees and dedup marks.
     chunk.var_noisy_read_cov_cr.reset();
     chunk.var_noisy_read_err_cr.reset();
     chunk.var_noisy_read_marks.clear();
     chunk.var_noisy_read_marks.shrink_to_fit();
     chunk.var_noisy_read_mark_id = 0;
-    // mirrors cr_destroy(chunk_noisy_regs) + noisy_reg_to_reads/n_reads
+    // Chunk-level noisy region list.
     chunk.noisy_regions.clear();
     chunk.noisy_regions.shrink_to_fit();
-    // mirrors cr_destroy(read_var_cr)
+    // Read-variant overlap interval tree (rebuilt if needed later).
     chunk.read_var_cr.reset();
 }
 
-/**
- * @brief Sequentially collects variants from candidate regions.
- *
- * Loads one genomic slice from the BAM/FASTA layer, delegates the numbered
- * longcallD-shaped candidate workflow to `collect_var_main`, then calls
- * `mid_free_chunk` to release heavy intermediates (digars, interval trees,
- * noisy regions) — mirroring longcallD's `bam_chunk_mid_free` call in
- * `collect_bam_call_var_worker_for`.
- *
- * @param region Genomic slice to process.
- * @param opts Pipeline and quality options.
- * @param context Per-thread BAM/FAI context.
- * @return `BamChunk` with filled `candidates` and related fields; intermediates freed.
- */
-static BamChunk process_chunk(const RegionChunk& region,
+// Process one genomic region: load reads from BAM, run variant calling
+// (candidate collection, classification, k-means phasing), then free
+// heavy intermediates.  Returns a PhasingChunk with candidates, read
+// profiles, and hap assignments ready for stitching.
+static PhasingChunk process_chunk(const RegionChunk& region,
                               const Options& opts,
                               WorkerContext& context) {
-    BamChunk chunk;
+    PhasingChunk chunk;
     chunk.region = region;
     load_and_prepare_chunk(chunk, opts, context);
     collect_var_main(chunk, opts, context.primary_header());
@@ -482,24 +444,14 @@ static BamChunk process_chunk(const RegionChunk& region,
     return chunk;
 }
 
-/**
- * @brief Concatenate per-chunk candidate tables and drop exact duplicate keys only.
- *
- * Each worker already ran `collapse_fuzzy_large_insertions` inside `collect_candidate_sites_from_records`
- * (mirroring longcallD `collect_all_cand_var_sites` for digar-derived sites). longcallD does **not**
- * apply `exact_comp_var_site_ins` across parallel BAM chunks: `call_var_main.c` writes `write_var_to_vcf`
- * once per chunk after `make_var_main`. Concatenating pgphase chunk outputs must therefore dedupe with
- * `exact_comp_var_site` only, preserving distinct large insertions (e.g. noisy recall vs digar) that
- * fuzzy collapse would incorrectly merge.
- *
- * Duplicate keys (overlap tiling): longcallD emits variants only from a chunk's active make-variants
- * region. Prefer the duplicate that passes that active-region gate; if both rows have the same pass
- * state, keep stream order `(chunk_index ascending, index_in_chunk ascending)`.
- *
- * @param chunks Completed chunk outputs (tables moved out).
- * @return Unified candidate table for the batch (exact-key dedupe).
- */
-static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
+// Merge per-chunk candidate tables into a single sorted table, deduplicating
+// by exact variant key (tid, pos, type, ref_len, alt).  Only exact-key dedup
+// is applied here — fuzzy insertion collapse was already done within each
+// chunk during candidate collection.
+//
+// When tiling overlap produces duplicate keys, the copy whose position falls
+// inside its chunk's active region is preferred; ties keep stream order.
+static CandidateTable merge_chunk_candidates(std::vector<PhasingChunk>& chunks) {
     struct TaggedRow {
         CandidateVariant v;
         int chunk_i = 0;
@@ -507,7 +459,7 @@ static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
     };
     std::vector<TaggedRow> rows;
     size_t reserve_n = 0;
-    for (const BamChunk& chunk : chunks) reserve_n += chunk.candidates.size();
+    for (const PhasingChunk& chunk : chunks) reserve_n += chunk.candidates.size();
     rows.reserve(reserve_n);
 
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
@@ -544,25 +496,14 @@ static CandidateTable merge_chunk_candidates(std::vector<BamChunk>& chunks) {
     return merged;
 }
 
-/**
- * @brief Parallel batch result: one `BamChunk` per chunk offset.
- */
+// Parallel batch result: one PhasingChunk per chunk offset.
 struct ChunkBatchResult {
-    std::vector<BamChunk> chunks;
+    std::vector<PhasingChunk> chunks;
 };
 
-/**
- * @brief Runs `process_chunk` on a contiguous slice of region chunks with a thread pool.
- *
- * Each worker constructs its own `WorkerContext` (per-thread BAM + FAI handles). On failure,
- * the first exception is stored and rethrown after all workers join.
- *
- * @param opts Thread count and I/O options.
- * @param chunks Full chunk list; only indices `[batch_begin, batch_end)` are processed.
- * @param batch_begin First index in `chunks` (inclusive).
- * @param batch_end One past the last index (exclusive).
- * @return Per-chunk `BamChunk` results in offset order.
- */
+// Run process_chunk on chunks[batch_begin..batch_end) using a thread pool.
+// Each worker opens its own BAM/FAI handles.  First exception is rethrown
+// after all workers join.
 static ChunkBatchResult collect_chunk_batch_parallel(const Options& opts,
                                                      const std::vector<RegionChunk>& chunks,
                                                      size_t batch_begin,
@@ -604,32 +545,6 @@ static ChunkBatchResult collect_chunk_batch_parallel(const Options& opts,
     if (first_error) std::rethrow_exception(first_error);
 
     return result;
-}
-
-/**
- * @brief Dispatcher driving the threadpool executing BAM collection logic.
- *
- * Implements a modern C++ thread dispatch architecture managing identical loops
- * defined by `collect_ref_seq_bam_main()` nested looping over regions.
- *
- * Divides linearly scheduled `RegionChunk` boundaries across an active set of `std::thread`,
- * spawning atomic threads parsing discrete BAM boundaries with unique indices without locking.
- * Collects returned processed vectors of variants, reassembles them serially with
- * `merge_chunk_candidates()` (exact duplicate keys only; no cross-chunk fuzzy INS merge).
- *
- * Handles exception safety seamlessly, ensuring memory cleans up on thread death.
- *
- * @param opts Run flags config struct.
- * @param chunks A pre-split list of genomic ranges to distribute.
- */
-CandidateTable collect_chunks_parallel(
-    const Options& opts,
-    const std::vector<RegionChunk>& chunks) {
-    if (chunks.empty()) return CandidateTable{};
-    ChunkBatchResult result =
-        collect_chunk_batch_parallel(opts, chunks, 0, chunks.size());
-    stitch_chunk_haps(result.chunks, &opts, nullptr);
-    return merge_chunk_candidates(result.chunks);
 }
 
 /**
@@ -840,7 +755,7 @@ static void print_collect_help() {
         << "  -j, --max-var-ratio FLOAT     Skip reads above this variant/ref-span ratio [0.05]\n"
         << "      --max-noisy-frac FLOAT    Skip reads with > this fraction in noisy regions [0.5]\n"
         << "      --include-filtered        Include QC-fail and duplicate reads\n"
-        << "      --amb-base                Emit VCF rows with ambiguous REF/ALT (longcallD --amb-base)\n"
+        << "      --amb-base                Emit VCF rows with ambiguous (non-ACGT) REF/ALT bases\n"
         << "  -o, --output FILE             Output TSV file [output.tsv]\n"
         << "  -v, --vcf-output FILE         Optional VCF output for collected candidates\n"
         << "      --phased-vcf-out FILE      Optional phased VCF (GT:DP:AD:VAF:GQ:PS)\n"
@@ -870,7 +785,7 @@ static void print_collect_help() {
         << "      --short-reads             Short-read mode: 25 bp noisy window (no ONT Fisher strand test)\n"
         << "      --strand-bias-pval FLOAT  max p-value for ONT strand filter [0.01]\n"
         << "      --noisy-max-xgaps INT     max indel len (bp) for STR/homopolymer flags [5]\n"
-        << "  -V, --verbose INT            Verbosity level; 2 prints longcallD-style noisy-region logs [0]\n"
+        << "  -V, --verbose INT            Verbosity level; 2 prints noisy-region diagnostic logs [0]\n"
         << "\n"
         << "Examples:\n"
         << "  pgphase collect-bam-variation \\\n"

@@ -168,7 +168,7 @@ static void finalize_phase_block_thread_state(PhaseBlockThreadState& state, int 
     refresh_phase_block_polarized_threads(state, polarity_margin);
 }
 
-static void build_read_thread_cache(const BamChunk& chunk,
+static void build_read_thread_cache(const PhasingChunk& chunk,
                                     const PgbamSidecarData& sidecar,
                                     std::vector<std::vector<uint64_t>>& read_threads) {
     read_threads.clear();
@@ -182,7 +182,7 @@ static void build_read_thread_cache(const BamChunk& chunk,
 }
 
 static std::vector<PhaseBlockThreadState>
-build_phase_block_thread_states(const BamChunk& chunk,
+build_phase_block_thread_states(const PhasingChunk& chunk,
                                 const std::vector<hts_pos_t>& psets,
                                 const std::vector<std::vector<uint64_t>>& read_threads,
                                 int polarity_margin) {
@@ -211,7 +211,7 @@ build_phase_block_thread_states(const BamChunk& chunk,
     return states;
 }
 
-static PhaseBlockThreadState collect_phase_block_thread_state(const BamChunk& chunk,
+static PhaseBlockThreadState collect_phase_block_thread_state(const PhasingChunk& chunk,
                                                               hts_pos_t phase_set,
                                                               const PgbamSidecarData& sidecar,
                                                               int polarity_margin) {
@@ -283,7 +283,7 @@ static PhaseBlockThreadState merge_phase_block_thread_states(const PhaseBlockThr
     return merged;
 }
 
-static void apply_pgbam_phase_merge(BamChunk& cur,
+static void apply_pgbam_phase_merge(PhasingChunk& cur,
                                     bool do_flip,
                                     hts_pos_t target_ps,
                                     hts_pos_t merged_ps) {
@@ -307,19 +307,19 @@ static void apply_pgbam_phase_merge(BamChunk& cur,
     }
 }
 
-static void apply_pgbam_phase_merge(std::vector<BamChunk>& chunks,
+static void apply_pgbam_phase_merge(std::vector<PhasingChunk>& chunks,
                                     bool do_flip,
                                     hts_pos_t target_ps,
                                     hts_pos_t merged_ps) {
-    for (BamChunk& chunk : chunks) {
+    for (PhasingChunk& chunk : chunks) {
         apply_pgbam_phase_merge(chunk, do_flip, target_ps, merged_ps);
     }
 }
 
-static void collect_phase_sets_from_chunks(const std::vector<BamChunk>& chunks,
+static void collect_phase_sets_from_chunks(const std::vector<PhasingChunk>& chunks,
                                            std::vector<hts_pos_t>& psets) {
     psets.clear();
-    for (const BamChunk& chunk : chunks) {
+    for (const PhasingChunk& chunk : chunks) {
         for (size_t i = 0; i < chunk.reads.size(); ++i) {
             if (chunk.reads[i].is_skipped || chunk.haps[i] == 0 || chunk.phase_sets[i] < 0) continue;
             psets.push_back(chunk.phase_sets[i]);
@@ -330,7 +330,7 @@ static void collect_phase_sets_from_chunks(const std::vector<BamChunk>& chunks,
 }
 
 static std::vector<PhaseBlockThreadState>
-build_phase_block_thread_states(const std::vector<BamChunk>& chunks,
+build_phase_block_thread_states(const std::vector<PhasingChunk>& chunks,
                                 const std::vector<hts_pos_t>& psets,
                                 const PgbamSidecarData& sidecar,
                                 int polarity_margin) {
@@ -343,7 +343,7 @@ build_phase_block_thread_states(const std::vector<BamChunk>& chunks,
     }
 
     std::vector<uint64_t> threads;
-    for (const BamChunk& chunk : chunks) {
+    for (const PhasingChunk& chunk : chunks) {
         for (size_t read_i = 0; read_i < chunk.reads.size(); ++read_i) {
             if (chunk.reads[read_i].is_skipped) continue;
             const int hap = chunk.haps[read_i];
@@ -362,7 +362,7 @@ build_phase_block_thread_states(const std::vector<BamChunk>& chunks,
     return states;
 }
 
-static void stitch_phase_blocks_with_pgbam(std::vector<BamChunk>& chunks,
+static void stitch_phase_blocks_with_pgbam(std::vector<PhasingChunk>& chunks,
                                            const PgbamSidecarData& sidecar,
                                            int min_winning_threads,
                                            int polarity_margin,
@@ -382,11 +382,11 @@ static void stitch_phase_blocks_with_pgbam(std::vector<BamChunk>& chunks,
     }
 }
 
-void stitch_phase_blocks_with_pgbam(BamChunk& chunk, const PgbamSidecarData& sidecar) {
+void stitch_phase_blocks_with_pgbam(PhasingChunk& chunk, const PgbamSidecarData& sidecar) {
     stitch_phase_blocks_with_pgbam(chunk, sidecar, kPgbamMinWinningThreads, kPgbamThreadPolarityMargin);
 }
 
-void stitch_phase_blocks_with_pgbam(BamChunk& chunk,
+void stitch_phase_blocks_with_pgbam(PhasingChunk& chunk,
                                     const PgbamSidecarData& sidecar,
                                     int min_winning_threads,
                                     int polarity_margin) {
@@ -416,13 +416,13 @@ void stitch_phase_blocks_with_pgbam(BamChunk& chunk,
     }
 }
 
-void stitch_phase_blocks_with_pgbam(std::vector<BamChunk>& chunks,
+void stitch_phase_blocks_with_pgbam(std::vector<PhasingChunk>& chunks,
                                     const PgbamSidecarData& sidecar,
                                     int min_winning_threads) {
     stitch_phase_blocks_with_pgbam(chunks, sidecar, min_winning_threads, kPgbamThreadPolarityMargin);
 }
 
-void stitch_phase_blocks_with_pgbam(std::vector<BamChunk>& chunks,
+void stitch_phase_blocks_with_pgbam(std::vector<PhasingChunk>& chunks,
                                     const PgbamSidecarData& sidecar,
                                     int min_winning_threads,
                                     int polarity_margin) {
@@ -435,12 +435,12 @@ void stitch_phase_blocks_with_pgbam(std::vector<BamChunk>& chunks,
     stitch_phase_blocks_with_pgbam(chunks, sidecar, min_winning_threads, polarity_margin, psets, states);
 }
 
-bool stitch_adjacent_chunks_with_pgbam(BamChunk& pre, BamChunk& cur, const PgbamSidecarData& sidecar) {
+bool stitch_adjacent_chunks_with_pgbam(PhasingChunk& pre, PhasingChunk& cur, const PgbamSidecarData& sidecar) {
     return stitch_adjacent_chunks_with_pgbam(pre, cur, sidecar, kPgbamMinWinningThreads, kPgbamThreadPolarityMargin);
 }
 
-bool stitch_adjacent_chunks_with_pgbam(BamChunk& pre,
-                                       BamChunk& cur,
+bool stitch_adjacent_chunks_with_pgbam(PhasingChunk& pre,
+                                       PhasingChunk& cur,
                                        const PgbamSidecarData& sidecar,
                                        int min_winning_threads,
                                        int polarity_margin) {

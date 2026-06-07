@@ -2,7 +2,7 @@
  * @file collect_phase_noisy.cpp
  * @brief Step 4: iterative noisy-region MSA variant calling.
  *
- * Ports longcallD step 4 from `collect_var.c` / `align.c`:
+ * Step 4 implementation: noisy-region MSA variant recall.
  *   `sort_noisy_regs`, `collect_noisy_vars1`, and the outer while-loop in
  *   `collect_var_main` that gates k-means re-runs on `kCandGermlineVarCate`.
  *
@@ -103,7 +103,7 @@ void set_noisy_category(CandidateVariant& var, VariantCategory category) {
     var.lcd_var_i_to_cate = category_to_flag(category);
 }
 
-static void restore_stashed_initial_if_any(BamChunk& chunk, CandidateVariant& var) {
+static void restore_stashed_initial_if_any(PhasingChunk& chunk, CandidateVariant& var) {
     auto& stash = chunk.erased_clean_signal_initial;
     for (size_t i = 0; i < stash.size(); ++i) {
         if (exact_comp_var_site(&stash[i].first, &var.key) != 0) continue;
@@ -150,12 +150,12 @@ std::vector<ReadVariantProfile> init_read_profiles(size_t n_reads) {
     return profiles;
 }
 
-bool var_is_homopolymer_indel(const BamChunk& chunk,
+bool var_is_homopolymer_indel(const PhasingChunk& chunk,
                               hts_pos_t ref_pos,
                               VariantType type,
                               int ref_len,
                               const std::string& alt) {
-    // Literal port of longcallD collect_var.c:1720 `var_is_homopolymer_indel`.
+    // Check if an indel is in a homopolymer context.
     // INS: ref loop compares raw FASTA bytes to nt4 alt (same as LCD); DEL: raw bytes throughout.
     if (type == VariantType::Snp) return false;
     if (type == VariantType::Insertion) {
@@ -183,7 +183,7 @@ bool var_is_homopolymer_indel(const BamChunk& chunk,
     return true;
 }
 
-CandidateVariant make_noisy_candidate(const BamChunk& chunk,
+CandidateVariant make_noisy_candidate(const PhasingChunk& chunk,
                                       hts_pos_t ref_pos,
                                       VariantType type,
                                       int ref_len,
@@ -198,8 +198,8 @@ CandidateVariant make_noisy_candidate(const BamChunk& chunk,
     var.key.ref_len = ref_len;
     var.key.alt = std::move(alt);
     var.ref_base = type == VariantType::Snp && ref_base < 4 ? ref_base : 4;
-    // INS/DEL: keep consensus anchor encoding (e.g. abPOA gap == 5) for longcallD VCF parity;
-    // SNP path does not use alt_ref_base (longcallD fills separately).
+    // INS/DEL: keep consensus anchor encoding (e.g. abPOA gap == 5) for VCF output;
+    // SNP path does not use alt_ref_base (filled separately).
     var.alt_ref_base = type == VariantType::Snp ? static_cast<uint8_t>(4) : alt_ref_base;
     var.is_homopolymer_indel = is_homopolymer_indel;
     var.counts.n_uniq_alles = 2;
@@ -210,7 +210,7 @@ CandidateVariant make_noisy_candidate(const BamChunk& chunk,
 }
 
 std::vector<CandidateVariant> make_cand_vars_from_baln0(const Options& opts,
-                                                        const BamChunk& chunk,
+                                                        const PhasingChunk& chunk,
                                                         hts_pos_t noisy_reg_beg,
                                                         const std::vector<uint8_t>& ref_msa_seq,
                                                         const std::vector<uint8_t>& cons_msa_seq,
@@ -301,7 +301,7 @@ std::vector<CandidateVariant> make_cand_vars_from_baln0(const Options& opts,
 }
 
 std::vector<CandidateVariant> make_cand_vars_from_msa(const Options& opts,
-                                                      const BamChunk& chunk,
+                                                      const PhasingChunk& chunk,
                                                       hts_pos_t noisy_reg_beg,
                                                       const std::vector<uint8_t>& ref_msa_seq,
                                                       const std::vector<uint8_t>& cons_msa_seq,
@@ -552,7 +552,7 @@ void update_cand_var_profile_from_cons_aln_str21(int clu_idx,
 }
 
 int update_cand_var_profile_from_cons_aln_str2(const Options& opts,
-                                               const BamChunk& chunk,
+                                               const PhasingChunk& chunk,
                                                const std::array<int, 2>& clu_n_seqs,
                                                const std::array<std::vector<int>, 2>& clu_read_ids,
                                                const std::array<std::vector<AlnStr>, 2>& aln_strs,
@@ -731,12 +731,12 @@ void merge_read_var_profile_entries(const ReadVariantProfile* old_profile,
 // sort_noisy_regs
 // ════════════════════════════════════════════════════════════════════════════
 
-std::vector<int> sort_noisy_regs(const BamChunk& chunk) {
+std::vector<int> sort_noisy_regs(const PhasingChunk& chunk) {
     const int n = static_cast<int>(chunk.noisy_regions.size());
     std::vector<int> idx(static_cast<size_t>(n));
     std::iota(idx.begin(), idx.end(), 0);
 
-    // mirrors longcallD bubble sort: primary key = noisy_reg_var_sizes[i] (= cr_label = Interval::label)
+    // Bubble sort: primary key = Interval::label (variant count)
     // ascending; secondary key = noisy_reg_lens[i] (= cr_end - cr_start = end - beg) ascending.
     for (int i = 0; i < n; ++i) {
         for (int j = i + 1; j < n; ++j) {
@@ -758,14 +758,14 @@ std::vector<int> sort_noisy_regs(const BamChunk& chunk) {
 // collect_noisy_reg_reads
 // ════════════════════════════════════════════════════════════════════════════
 
-std::vector<int> collect_noisy_reg_reads(const BamChunk& chunk,
+std::vector<int> collect_noisy_reg_reads(const PhasingChunk& chunk,
                                          hts_pos_t beg, hts_pos_t end) {
     std::vector<int> result;
     result.reserve(chunk.reads.size());
 
-    // mirrors longcallD collect_noisy_reg_reads1: iterate ordered_read_ids, skip
+    // Iterate ordered_read_ids, skip
     // skipped reads and reads with no overlap (beg > end || end <= beg).
-    // ReadRecord::beg/end ↔ longcallD chunk->digars[read_i].beg/end.
+    // ReadRecord::beg/end = aligned region boundaries.
     const auto visit = [&](int ri) {
         if (ri < 0 || static_cast<size_t>(ri) >= chunk.reads.size()) return;
         const ReadRecord& r = chunk.reads[static_cast<size_t>(ri)];
@@ -786,7 +786,7 @@ std::vector<int> collect_noisy_reg_reads(const BamChunk& chunk,
 // collect_reg_ref_bseq
 // ════════════════════════════════════════════════════════════════════════════
 
-// 2-bit encoding matching longcallD nst_nt4_table (A=0, C=1, G=2, T/U=3, other=4).
+// nt4 encoding table (A=0, C=1, G=2, T/U=3, other=4).
 static const uint8_t kNstNt4Table[256] = {
     4,4,4,4, 4,4,4,4, 4,4,4,4, 4,4,4,4, // 0x00-0x0F
     4,4,4,4, 4,4,4,4, 4,4,4,4, 4,4,4,4, // 0x10-0x1F
@@ -806,9 +806,9 @@ static const uint8_t kNstNt4Table[256] = {
     4,4,4,4, 4,4,4,4, 4,4,4,4, 4,4,4,4, // 0xF0-0xFF
 };
 
-std::vector<uint8_t> collect_reg_ref_bseq(const BamChunk& chunk,
+std::vector<uint8_t> collect_reg_ref_bseq(const PhasingChunk& chunk,
                                            hts_pos_t& beg, hts_pos_t& end) {
-    // mirrors longcallD collect_reg_ref_bseq: clip beg/end to ref slice boundaries.
+    // Clip beg/end to ref slice boundaries.
     if (beg < chunk.ref_beg) beg = chunk.ref_beg;
     if (end > chunk.ref_end) end = chunk.ref_end;
 
@@ -829,7 +829,7 @@ std::vector<uint8_t> collect_reg_ref_bseq(const BamChunk& chunk,
 // ════════════════════════════════════════════════════════════════════════════
 
 int make_vars_from_msa_cons_aln(
-    const Options& opts, BamChunk& chunk,
+    const Options& opts, PhasingChunk& chunk,
     int /*n_noisy_reads*/, const std::vector<int>& /*read_ids*/,
     hts_pos_t noisy_reg_beg,
     int n_cons,
@@ -843,7 +843,7 @@ int make_vars_from_msa_cons_aln(
     noisy_var_cate.clear();
     noisy_rvp.clear();
 
-    // longcallD `make_vars_from_msa_cons_aln` (`collect_var.c`): branch on the `n_cons`
+    // Branch on the number of consensus sequences from MSA:
     // returned by `collect_noisy_reg_aln_strs`, not on whether auxiliary vectors are empty.
     if (n_cons == 0) return 0;
 
@@ -895,7 +895,7 @@ int make_vars_from_msa_cons_aln(
 // merge_var_profile
 // ════════════════════════════════════════════════════════════════════════════
 
-void merge_var_profile(BamChunk& chunk,
+void merge_var_profile(PhasingChunk& chunk,
                        const std::vector<CandidateVariant>& noisy_vars,
                        const std::vector<VariantCategory>& noisy_var_cate,
                        const std::vector<ReadVariantProfile>& noisy_rvp) {
@@ -948,7 +948,7 @@ void merge_var_profile(BamChunk& chunk,
             new_to_merged[new_i] = static_cast<int>(merged_vars.size());
             merged_vars.push_back(new_vars[new_i++]);
         } else {
-            // longcallD merge_var_profile: exact-key collision always keeps old variant.
+            // Exact-key collision: always keep the existing variant.
             old_to_merged[old_i] = static_cast<int>(merged_vars.size());
             merged_vars.push_back(old_vars[old_i++]);
             ++new_i;
@@ -1012,17 +1012,17 @@ void merge_var_profile(BamChunk& chunk,
 // collect_noisy_vars1
 // ════════════════════════════════════════════════════════════════════════════
 
-int collect_noisy_vars1(BamChunk& chunk, const Options& opts, int noisy_reg_i) {
+int collect_noisy_vars1(PhasingChunk& chunk, const Options& opts, int noisy_reg_i) {
     const Interval& reg = chunk.noisy_regions[static_cast<size_t>(noisy_reg_i)];
-    // longcallD `collect_noisy_vars1` enters with `noisy_reg_beg = cr_start(chunk_noisy_regs, i)`.
+    // Enter with noisy_reg_beg/end from the interval tree.
     hts_pos_t noisy_reg_beg = reg.beg;
     hts_pos_t noisy_reg_end = reg.end;
 
-    // mirrors longcallD: skip regions longer than max_noisy_reg_len (return 0 = done, no vars).
+    // Skip regions longer than max_noisy_reg_len (return 0 = done, no vars).
     if (noisy_reg_end - noisy_reg_beg + 1 > static_cast<hts_pos_t>(opts.max_noisy_reg_len))
         return 0;
 
-    // longcallD first clips beg/end via collect_reg_ref_bseq, then collects reads on the
+    // First clip beg/end via collect_reg_ref_bseq, then collect reads on the
     // finalized region bounds.
     std::vector<uint8_t> ref_seq =
         collect_reg_ref_bseq(chunk, noisy_reg_beg, noisy_reg_end);
@@ -1033,7 +1033,7 @@ int collect_noisy_vars1(BamChunk& chunk, const Options& opts, int noisy_reg_i) {
         collect_noisy_reg_reads(chunk, noisy_reg_beg, noisy_reg_end);
     const int n_noisy_reads = static_cast<int>(read_ids.size());
 
-    // mirrors longcallD: skip regions with more than max_noisy_reg_cov reads.
+    // Skip regions with more than max_noisy_reg_cov reads.
     if (n_noisy_reads > opts.max_noisy_reg_cov)
         return 0;
 
@@ -1046,7 +1046,7 @@ int collect_noisy_vars1(BamChunk& chunk, const Options& opts, int noisy_reg_i) {
         read_ids, ref_seq,
         clu_n_seqs, clu_read_ids, aln_strs);
 
-    // mirrors longcallD: n_cons == 0 → MSA could not resolve; return -1 so the
+    // n_cons == 0 → MSA could not resolve; return -1 so the
     // outer loop leaves this region undone and may retry if another region makes progress.
     if (n_cons == 0)
         return -1;
@@ -1070,10 +1070,10 @@ int collect_noisy_vars1(BamChunk& chunk, const Options& opts, int noisy_reg_i) {
 // collect_noisy_vars_step4
 // ════════════════════════════════════════════════════════════════════════════
 
-void collect_noisy_vars_step4(BamChunk& chunk, const Options& opts) {
+void collect_noisy_vars_step4(PhasingChunk& chunk, const Options& opts) {
     if (chunk.noisy_regions.empty()) return;
 
-    // mirrors longcallD step 4 in collect_var_main.
+    // Step 4: iterate noisy regions, recall variants via MSA, re-phase.
     const std::vector<int> sorted = sort_noisy_regs(chunk);
     const int n_regs = static_cast<int>(chunk.noisy_regions.size());
     std::vector<bool> done(static_cast<size_t>(n_regs), false);
@@ -1092,7 +1092,7 @@ void collect_noisy_vars_step4(BamChunk& chunk, const Options& opts) {
                 if (ret > 0) any_new_var = true;
             }
         }
-        // mirrors longcallD: re-run k-means with kCandGermlineVarCate whenever new
+        // Re-run k-means with kCandGermlineVarCate whenever new
         // noisy variants were merged, incorporating NOISY_CAND_HET / NOISY_CAND_HOM.
         if (any_new_var)
             assign_hap_based_on_germline_het_vars_kmeans(chunk, opts, kCandGermlineVarCate);

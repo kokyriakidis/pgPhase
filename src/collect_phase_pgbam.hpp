@@ -10,12 +10,12 @@ namespace pgphase_collect {
 /**
  * @brief Merge phase blocks within one chunk using annotated-BAM `hs` tags and `.pgbam` threads.
  */
-void stitch_phase_blocks_with_pgbam(BamChunk& chunk, const PgbamSidecarData& sidecar);
+void stitch_phase_blocks_with_pgbam(PhasingChunk& chunk, const PgbamSidecarData& sidecar);
 
 /**
  * @brief Merge phase blocks within one chunk with explicit `.pgbam` evidence thresholds.
  */
-void stitch_phase_blocks_with_pgbam(BamChunk& chunk,
+void stitch_phase_blocks_with_pgbam(PhasingChunk& chunk,
                                     const PgbamSidecarData& sidecar,
                                     int min_winning_threads,
                                     int polarity_margin);
@@ -23,14 +23,14 @@ void stitch_phase_blocks_with_pgbam(BamChunk& chunk,
 /**
  * @brief Cleanup pass over final contig phase blocks using annotated-BAM `hs` tags and `.pgbam` threads.
  */
-void stitch_phase_blocks_with_pgbam(std::vector<BamChunk>& chunks,
+void stitch_phase_blocks_with_pgbam(std::vector<PhasingChunk>& chunks,
                                     const PgbamSidecarData& sidecar,
                                     int min_winning_threads);
 
 /**
  * @brief Cleanup pass over final contig phase blocks with an explicit thread-polarity margin.
  */
-void stitch_phase_blocks_with_pgbam(std::vector<BamChunk>& chunks,
+void stitch_phase_blocks_with_pgbam(std::vector<PhasingChunk>& chunks,
                                     const PgbamSidecarData& sidecar,
                                     int min_winning_threads,
                                     int polarity_margin);
@@ -38,13 +38,13 @@ void stitch_phase_blocks_with_pgbam(std::vector<BamChunk>& chunks,
 /**
  * @brief Fallback stitch for adjacent chunks when common-read overlap has no decisive signal.
  */
-bool stitch_adjacent_chunks_with_pgbam(BamChunk& pre, BamChunk& cur, const PgbamSidecarData& sidecar);
+bool stitch_adjacent_chunks_with_pgbam(PhasingChunk& pre, PhasingChunk& cur, const PgbamSidecarData& sidecar);
 
 /**
  * @brief Fallback stitch for adjacent chunks with explicit `.pgbam` evidence thresholds.
  */
-bool stitch_adjacent_chunks_with_pgbam(BamChunk& pre,
-                                       BamChunk& cur,
+bool stitch_adjacent_chunks_with_pgbam(PhasingChunk& pre,
+                                       PhasingChunk& cur,
                                        const PgbamSidecarData& sidecar,
                                        int min_winning_threads,
                                        int polarity_margin);

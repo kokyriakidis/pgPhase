@@ -5,7 +5,7 @@
  * @file align.hpp
  * @brief WFA2-lib / abPOA alignment wrappers and noisy-region read-info helpers.
  *
- * Mirrors longcallD align.h / align.c.  All functions that directly call WFA2-lib
+ * Alignment utilities: WFA2-lib and abPOA wrappers, noisy-region read
  * or abPOA live here; collect_phase_noisy.cpp calls into this file.
  */
 
@@ -18,7 +18,7 @@
 namespace pgphase_collect {
 
 // ════════════════════════════════════════════════════════════════════════════
-// Cover-flag constants  (mirrors longcallD align.h LONGCALLD_NOISY_* macros)
+// Cover-flag constants for noisy-region read classification.
 // ════════════════════════════════════════════════════════════════════════════
 
 constexpr int kNoisyNoCover    = 0x0000;
@@ -36,7 +36,7 @@ inline bool noisyIsRightGap(int c)   { return (c & kNoisyRightGap) != 0; }
 inline bool noisyIsNotCover(int c)   { return !(c & kNoisyLeftCover) && !(c & kNoisyRightCover); }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Alignment scoring  (mirrors longcallD align.h / call_var_main.h constants)
+// Alignment scoring constants for WFA2 and abPOA.
 // ════════════════════════════════════════════════════════════════════════════
 
 constexpr int kMatchScore     = 2;
@@ -62,14 +62,14 @@ constexpr int kWfaAffine2p = 1;
 constexpr double kPartialAlnRatio = 1.1; // max longer/shorter ratio for partial alignment
 
 // ════════════════════════════════════════════════════════════════════════════
-// AlnStr  (mirrors longcallD aln_str_t in collect_var.h)
+// AlnStr: alignment string representation for MSA consensus.
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
  * @brief Pairwise alignment string for one (target, query) pair from the MSA.
  *
  * target_aln / query_aln are parallel byte arrays; each byte is a 2-bit base
- * (0–3 = ACGT) or 5 for a gap character, matching longcallD's convention.
+ * (0–3 = ACGT) or 5 for a gap character.
  */
 struct AlnStr {
     std::vector<uint8_t> target_aln; ///< reference / consensus bases (5 = gap)
@@ -86,7 +86,7 @@ struct AlnStr {
 /**
  * @brief Per-read data extracted from a noisy region for MSA input.
  *
- * Mirrors what longcallD collect_noisy_read_info allocates and fills.
+ * Per-read alignment info for noisy-region MSA.
  * All arrays are parallel and indexed [0, n_reads).
  */
 struct NoisyReadInfo {
@@ -111,30 +111,30 @@ struct NoisyReadInfo {
 
 /**
  * @brief Compute per-base expected error rate from Phred quality bytes.
- * Mirrors longcallD calc_read_error_rate (seq.c).
+ * Calculate per-read error rate from NM tag and aligned length.
  */
 double calc_read_error_rate(int len, const uint8_t* qual);
 
 /**
  * @brief Compare two cover flags: BOTH_COVER > LEFT/RIGHT_COVER > NO_COVER.
- * Mirrors longcallD full_cover_cmp (align.c).
+ * Compare two reads by full-cover flag, then by error rate (ascending).
  */
 int full_cover_cmp(int cover1, int cover2);
 
 /**
  * @brief Extract per-read sequences and cover metadata for a noisy region.
  *
- * Mirrors longcallD collect_noisy_read_info (align.c lines 1377–1461).
+ * Collect per-read alignment info for reads overlapping a noisy region.
  * Walks digars to locate query positions spanning [reg_beg, reg_end], extracts
  * bases via bam_get_seq, computes the fully_covers bitmask, and records haps/phase_sets.
  */
-NoisyReadInfo collect_noisy_read_info(const Options& opts, const BamChunk& chunk,
+NoisyReadInfo collect_noisy_read_info(const Options& opts, const PhasingChunk& chunk,
                                       hts_pos_t reg_beg, hts_pos_t reg_end,
                                       const std::vector<int>& noisy_read_ids);
 
 /**
  * @brief Sort reads in a noisy region: BOTH_COVER first, then by error rate (opt.), then by length desc.
- * Mirrors longcallD sort_noisy_region_reads (align.c).
+ * Sort noisy-region reads: full-cover first, then by error rate.
  * Mutates info in place (parallel arrays).
  */
 void sort_noisy_region_reads(NoisyReadInfo& info, bool use_error_rate);
@@ -142,7 +142,7 @@ void sort_noisy_region_reads(NoisyReadInfo& info, bool use_error_rate);
 /**
  * @brief Find the best phase set with >= min_hap_full_reads per haplotype.
  *
- * Mirrors longcallD collect_phase_set_with_both_haps (align.c).
+ * Find phase sets that have reads on both haplotypes in the noisy region.
  * Returns -1 when no valid phase set exists.
  */
 hts_pos_t collect_phase_set_with_both_haps(const NoisyReadInfo& info,
@@ -151,14 +151,14 @@ hts_pos_t collect_phase_set_with_both_haps(const NoisyReadInfo& info,
 
 /**
  * @brief Trim AlnStr for partially covering reads (left- or right-cover only).
- * Mirrors longcallD wfa_trim_aln_str (align.c).
+ * Trim leading/trailing gaps from an alignment string.
  */
 void wfa_trim_aln_str(int full_cover, AlnStr& aln_str);
 
 /**
  * @brief WFA end-to-end alignment of pattern vs text, returns alignment strings.
  *
- * Mirrors longcallD wfa_end2end_aln (align.c).
+ * End-to-end WFA2 alignment of query against target.
  * pattern_alg / text_alg are filled with 2-bit bases (5=gap); caller owns memory.
  */
 int wfa_end2end_aln(const uint8_t* pattern, int plen, const uint8_t* text, int tlen,
@@ -168,7 +168,7 @@ int wfa_end2end_aln(const uint8_t* pattern, int plen, const uint8_t* text, int t
 
 /**
  * @brief Align target vs query into an AlnStr, handling both full- and partial-cover reads.
- * Mirrors longcallD wfa_collect_aln_str (align.c).
+ * Extract an AlnStr from a WFA2 alignment result.
  */
 int wfa_collect_aln_str(const Options& opts, const uint8_t* target, int tlen,
                         const uint8_t* query, int qlen, int full_cover,
@@ -176,14 +176,14 @@ int wfa_collect_aln_str(const Options& opts, const uint8_t* target, int tlen,
 
 /**
  * @brief Build cons-vs-read AlnStr from abPOA MSA result rows.
- * Mirrors longcallD make_cons_read_aln_str (align.c).
+ * Build consensus-vs-read alignment string from WFA2 output.
  */
 int make_cons_read_aln_str(const uint8_t* cons_msa_row, const uint8_t* read_msa_row,
                            int msa_len, int full_cover, AlnStr& out);
 
 /**
  * @brief Build ref-vs-read AlnStr by merging ref-cons and cons-read AlnStrs.
- * Mirrors longcallD make_ref_read_aln_str (align.c).
+ * Build reference-vs-read alignment string from WFA2 output.
  */
 int make_ref_read_aln_str(const Options& opts, const AlnStr& ref_cons,
                           const AlnStr& cons_read, AlnStr& ref_read);
@@ -191,7 +191,7 @@ int make_ref_read_aln_str(const Options& opts, const AlnStr& ref_cons,
 /**
  * @brief Run abPOA de-novo MSA and produce ≤2 consensus sequences (haplotype-unaware path).
  *
- * Mirrors longcallD abpoa_aln_msa_cons (align.c).
+ * Full-length abPOA MSA consensus from a set of reads.
  * Returns number of consensus sequences (0, 1, or 2).
  * clu_n_seqs[i] = # reads assigned to cluster i; clu_read_ids[i] = their original read indices.
  * msa_seqs[i][j] = MSA row (length msa_len[i]) for read j within cluster i (j == clu_n_seqs[i] → consensus row).
@@ -211,7 +211,7 @@ int abpoa_aln_msa_cons(const Options& opts, int n_reads,
 /**
  * @brief Run abPOA partial MSA for a single haplotype and produce one consensus.
  *
- * Mirrors longcallD abpoa_partial_aln_msa_cons (align.c).
+ * Partial-overlap abPOA MSA consensus (reads may not span full region).
  * Returns 1 on success, 0 if no consensus was produced.
  */
 int abpoa_partial_aln_msa_cons(const Options& opts, int sampling_reads,
@@ -232,7 +232,7 @@ int abpoa_partial_aln_msa_cons(const Options& opts, int sampling_reads,
 /**
  * @brief Build MSA alignment strings for a noisy region (haplotype-unaware path).
  *
- * Mirrors longcallD wfa_collect_noisy_aln_str_no_ps_hap (align.c).
+ * WFA2 alignment of noisy-region reads without haplotype separation.
  * Returns number of consensus sequences (0, 1, or 2).
  */
 int wfa_collect_noisy_aln_str_no_ps_hap(const Options& opts, NoisyReadInfo& info,
@@ -245,7 +245,7 @@ int wfa_collect_noisy_aln_str_no_ps_hap(const Options& opts, NoisyReadInfo& info
 /**
  * @brief Build MSA alignment strings for a noisy region (haplotype-aware path).
  *
- * Mirrors longcallD wfa_collect_noisy_aln_str_with_ps_hap (align.c).
+ * WFA2 alignment of noisy-region reads with per-haplotype separation.
  * Returns 2 on success (one consensus per haplotype), 0 otherwise.
  */
 int wfa_collect_noisy_aln_str_with_ps_hap(const Options& opts, bool sampling_reads,
@@ -261,10 +261,10 @@ int wfa_collect_noisy_aln_str_with_ps_hap(const Options& opts, bool sampling_rea
 /**
  * @brief Top-level entry: collect reads → sort → find phase set → MSA → fill aln_strs.
  *
- * Mirrors longcallD collect_noisy_reg_aln_strs (align.c / align.h).
+ * Top-level noisy-region alignment: collect reads, align, build consensus.
  * Returns number of consensus sequences produced (0, 1, or 2).
  */
-int collect_noisy_reg_aln_strs(const Options& opts, BamChunk& chunk,
+int collect_noisy_reg_aln_strs(const Options& opts, PhasingChunk& chunk,
                                 hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                                 const std::vector<int>& noisy_read_ids,
                                 const std::vector<uint8_t>& ref_seq,

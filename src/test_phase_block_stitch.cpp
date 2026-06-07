@@ -1,8 +1,8 @@
 /**
  * @file test_phase_block_stitch.cpp
- * @brief Unit tests for longcallD-equivalent chunk stitching (`stitch_chunk_haps` / `flip_variant_hap`).
+ * Unit tests for chunk stitching (stitch_chunk_haps / flip logic).
  *
- * Only boundary overlap read pairing is exercised — matching longcallD `stitch_var_main`, which does
+ * Only boundary overlap read pairing is exercised — stitch_chunk_haps does
  * not run pangenome-graph or within-chunk merges.
  *
  * Build (from repo root):
@@ -43,10 +43,10 @@ static CandidateVariant dummy_cand(hts_pos_t ps) {
 // Two chunks, one overlapping pair: pre down index 0, cur up index 0.
 static bool test_cross_chunk_flip_when_haps_disagree() {
     std::printf("--- test_cross_chunk_flip_when_haps_disagree ---\n");
-    std::vector<BamChunk> chunks;
+    std::vector<PhasingChunk> chunks;
     chunks.resize(2);
-    BamChunk& pre = chunks[0];
-    BamChunk& cur = chunks[1];
+    PhasingChunk& pre = chunks[0];
+    PhasingChunk& cur = chunks[1];
     pre.region.tid = 0;
     cur.region.tid = 0;
 
@@ -78,7 +78,7 @@ static bool test_cross_chunk_flip_when_haps_disagree() {
 // Equal votes: one agree (−1) and one disagree (+1) ⇒ flip_hap_score == 0 ⇒ no updates.
 static bool test_flip_score_zero_no_merge() {
     std::printf("--- test_flip_score_zero_no_merge ---\n");
-    BamChunk pre, cur;
+    PhasingChunk pre, cur;
     pre.region.tid = cur.region.tid = 0;
 
     for (int i = 0; i < 2; ++i) {
@@ -99,7 +99,7 @@ static bool test_flip_score_zero_no_merge() {
     cur.candidates.push_back(dummy_cand(200));
     cur.up_ovlp_read_i = {{0, 1}};
 
-    std::vector<BamChunk> chunks;
+    std::vector<PhasingChunk> chunks;
     chunks.push_back(std::move(pre));
     chunks.push_back(std::move(cur));
 
@@ -117,7 +117,7 @@ static bool test_flip_score_zero_no_merge() {
 
 static bool test_skipped_overlap_read_ignored() {
     std::printf("--- test_skipped_overlap_read_ignored ---\n");
-    BamChunk pre, cur;
+    PhasingChunk pre, cur;
     pre.region.tid = cur.region.tid = 0;
 
     ReadRecord rskip = min_read();
@@ -134,7 +134,7 @@ static bool test_skipped_overlap_read_ignored() {
     cur.candidates.push_back(dummy_cand(20));
     cur.up_ovlp_read_i = {{0}};
 
-    std::vector<BamChunk> chunks;
+    std::vector<PhasingChunk> chunks;
     chunks.push_back(std::move(pre));
     chunks.push_back(std::move(cur));
 

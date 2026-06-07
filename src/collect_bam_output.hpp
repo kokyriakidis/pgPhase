@@ -18,7 +18,7 @@ public:
     PhasedAlignmentWriter(const PhasedAlignmentWriter&) = delete;
     PhasedAlignmentWriter& operator=(const PhasedAlignmentWriter&) = delete;
 
-    int write_chunks(const std::vector<BamChunk>& chunks);
+    int write_chunks(const std::vector<PhasingChunk>& chunks);
 
 private:
     Options opts_;

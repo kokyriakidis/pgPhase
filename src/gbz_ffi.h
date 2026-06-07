@@ -134,8 +134,32 @@ int pgphase_gbz_query_interval_structured(
     char** err_out
 );
 
-/** Free a buffer returned by the FFI. */
-void pgphase_gbz_free_buffer(unsigned char* buf, size_t len);
+/* ── Path range query ──────────────────────────────────────────────────── */
+
+/**
+ * Query the genome-coordinate range covered by a reference path.
+ *
+ * For subgraphed GBZ files the path may start at a non-zero genome offset
+ * (the "fragment" field).  This function returns that offset as *out_start
+ * and a conservative end coordinate as *out_end (based on the last indexed
+ * position; the true path may extend up to ~1000 bp beyond *out_end).
+ *
+ * @param gbz_handle  Handle from pgphase_gbz_open().
+ * @param sample      Reference sample name (e.g. "CHM13"), or NULL.
+ * @param contig      Contig name (e.g. "chr6").
+ * @param out_start   Receives the genome-coordinate start of the path.
+ * @param out_end     Receives a conservative genome-coordinate end.
+ * @param err_out     On error, receives a malloc'd error string.
+ * @return 0 on success, -1 on error (path not found / not indexed).
+ */
+int pgphase_gbz_path_range(
+    void* gbz_handle,
+    const char* sample,
+    const char* contig,
+    uint64_t* out_start,
+    uint64_t* out_end,
+    char** err_out
+);
 
 #ifdef __cplusplus
 }

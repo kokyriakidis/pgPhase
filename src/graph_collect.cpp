@@ -36,12 +36,6 @@ namespace pgphase_collect {
 
 namespace {
 
-// Mirrors graph_bam_adapter.cpp site_key (static there; duplicated here to avoid coupling).
-static std::string graph_site_key_str(const GraphSite& site, size_t /*index*/) {
-    if (!site.id.empty() && site.id != ".") return site.id;
-    return site.chrom + ":" + std::to_string(site.pos) + ":" + site.ref;
-}
-
 // Pre-filter catalog to a single contig, returning indices into the original.
 // Called once per batch (all chunks in a batch share the same contig).
 static std::vector<size_t> filter_catalog_indices_for_contig(
@@ -94,15 +88,15 @@ static bam_hdr_t* build_synthetic_header(faidx_t* fai) {
 // Converts phased multi-allelic graph candidates to biallelic CandidateVariants compatible
 // with the existing TSV/VCF writers. One output row per passing alt allele per site.
 static CandidateTable graph_chunks_to_candidate_table(
-    const std::vector<GraphBamChunkBuildResult>& graph_chunks,
+    const std::vector<GraphChunkBuildResult>& graph_chunks,
     const std::unordered_map<std::string, const GraphSite*>& site_id_to_site,
     const std::unordered_map<std::string, int>& contig_to_tid,
     const Options& opts)
 {
     CandidateTable result;
 
-    for (const GraphBamChunkBuildResult& graph_chunk : graph_chunks) {
-        const BamChunk& chunk = graph_chunk.chunk;
+    for (const GraphChunkBuildResult& graph_chunk : graph_chunks) {
+        const PhasingChunk& chunk = graph_chunk.chunk;
         for (size_t ci = 0; ci < chunk.candidates.size(); ++ci) {
             const CandidateVariant& mcand = chunk.candidates[ci];
 
@@ -258,10 +252,10 @@ static CandidateTable graph_chunks_to_candidate_table(
 // Processes one batch of graph chunks in parallel (one thread pool per reg_chunk_i batch,
 // mirroring collect_chunk_batch_parallel in collect_pipeline.cpp).
 // Each worker queries overlapping reads via the gbz-base FFI (one SQLite connection
-// per thread), then build_graph_bam_chunk + assign_hap k-means.
+// per thread), then build_graph_chunk + assign_hap k-means.
 // Peak memory = threads × reads_per_chunk (like BAM).
 // After all workers join: populate_graph_chunk_overlaps + stitch_chunk_haps.
-static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
+static std::vector<GraphChunkBuildResult> process_graph_chunk_batch(
     const GraphSiteCatalog& catalog,
     const std::vector<RegionChunk>& chunks,
     size_t batch_begin,
@@ -274,7 +268,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
     const PgbamSidecarData* pgbam_sidecar)
 {
     const size_t batch_size = batch_end - batch_begin;
-    std::vector<GraphBamChunkBuildResult> graph_chunks(batch_size);
+    std::vector<GraphChunkBuildResult> graph_chunks(batch_size);
 
     // All chunks in a batch share the same contig (reg_chunk_i). Pre-filter
     // the catalog to that contig once to avoid scanning the full catalog per chunk.
@@ -287,6 +281,24 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
         auto it = fai_full_to_suffix.find(batch_contig);
         return (it != fai_full_to_suffix.end()) ? it->second : batch_contig;
     }();
+
+    // Query the genome-coordinate range of the reference path so we can
+    // skip or clamp chunks that fall outside the GBZ subgraph.  This is
+    // done once on the main thread before spawning workers.
+    PathRange path_range;
+    {
+        char* err = nullptr;
+        void* gbz_tmp = pgphase_gbz_open(qconfig.gbz_db.c_str(), &err);
+        if (gbz_tmp) {
+            path_range = query_gbz_path_range(gbz_tmp, ref_sample, batch_query_contig);
+            pgphase_gbz_close(gbz_tmp);
+            if (opts.verbose >= 2 && path_range.valid)
+                std::cerr << "GBZ path range for " << ref_sample << "#" << batch_query_contig
+                          << ": [" << path_range.start << ", " << path_range.end << ")\n";
+        } else {
+            if (err) pgphase_gbz_free_string(err);
+        }
+    }
 
     const size_t worker_count = std::min<size_t>(static_cast<size_t>(opts.threads), batch_size);
     std::atomic<size_t> next_offset{0};
@@ -354,13 +366,23 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
 
                     std::vector<GraphReadAllele> chunk_rows;
                     if (!chunk_catalog.sites.empty()) {
-                        chunk_rows = query_gbz_interval_gaf_ffi(
-                            gbz_h, gaf_h, ref_sample, batch_query_contig,
-                            region.beg - 1, region.end,
-                            chunk_catalog, qconfig.min_mapq);
+                        // Clamp the query interval to the GBZ path range.
+                        // Chunks entirely outside the path are skipped.
+                        hts_pos_t q_beg = region.beg - 1;
+                        hts_pos_t q_end = region.end;
+                        if (path_range.valid) {
+                            q_beg = std::max(q_beg, path_range.start);
+                            q_end = std::min(q_end, path_range.end);
+                        }
+                        if (q_beg < q_end) {
+                            chunk_rows = query_gbz_interval_gaf_ffi(
+                                gbz_h, gaf_h, ref_sample, batch_query_contig,
+                                q_beg, q_end,
+                                chunk_catalog, qconfig.min_mapq);
+                        }
                     }
 
-                    graph_chunks[offset] = build_graph_bam_chunk(
+                    graph_chunks[offset] = build_graph_chunk(
                         chunk_catalog,
                         chunk_rows,
                         batch_contig,
@@ -385,14 +407,14 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
     // setting down_ovlp_read_i / up_ovlp_read_i for stitch_chunk_haps.
     populate_graph_chunk_overlaps(graph_chunks);
 
-    // stitch_chunk_haps needs a flat BamChunk vector (mirrors phase_graph_bam_chunks).
-    std::vector<BamChunk> bam_chunks;
-    bam_chunks.reserve(batch_size);
-    for (GraphBamChunkBuildResult& gc : graph_chunks)
-        bam_chunks.push_back(std::move(gc.chunk));
-    stitch_chunk_haps(bam_chunks, &opts, pgbam_sidecar);
+    // stitch_chunk_haps needs a flat PhasingChunk vector (mirrors phase_graph_chunks).
+    std::vector<PhasingChunk> phasing_chunks;
+    phasing_chunks.reserve(batch_size);
+    for (GraphChunkBuildResult& gc : graph_chunks)
+        phasing_chunks.push_back(std::move(gc.chunk));
+    stitch_chunk_haps(phasing_chunks, &opts, pgbam_sidecar);
     for (size_t i = 0; i < batch_size; ++i)
-        graph_chunks[i].chunk = std::move(bam_chunks[i]);
+        graph_chunks[i].chunk = std::move(phasing_chunks[i]);
 
     return graph_chunks;
 }
@@ -400,7 +422,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
 // Per-chunk tabix queries on an indexed GAF file.  Each worker seeks directly
 // to the overlapping region — only the relevant reads are decompressed and
 // parsed, making this efficient even for very large (100+ GB) GAF files.
-static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_gaf(
+static std::vector<GraphChunkBuildResult> process_graph_chunk_batch_indexed_gaf(
     const GraphSiteCatalog& catalog,
     const std::vector<RegionChunk>& chunks,
     size_t batch_begin,
@@ -413,7 +435,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
     const PgbamSidecarData* pgbam_sidecar)
 {
     const size_t batch_size = batch_end - batch_begin;
-    std::vector<GraphBamChunkBuildResult> graph_chunks(batch_size);
+    std::vector<GraphChunkBuildResult> graph_chunks(batch_size);
 
     // Pre-filter catalog to the batch contig once (same optimization as FFI path).
     const std::string batch_contig_gaf = header->target_name[chunks[batch_begin].tid];
@@ -451,7 +473,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
                             chunk_catalog, min_mapq);
                     }
 
-                    graph_chunks[offset] = build_graph_bam_chunk(
+                    graph_chunks[offset] = build_graph_chunk(
                         chunk_catalog,
                         chunk_rows,
                         batch_contig_gaf,
@@ -474,13 +496,13 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
 
     populate_graph_chunk_overlaps(graph_chunks);
 
-    std::vector<BamChunk> bam_chunks;
-    bam_chunks.reserve(batch_size);
-    for (GraphBamChunkBuildResult& gc : graph_chunks)
-        bam_chunks.push_back(std::move(gc.chunk));
-    stitch_chunk_haps(bam_chunks, &opts, pgbam_sidecar);
+    std::vector<PhasingChunk> phasing_chunks;
+    phasing_chunks.reserve(batch_size);
+    for (GraphChunkBuildResult& gc : graph_chunks)
+        phasing_chunks.push_back(std::move(gc.chunk));
+    stitch_chunk_haps(phasing_chunks, &opts, pgbam_sidecar);
     for (size_t i = 0; i < batch_size; ++i)
-        graph_chunks[i].chunk = std::move(bam_chunks[i]);
+        graph_chunks[i].chunk = std::move(phasing_chunks[i]);
 
     return graph_chunks;
 }
@@ -671,7 +693,7 @@ void run_collect_graph_variation(const Options& opts) {
     std::unordered_map<std::string, const GraphSite*> site_id_to_site;
     site_id_to_site.reserve(catalog.sites.size());
     for (size_t i = 0; i < catalog.sites.size(); ++i) {
-        site_id_to_site[graph_site_key_str(catalog.sites[i], i)] = &catalog.sites[i];
+        site_id_to_site[graph_site_key_str(catalog.sites[i])] = &catalog.sites[i];
     }
 
     // 9. Open output streams.
@@ -725,7 +747,7 @@ void run_collect_graph_variation(const Options& opts) {
             ++batch_end;
         }
 
-        std::vector<GraphBamChunkBuildResult> graph_chunks =
+        std::vector<GraphChunkBuildResult> graph_chunks =
             use_indexed_gaf
                 ? process_graph_chunk_batch_indexed_gaf(
                       catalog, chunks, batch_begin, batch_end, header.get(),
@@ -750,7 +772,7 @@ void run_collect_graph_variation(const Options& opts) {
         // Batches are per-contig so cross-batch read overlap is impossible;
         // flush everything after each batch.
         if (emit_phased_bam) {
-            for (const GraphBamChunkBuildResult& gc : graph_chunks)
+            for (const GraphChunkBuildResult& gc : graph_chunks)
                 merge_graph_chunk_into_read_rows(phased_bam_rows, gc);
             flush_graph_phase_bam_after_merge(
                 phased_bam_fp.get(), phased_bam_hdr.get(),

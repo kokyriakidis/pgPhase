@@ -326,12 +326,87 @@ pub extern "C" fn pgphase_gbz_query_interval_structured(
     0
 }
 
-/// Free a buffer returned by the FFI.
+// ---------------------------------------------------------------------------
+// Path range query: expose the genome-coordinate extent of a reference path
+// ---------------------------------------------------------------------------
+
+/// Query the genome-coordinate range covered by a reference path.
+///
+/// For subgraphed GBZ files the path may start at a non-zero genome offset
+/// (the "fragment" field).  This function returns that offset as `*out_start`
+/// and a conservative end coordinate as `*out_end`.  The end is computed from
+/// the last indexed position in the ReferenceIndex, so the true path may
+/// extend up to ~INDEX_INTERVAL (1000 bp) beyond `*out_end`.
+///
+/// Returns 0 on success, -1 on error (path not found / not indexed).
 #[unsafe(no_mangle)]
-pub extern "C" fn pgphase_gbz_free_buffer(buf: *mut u8, len: usize) {
-    if !buf.is_null() && len > 0 {
-        unsafe { drop(Vec::from_raw_parts(buf, len, len)); }
+pub extern "C" fn pgphase_gbz_path_range(
+    gbz_handle: *mut c_void,
+    sample: *const c_char,
+    contig: *const c_char,
+    out_start: *mut u64,
+    out_end: *mut u64,
+    err_out: *mut *mut c_char,
+) -> c_int {
+    if gbz_handle.is_null() {
+        return set_error_int(err_out, "null GBZ handle");
     }
+    let gbz_session = unsafe { &*(gbz_handle as *const GbzSession) };
+
+    let contig_str = match unsafe { CStr::from_ptr(contig) }.to_str() {
+        Ok(s) => s,
+        Err(e) => return set_error_int(err_out, &format!("invalid contig: {}", e)),
+    };
+    let sample_str = if sample.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(sample) }.to_str() {
+            Ok(s) => Some(s),
+            Err(e) => return set_error_int(err_out, &format!("invalid sample: {}", e)),
+        }
+    };
+
+    let sample_name = sample_str.unwrap_or(gbz::GENERIC_SAMPLE);
+    // Use a large fragment so find_path's "fragment <= ?" query matches
+    // any path regardless of its starting offset.  Stay within i64::MAX
+    // to avoid overflow when rusqlite binds usize as SQLite INTEGER.
+    let mut path_name = FullPathName::reference(sample_name, contig_str);
+    path_name.fragment = i64::MAX as usize;
+
+    let mut graph_iface = match GraphInterface::new(&gbz_session.db) {
+        Ok(g) => g,
+        Err(e) => return set_error_int(err_out, &format!("GraphInterface::new: {}", e)),
+    };
+
+    // Look up the path record to get the fragment (genome-coordinate offset).
+    let path = match graph_iface.find_path(&path_name) {
+        Ok(Some(p)) => p,
+        Ok(None) => return set_error_int(err_out, &format!(
+            "no path found for {}#{}", sample_name, contig_str)),
+        Err(e) => return set_error_int(err_out, &format!("find_path: {}", e)),
+    };
+    if !path.is_indexed {
+        return set_error_int(err_out, &format!(
+            "path {}#{} is not indexed for random access", sample_name, contig_str));
+    }
+
+    let fragment_start = path.name.fragment as u64;
+
+    // Find the last indexed position by querying with a very large offset.
+    // indexed_position returns the last entry with path_offset <= query.
+    // Stay within i64::MAX to avoid rusqlite integer overflow.
+    let max_indexed_offset = match graph_iface.indexed_position(path.handle, i64::MAX as usize) {
+        Ok(Some((offset, _pos))) => offset as u64,
+        Ok(None) => 0,
+        Err(e) => return set_error_int(err_out, &format!("indexed_position: {}", e)),
+    };
+
+    unsafe {
+        *out_start = fragment_start;
+        *out_end = fragment_start + max_indexed_offset;
+    }
+
+    0
 }
 
 // ---------------------------------------------------------------------------

@@ -3,17 +3,12 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
-#include <cstdio>
 #include <cstring>
 #include <functional>
-#include <cstdlib>
-#include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
 #include <htslib/hts.h>
 #include <htslib/kstring.h>
@@ -25,11 +20,10 @@ using GraphReadAlleleThreadEmitter = std::function<void(size_t, GraphReadAllele&
 
 namespace {
 
-std::string graph_site_key_str(const GraphSite& site, size_t /*index*/) {
-    if (!site.id.empty() && site.id != ".") return site.id;
-    return site.chrom + ":" + std::to_string(site.pos) + ":" + site.ref;
-}
-
+// Compact handle encoding: pack (node_id, orientation) into a uint32_t.
+// Bit layout: [31:1] = node_id, [0] = reverse flag.
+// This matches the GBWT handle encoding (2*node_id + orientation), so
+// FFI-provided GBWT handles can be truncated directly to CompactHandle.
 using CompactHandle = uint32_t;
 constexpr uint64_t kMaxCompactNodeId =
     static_cast<uint64_t>(std::numeric_limits<CompactHandle>::max() >> 1);
@@ -56,6 +50,7 @@ bool parse_unsigned_node(std::string_view value, uint64_t& out) {
     return true;
 }
 
+// Parse a GAF path field (e.g. ">12>34<56>78") into a vector of CompactHandles.
 bool parse_gaf_path_compact(std::string_view walk,
                             std::vector<CompactHandle>& out) {
     out.clear();
@@ -134,20 +129,24 @@ struct FlatAllelePack {
     size_t allele_len(size_t i) const { return lengths[i]; }
 };
 
+// A snarl site ready for numeric matching.  Stores the ref walk's boundary
+// handles (left/right and their reverse complements) plus all allele walks
+// packed into a FlatAllelePack.
 struct CompactGraphSite {
-    size_t original_index = 0;
+    size_t original_index = 0;   // index into GraphSiteCatalog::sites
     std::string site_id;
     std::string chrom;
     hts_pos_t pos = 0;
-    CompactHandle left = 0;
-    CompactHandle right = 0;
-    CompactHandle left_rev = 0;
-    CompactHandle right_rev = 0;
+    CompactHandle left = 0;      // first handle of ref walk (forward)
+    CompactHandle right = 0;     // last handle of ref walk (forward)
+    CompactHandle left_rev = 0;  // reverse complement of left
+    CompactHandle right_rev = 0; // reverse complement of right
     FlatAllelePack alleles;
-    size_t max_walk_len = 0;
+    size_t max_walk_len = 0;     // longest allele walk (for early-break)
 };
 
-// Flat sorted boundary→sites index. Sorted by handle for binary search.
+// Maps a boundary handle to the compact site it belongs to.
+// All entries are sorted by handle for binary-search lookup.
 struct BoundarySiteEntry {
     CompactHandle handle;
     uint32_t site_index;
@@ -180,6 +179,9 @@ void add_boundary_entry(std::vector<BoundarySiteEntry>& entries,
     entries.push_back({handle, site_index});
 }
 
+// Convert a GraphSiteCatalog into a CompactGraphSiteIndex: flatten allele
+// walks into contiguous FlatAllelePacks and build a sorted boundary→site
+// index for O(log n) handle lookup during read scanning.
 bool build_compact_graph_site_index(const GraphSiteCatalog& catalog,
                                     CompactGraphSiteIndex& out) {
     out = {};
@@ -194,7 +196,7 @@ bool build_compact_graph_site_index(const GraphSiteCatalog& catalog,
 
         CompactGraphSite compact;
         compact.original_index = i;
-        compact.site_id = graph_site_key_str(site, i);
+        compact.site_id = graph_site_key_str(site);
         compact.chrom = site.ref_contig.empty() ? site.chrom : site.ref_contig;
         compact.pos = site.pos;
 
@@ -224,6 +226,7 @@ bool build_compact_graph_site_index(const GraphSiteCatalog& catalog,
             }
             const size_t walk_len = pack.data.size() - walk_start;
             if (walk_len == 0) return false;
+            if (walk_len > std::numeric_limits<uint16_t>::max()) return false;
             pack.lengths[ai] = static_cast<uint16_t>(walk_len);
             compact.max_walk_len = std::max(compact.max_walk_len, walk_len);
         }
@@ -270,7 +273,10 @@ struct FlatBoundaryPositions {
     void add(CompactHandle h, uint32_t pos) { entries.push_back({h, pos}); }
     void sort() {
         std::sort(entries.begin(), entries.end(),
-                  [](const Entry& a, const Entry& b) { return a.handle < b.handle; });
+                  [](const Entry& a, const Entry& b) {
+                      if (a.handle != b.handle) return a.handle < b.handle;
+                      return a.pos < b.pos;
+                  });
     }
 
     // Returns [begin, end) pointers for all positions with the given handle.
@@ -286,6 +292,8 @@ struct FlatBoundaryPositions {
     }
 };
 
+// Compare a read sub-walk against one allele walk.  Forward comparison uses
+// memcmp; reverse comparison walks the allele backwards, flipping orientation.
 bool compact_span_matches_allele(const CompactHandle* read_ptr, size_t span_len,
                                  const CompactHandle* allele_ptr, size_t allele_len,
                                  bool reverse) {
@@ -299,6 +307,9 @@ bool compact_span_matches_allele(const CompactHandle* read_ptr, size_t span_len,
     return true;
 }
 
+// Try to match a read span against all allele walks of a site.
+// Returns the allele index (≥0), kGraphAlleleMissing, or kGraphAlleleAmbiguous
+// if multiple alleles match (shouldn't happen with well-formed snarls).
 int match_compact_span(const CompactHandle* read_ptr, size_t span_len,
                        const CompactGraphSite& site,
                        bool reverse) {
@@ -316,6 +327,10 @@ int match_compact_span(const CompactHandle* read_ptr, size_t span_len,
     return match;
 }
 
+// Determine which allele a read traverses at a given site.
+// Looks up the site's boundary handles in the read's position index, extracts
+// the sub-walk between left and right boundaries, and compares against each
+// allele walk.  Tries forward orientation first, then reverse complement.
 int match_compact_site_on_read(
     const std::vector<CompactHandle>& read_walk,
     const FlatBoundaryPositions& boundary_positions,
@@ -356,6 +371,11 @@ int match_compact_site_on_read(
     return kGraphAlleleMissing;
 }
 
+// Process one GAF line: parse the read walk, find candidate sites whose
+// boundary handles appear in the walk, then match each candidate.
+// Emits a GraphReadAllele for every successful match.  Scratch buffers
+// (read_walk, boundary_positions, candidates, site_marks) are caller-owned
+// to avoid per-line allocation.
 size_t scan_gaf_line_compact(std::string_view line,
                              int first_gaf_column,
                              const CompactGraphSiteIndex& compact_index,
@@ -416,7 +436,6 @@ size_t scan_gaf_line_compact(std::string_view line,
     return emitted;
 }
 
-// Returns the sub-walk of `walk` that spans between left_bnd and right_bnd
 } // namespace
 
 // pggaf coordinate-indexed GAF tabix often names sequences by reference suffix ("chr20")
@@ -513,13 +532,11 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
     return rows;
 }
 
-// ── FFI-based interval query (structured, no GAF text) ────────────────────
-
 namespace {
 
-// Context for the structured alignment callback using compact numeric matching.
-// GBWT handles (2 * node_id + orientation) map directly to CompactHandle
-// ((node_id << 1) | orientation) — same encoding, no conversion needed.
+// Callback context for the Rust FFI path: receives pre-parsed GBWT handle
+// arrays instead of GAF text.  GBWT handles (2*node_id + orientation) share
+// the same encoding as CompactHandle, so no conversion is needed.
 struct CompactFFIContext {
     const CompactGraphSiteIndex* index;
     int min_mapq;
@@ -633,7 +650,7 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
     ctx.site_marks.resize(compact_index.sites.size(), 0);
 
     char* err = nullptr;
-    const int rc = pgphase_gbz_query_interval_structured(
+    int rc = pgphase_gbz_query_interval_structured(
         gbz_handle, gaf_handle,
         sample.empty() ? nullptr : sample.c_str(),
         contig.c_str(),
@@ -649,6 +666,32 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
     }
 
     return results;
+}
+
+PathRange
+query_gbz_path_range(void* gbz_handle,
+                     const std::string& sample,
+                     const std::string& contig)
+{
+    PathRange result;
+    if (!gbz_handle) return result;
+
+    uint64_t out_start = 0, out_end = 0;
+    char* err = nullptr;
+    int rc = pgphase_gbz_path_range(
+        gbz_handle,
+        sample.empty() ? nullptr : sample.c_str(),
+        contig.c_str(),
+        &out_start, &out_end, &err);
+    if (rc != 0) {
+        if (err) pgphase_gbz_free_string(err);
+        return result;
+    }
+
+    result.start = static_cast<hts_pos_t>(out_start);
+    result.end   = static_cast<hts_pos_t>(out_end);
+    result.valid  = true;
+    return result;
 }
 
 } // namespace pgphase_collect

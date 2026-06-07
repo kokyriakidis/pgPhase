@@ -1,17 +1,21 @@
 #ifndef PGPHASE_GRAPH_SITES_HPP
 #define PGPHASE_GRAPH_SITES_HPP
 
+// Snarl site catalog: parsing VCF sites produced by `vg deconstruct -a`,
+// validating allele traversals, and providing the GraphSiteCatalog used by
+// graph_query for allele matching and graph_bam_adapter for phasing.
+
 #include "collect_types.hpp"
 
 #include <cstdint>
 #include <iosfwd>
-#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace pgphase_collect {
 
+// One step in an allele traversal walk: a graph node ID and its orientation.
 struct GraphWalkStep {
     std::string node;
     bool reverse = false;
@@ -23,28 +27,29 @@ struct GraphWalkStep {
 
 using GraphWalk = std::vector<GraphWalkStep>;
 
-constexpr int kGraphAlleleMissing = -1;
-constexpr int kGraphAlleleAmbiguous = -2;
+constexpr int kGraphAlleleMissing = -1;    // read doesn't span the site
+constexpr int kGraphAlleleAmbiguous = -2;  // read matches multiple alleles
 
+// A snarl variation site parsed from a VCF record.
 struct GraphSite {
-    std::string chrom;
-    std::string ref_contig;
-    hts_pos_t pos = 0; // VCF 1-based POS.
-    std::string id;
+    std::string chrom;          // VCF CHROM (pangenome path name)
+    std::string ref_contig;     // suffix after last '#' (e.g. "chr20")
+    hts_pos_t pos = 0;          // VCF 1-based POS
+    std::string id;              // VCF ID field (snarl identifier)
     std::string ref;
     std::vector<std::string> alts;
     std::unordered_map<std::string, std::string> info;
-    std::vector<std::string> allele_traversals;
-    std::vector<GraphWalk> allele_walks;
-    int level = -1;
-    std::string parent;
-    std::string root;
-    hts_pos_t ref_beg = 0;
-    hts_pos_t ref_end = 0;
-    std::vector<int> conditional_parent_alleles;
-    bool has_spanning_deletion = false;
-    bool eligible = true;
-    std::string skip_reason;
+    std::vector<std::string> allele_traversals;  // raw AT field entries
+    std::vector<GraphWalk> allele_walks;          // parsed walks (one per allele)
+    int level = -1;              // snarl nesting level (LV info field)
+    std::string parent;          // parent snarl site key (PS info field)
+    std::string root;            // root snarl (unused, reserved)
+    hts_pos_t ref_beg = 0;      // linearized ref interval start
+    hts_pos_t ref_end = 0;      // linearized ref interval end
+    std::vector<int> conditional_parent_alleles;  // PA field: parent alleles that gate this child
+    bool has_spanning_deletion = false;  // true if any ALT is '*'
+    bool eligible = true;        // false if validation failed
+    std::string skip_reason;     // why the site was marked ineligible
 
     hts_pos_t order_pos() const { return pos; }
 };
@@ -61,57 +66,11 @@ GraphSiteCatalog load_graph_site_catalog_from_vcf(
     const std::vector<RegionFilter>& filters = {},
     bool keep_allele_traversal_strings = true);
 
-/**
- * @brief True if `path` has a tabix index (.tbi/.csi) loadable by htslib.
- */
+// True if `path` has a tabix index (.tbi/.csi) loadable by htslib.
 bool graph_site_vcf_has_tabix_index(const std::string& path);
 
-/** @throws std::runtime_error if \p path has no tabix index (.tbi/.csi). */
+// Throws std::runtime_error if `path` has no tabix index (.tbi/.csi).
 void require_graph_site_vcf_tabix_index(const std::string& path);
-
-/**
- * @brief Reference length (bp) from VCF ##contig meta for a logical sequence name.
- *
- * Matches CHROM to ##contig ID with the same pangenome suffix rules as site loading.
- * @throws std::runtime_error if no matching ##contig record carries length=
- */
-hts_pos_t graph_site_contig_end_bp_from_vcf_header(const std::string& vcf_path,
-                                                   const std::string& logical_chrom);
-
-/**
- * @brief Incremental graph-site loader: one open VCF + tabix index, many interval queries.
- *
- * Construct one instance per worker thread. Uses half-open \p beg0..\p end0 in the same
- * coordinate convention as `phase-graph` chunk tiling (0-based, end exclusive).
- */
-class GraphSitesTabixReader {
-public:
-    explicit GraphSitesTabixReader(const std::string& vcf_path);
-    ~GraphSitesTabixReader();
-
-    GraphSitesTabixReader(const GraphSitesTabixReader&) = delete;
-    GraphSitesTabixReader& operator=(const GraphSitesTabixReader&) = delete;
-
-    GraphSitesTabixReader(GraphSitesTabixReader&&) noexcept;
-    GraphSitesTabixReader& operator=(GraphSitesTabixReader&&) noexcept;
-
-    GraphSiteCatalog load_half_open_interval(const std::string& logical_chrom,
-                                             hts_pos_t beg0,
-                                             hts_pos_t end0,
-                                             bool keep_allele_traversal_strings);
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
-
-// Returns the ordered list of distinct reference-contig names present in a VCF.
-// For bgzipped+indexed VCFs, reads the tabix/csi sequence name table (fast, no
-// data scan).  For plain-text VCFs, streams all data lines (linear time).
-// Names are normalised: pangenome prefixes like "CHM13#0#chr20" → "chr20".
-// Deduplication preserves VCF-header order for indexed files and uses lexicographic
-// order for the streaming fallback.
-std::vector<std::string> load_graph_site_contig_names(const std::string& vcf_path);
 
 GraphSiteCatalog load_graph_site_catalog_from_gfa_text(const std::string& gfa_text,
                                                        const std::string& reference_sample,
@@ -135,6 +94,12 @@ std::string graph_site_between_query(const GraphSite& site);
 std::string graph_site_validation_skip_reason(const GraphSite& site);
 
 bool graph_site_is_queryable(const GraphSite& site);
+
+// Canonical site key: VCF ID if present, otherwise "chrom:pos:ref".
+inline std::string graph_site_key_str(const GraphSite& site) {
+    if (!site.id.empty() && site.id != ".") return site.id;
+    return site.chrom + ":" + std::to_string(site.pos) + ":" + site.ref;
+}
 
 } // namespace pgphase_collect
 

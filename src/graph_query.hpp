@@ -53,6 +53,21 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
                             const GraphSiteCatalog& catalog,
                             int min_mapq);
 
+// Genome-coordinate range covered by a reference path in the GBZ.
+// For subgraphed GBZ files the path may start at a non-zero offset.
+// `end` is a conservative lower bound (the true path may extend up to
+// ~1000 bp beyond).
+struct PathRange {
+    hts_pos_t start = 0;
+    hts_pos_t end   = 0;
+    bool valid      = false;
+};
+
+// Query the genome-coordinate range of a reference path.
+PathRange query_gbz_path_range(void* gbz_handle,
+                               const std::string& sample,
+                               const std::string& contig);
+
 } // namespace pgphase_collect
 
 #endif

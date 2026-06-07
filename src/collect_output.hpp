@@ -18,9 +18,9 @@ namespace pgphase_collect {
  * @brief Declarations for TSV/VCF/read-support serialization of collect-bam-variation results.
  *
  * @details Contract: TSV/read-support outputs remain **candidate-space** diagnostics. VCF outputs use a
- * longcallD-like final-call projection (germline/noisy called categories that pass depth/alt-depth gates)
+ * Final-call projection (germline/noisy called categories that pass depth/alt-depth gates)
  * rather than dumping all candidate rows. TSV includes CATEGORY (final, post-containment) and INIT_CAT
- * (longcallD first `classify_var_cate` only, for parity checks). Candidate TSV includes `PHASE_SET` /
+ * (first classify pass only, for parity checks). Candidate TSV includes `PHASE_SET` /
  * `HAP_ALT` / `HAP_REF` from k-means. Optional `--phase-read-tsv` lists per-read scaffold fields
  * (`HAP`, `PHASE_SET`) for debugging phasing.
  */
@@ -31,7 +31,7 @@ namespace pgphase_collect {
 std::string type_name(VariantType type);
 
 /**
- * @brief Maps `VariantCategory` to longcallD-style labels (e.g. `LOW_COV`, `CLEAN_HET_SNP`).
+ * Maps VariantCategory to short labels (e.g. LOW_COV, CLEAN_HET_SNP).
  */
 std::string category_name(VariantCategory category);
 

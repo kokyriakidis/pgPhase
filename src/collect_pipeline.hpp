@@ -15,7 +15,7 @@ namespace pgphase_collect {
 /**
  * @brief Public API for region chunking and parallel collect-bam-variation orchestration.
  *
- * @details Mirrors longcallD-style region partitioning into `RegionChunk` units, worker dispatch,
+ * Region partitioning into RegionChunk units, worker dispatch,
  * and merged candidate tables.
  */
 
@@ -57,17 +57,6 @@ std::vector<RegionChunk> build_region_chunks(const Options& opts,
  * @return Chunk list; throws if BAM/index/FAI cannot be opened.
  */
 std::vector<RegionChunk> load_region_chunks(const Options& opts);
-
-/**
- * @brief Runs all chunks through a worker pool and merges results into one `CandidateTable`.
- *
- * @param opts Thread count and paths.
- * @param chunks Region list from `load_region_chunks`.
- * @return Merged candidates in chunk processing order.
- */
-CandidateTable collect_chunks_parallel(
-    const Options& opts,
-    const std::vector<RegionChunk>& chunks);
 
 /**
  * @brief Streaming driver: batch by `reg_chunk_i`, write TSV/VCF incrementally.

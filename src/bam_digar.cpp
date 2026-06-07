@@ -18,7 +18,7 @@ namespace pgphase_collect {
 /**
  * @brief A dynamic sliding window queue for detecting dense mismatch/indel regions.
  *
- * Equivalent to longcallD's `xid_queue_t`. As variants (SNPs/INDELs) are parsed,
+ * Sliding window of recent variant events. As variants (SNPs/INDELs) are parsed,
  * their positions and sizes are pushed into this queue. It maintains a running sum
  * of variation penalties ("counts") within a specific genomic window size.
  * 
@@ -54,7 +54,7 @@ struct XidQueue {
 /**
  * @brief Pushes a new variant event into the sliding window and evaluates noise.
  *
- * Equivalent to longcallD's `push_xid_size_queue_win()`.
+ * Push a new variant event into the sliding window.
  * 1. Adds the new event to the tail of the queue.
  * 2. Evicts old events that fall behind the trailing window boundary.
  * 3. Checks if the remaining sum of events crosses the noise threshold `max_s`.
@@ -173,7 +173,7 @@ struct NoisyRegionBuilder {
                              bool left_clip_is_palindrome,
                              bool right_clip_is_palindrome,
                              ReadRecord& read) {
-        // Line-aligned with longcallD collect_digar_from_eqx_cigar() clip branch (bam_utils.c):
+        // Clip-to-noisy-region conversion:
         //   if ((i == 0 && pos > 10) || (i != 0 && pos < tlen - 10)) {
         //     if (len > end_clip_reg) {
         //       if (i == 0 && !left_clip_is_palindrome) {
@@ -185,8 +185,8 @@ struct NoisyRegionBuilder {
         //       }
         //     }
         //   }
-        constexpr int end_clip_reg = kLongClipLength;        // LONGCALLD_NOISY_END_CLIP
-        constexpr int end_clip_flank = kClipFlank;             // LONGCALLD_NOISY_END_CLIP_WIN
+        constexpr int end_clip_reg = kLongClipLength;        // min clip length to flag as noisy
+        constexpr int end_clip_flank = kClipFlank;             // flank around clip for noisy window
         if (!((cigar_idx == 0 && pos > 10) || (cigar_idx != 0 && pos < tlen - 10))) return;
         if (clip_len <= end_clip_reg) return;
         if (cigar_idx == 0 && !left_clip_is_palindrome) {
@@ -223,7 +223,7 @@ struct NoisyRegionBuilder {
  * @brief Increments the total candidate event count for a read.
  * 
  * Tracks the absolute number of high-penalty structural events (SNPs, Insertions, Deletions)
- * observed on a read. This behaves precisely like `longcallD`, feeding into `read_has_too_many_variants` 
+ * observed on a read, feeding into `read_has_too_many_variants` 
  * to skip reads that are overwhelmingly chaotic or mismapped.
  * 
  * @param read The read record accumulating variants.
@@ -265,7 +265,7 @@ inline bool parse_debug_site(const std::string& site, std::string& chrom_out, ht
 /**
  * @brief conditionally prints extensive debug logs if a read spans a target coordinate.
  * 
- * Ported from `longcallD`'s manual inspection hooks. When `--debug-site` is provided, 
+ * Debug output hooks. When `--debug-site` is provided, 
  * this dumps the precise alignment properties and parsed DIGAR items at that exact locus.
  * 
  * @param opts The pipeline options containing the debug site.
@@ -424,7 +424,7 @@ bool deletion_is_low_quality(const bam1_t* aln, int qi, int min_bq) {
 /**
  * @brief Appends a new Digar operation, coalescing matching runs if safe.
  * 
- * Safely mimics `longcallD`'s appending semantics. It explicitly forbids merging
+ * Append a digar op to the read's operation list. Explicitly forbids merging
  * distinct insertion/deletion components to ensure exact byte-offsets and ordering 
  * matches `exact_comp_var_site_ins` variant grouping behaviors.
  * 
@@ -440,12 +440,12 @@ void append_digar(std::vector<DigarOp>& digars, DigarOp op) {
  * @brief Evaluates global Phred quality quartiles (min, 25%, median, 75%, max) for an entire chunk.
  * 
  * Condenses the massive stream of mapping characteristics down to a few core metrics.
- * These metrics populate the candidate filter algorithms mapping against `longcallD` 
+ * These metrics populate the candidate filter algorithms for 
  * chunk quality histograms to aggressively prune outlier sets.
  * 
  * @param chunk The processing node chunk structure holding active read mappings.
  */
-void recompute_chunk_qual_stats(BamChunk& chunk) {
+void recompute_chunk_qual_stats(PhasingChunk& chunk) {
     int64_t qual_hist[256] = {};
     for (const ReadRecord& r : chunk.reads) {
         if (r.is_skipped) continue;
@@ -488,8 +488,8 @@ static hts_pos_t contig_len_from_header(const bam_hdr_t* header, int tid) {
     return static_cast<hts_pos_t>(header->target_len[tid]);
 }
 
-/** longcallD `has_equal_X_in_bam_cigar` (`bam_utils.c`) — chooses EQX vs CS/MD/ref digar paths. */
-static bool longcalld_has_equal_x_in_bam_cigar(const bam1_t* aln) {
+// True when the CIGAR uses =/X ops (EQX format) instead of M ops.
+static bool has_equal_x_in_bam_cigar(const bam1_t* aln) {
     const uint32_t* cigar = bam_get_cigar(aln);
     const int n_cigar = aln->core.n_cigar;
     if (n_cigar <= 0) return false;
@@ -511,7 +511,7 @@ static bool longcalld_has_equal_x_in_bam_cigar(const bam1_t* aln) {
  * BAM_CMATCH operations by extracting query bases and referencing the fetched FASTA to evaluate
  * equality.
  *
- * Equivalent to `longcallD`'s `collect_digar_from_ref_seq()`.
+ * Build digars by comparing the read sequence against the reference.
  *
  * @param aln BAM record.
  * @param header BAM header.
@@ -597,7 +597,7 @@ static void build_digars_ref_cigar(const bam1_t* aln,
                                               read);
             if (op == BAM_CSOFT_CLIP) query_pos += len;
         } else if (op == BAM_CREF_SKIP) {
-            // longcallD collect_digar_*: skip N op without adding a digar entry.
+            // Skip N (ref-skip) op without adding a digar entry.
             ref_pos += len;
         }
     }
@@ -612,7 +612,7 @@ static void build_digars_ref_cigar(const bam1_t* aln,
  * and mismatches using the = and X CIGAR operators (no M operators). Since mismatches 
  * are explicit, it does not require reference sequence lookups to identify SNPs.
  *
- * Equivalent to longcallD's `collect_digar_from_eqx_cigar()`. It builds variant 
+ * Build digars from EQX CIGAR ops (=/X). Builds variant 
  * representations directly from X, D, and I operators, evaluating base/flank qualities
  * via `insertion_is_low_quality` and `deletion_is_low_quality`.
  *
@@ -685,7 +685,7 @@ static void build_digars_eqx_cigar(const bam1_t* aln,
                                               read);
             if (op == BAM_CSOFT_CLIP) query_pos += len;
         } else if (op == BAM_CREF_SKIP) {
-            // longcallD collect_digar_*: skip N op without adding a digar entry.
+            // Skip N (ref-skip) op without adding a digar entry.
             ref_pos += len;
         }
     }
@@ -702,7 +702,7 @@ static void build_digars_eqx_cigar(const bam1_t* aln,
  *
  * It is faster than pulling FASTA chunks (fallback reference path) but fails safely
  * (returning false) if the BAM record is missing the MD tag or has malformed MD values.
- * Equivalent to longcallD's `collect_digar_from_MD_tag()` implementation.
+ * Build digars from the MD tag when CIGAR uses M ops.
  *
  * @param aln BAM record.
  * @param header BAM header.
@@ -794,7 +794,7 @@ static bool build_digars_md_cigar(const bam1_t* aln,
             record_variant_event(read, aln->core.tid, digar);
             if (!digar.low_quality) noisy_builder.observe_variant(ref_pos, len, len);
             ref_pos += len;
-            // longcallD MD pointer advance after deletion: skip one token and consume letters.
+            // MD pointer advance after deletion: skip one token and consume letters.
             if (*md != '\0') {
                 ++md;
                 while (*md != '\0' && std::isalpha(static_cast<unsigned char>(*md))) ++md;
@@ -856,7 +856,7 @@ static int cs_char_to_nt4(char c) {
  * long splice operations (~).
  * It runs by checking the first CIGAR operation (to skip leading clips), and then exclusively
  * tokenizes the `cs:Z:` string tag to construct variants. The method is extremely accurate and 
- * equivalent to longcallD's `collect_digar_from_cs_tag`.
+ * Build digars from the CS (difference string) tag.
  *
  * @param aln BAM record.
  * @param header BAM header.
@@ -1013,7 +1013,7 @@ static bool build_digars_cs_tag(const bam1_t* aln,
  * Tries four strategies in order and falls back when a strategy is unavailable or malformed:
  *
  * 1. **EQX CIGAR** (`=`/`X` operators, no `M`): explicit match/mismatch; no reference lookup
- *    needed. Most accurate and fastest. Used when `longcalld_has_equal_x_in_bam_cigar`.
+ *    needed. Most accurate and fastest. Used when `has_equal_x_in_bam_cigar`.
  * 2. **`cs:Z:` tag** (minimap2 format): `:` matches, `*xy` mismatches, `+seq` insertions,
  *    `-seq` deletions. Falls back to ref-comparison if the tag is missing or malformed.
  * 3. **`MD:Z:` tag** + CIGAR: reconstructs SNPs from the `MD` string; insertions from CIGAR.
@@ -1043,7 +1043,7 @@ void build_digars_and_events(const bam1_t* aln,
     read.total_cand_events = 0;
     read.digars.reserve(static_cast<size_t>(aln->core.n_cigar) * 2u + 8u);
 
-    if (longcalld_has_equal_x_in_bam_cigar(aln)) {
+    if (has_equal_x_in_bam_cigar(aln)) {
         build_digars_eqx_cigar(aln, header, opts, read);
     } else if (bam_aux_get(const_cast<bam1_t*>(aln), "cs") != nullptr) {
         if (!build_digars_cs_tag(aln, header, opts, read)) {
@@ -1068,7 +1068,7 @@ void build_digars_and_events(const bam1_t* aln,
 // ════════════════════════════════════════════════════════════════════════════
 
 /**
- * @brief Early-out flag filter equivalent to longcallD BAM inspection filters.
+ * Early-out flag filter for BAM records (unmapped, secondary, QC-fail, dup, supplementary).
  *
  * Discards unmapped, secondary, and supplementary alignments instantly.
  * Follows `opt->min_mapq` criteria, and optionally drops QC-failed/duplicate reads.
@@ -1109,7 +1109,7 @@ bool read_overlaps_next_region(const RegionChunk& chunk, int read_tid, hts_pos_t
 /**
  * @brief Checks if the variant event load relative to mapped length exceeds limits.
  *
- * Implements `longcallD`'s fractional limits (`max_var_ratio_per_read` and 
+ * Fractional limits (`max_var_ratio_per_read` and 
  * `max_noisy_frac_per_read`) that discard reads interpreted as entirely junk 
  * or chimeric (where simple sequence alignment failed). By bounding the math to
  * `mapped_len`, it prevents dividing by zero.
@@ -1159,7 +1159,7 @@ std::unique_ptr<hts_itr_t, IteratorDeleter> make_chunk_iterator(const hts_idx_t*
  * 
  * It uses zero-allocation C-string parsing (`sscanf`, `strtol`) and fixed stack buffers 
  * for maximum per-read efficiency without triggering heap allocations.
- * Equivalent to longcallD's `is_ont_palindrome_clip()`.
+ * Detect ONT palindrome artifacts (inverted-repeat clips).
  *
  * @param aln The primary BAM alignment record.
  * @param header The BAM header for resolving contig names.
@@ -1214,7 +1214,7 @@ static bool detect_ont_palindrome(const bam1_t* aln, const bam_hdr_t* header, co
 /**
  * @brief Fetch reads falling within a genomic chunk and parse them to variants natively.
  *
- * Implements the equivalent iteration loops inside longcallD's `collect_ref_seq_bam_main()`.
+ * Load reads from BAM, parse digars, detect noisy regions, and populate the chunk.
  * Pulls the alignment pointer iteratively per chunk boundary (with an index via HTSlib),
  * performs standard flag matching and then dispatches the best digar parser 
  * (`build_digars_and_events`) per read before accumulating the read into memory.
@@ -1298,7 +1298,7 @@ std::vector<ReadRecord> load_read_records_for_chunk(const Options& opts,
  * @param ref Reference abstraction cache.
  * @param header The BAM header for checking contig boundaries constraints.
  */
-void populate_reference_slice(BamChunk& chunk, ReferenceCache& ref, const bam_hdr_t* header) {
+void populate_reference_slice(PhasingChunk& chunk, ReferenceCache& ref, const bam_hdr_t* header) {
     const ReadRecord* first_active = nullptr;
     for (const ReadRecord& read : chunk.reads) {
         if (!read.is_skipped) {
@@ -1345,7 +1345,7 @@ void populate_reference_slice(BamChunk& chunk, ReferenceCache& ref, const bam_hd
  * @param ref Used to gather references chunks natively.
  * @param header Header to extract indices bounds constraints.
  */
-void finalize_bam_chunk(BamChunk& chunk, ReferenceCache& ref, const bam_hdr_t* header) {
+void finalize_bam_chunk(PhasingChunk& chunk, ReferenceCache& ref, const bam_hdr_t* header) {
     recompute_chunk_qual_stats(chunk);
     populate_reference_slice(chunk, ref, header);
     populate_low_complexity_intervals(chunk);

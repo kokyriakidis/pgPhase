@@ -105,7 +105,7 @@ inline char nt_char_lower(char b) {
     return static_cast<char>(std::tolower(static_cast<unsigned char>(u)));
 }
 
-// longcallD `get_cs_from_digar`: MSA digar alt is 0–4; BAM-built digars use ASCII (see `bam_digar.cpp`).
+// MSA digar alt is 0–4 (nt4); BAM-built digars use ASCII (see bam_digar.cpp).
 inline char cs_alt_base_from_digar_char(char stored) {
     const auto u = static_cast<unsigned char>(stored);
     if (u < 5) return "acgtn"[u];
@@ -384,10 +384,10 @@ PhasedAlignmentWriter::~PhasedAlignmentWriter() {
     if (out_ != nullptr) hts_close(out_);
 }
 
-int PhasedAlignmentWriter::write_chunks(const std::vector<BamChunk>& chunks) {
+int PhasedAlignmentWriter::write_chunks(const std::vector<PhasingChunk>& chunks) {
     if (out_ == nullptr) return 0;
     int n_out_reads = 0;
-    for (const BamChunk& chunk : chunks) {
+    for (const PhasingChunk& chunk : chunks) {
         const hts_pos_t reg_beg = chunk.region.beg;
         const hts_pos_t reg_end = chunk.region.end;
         const int tid = chunk.region.tid;

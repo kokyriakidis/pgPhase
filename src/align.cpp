@@ -2,7 +2,7 @@
  * @file align.cpp
  * @brief WFA2-lib / abPOA alignment wrappers and noisy-region helpers.
  *
- * Mirrors longcallD align.c, limited to the functions needed for step 4
+ * Alignment utilities for noisy-region MSA (step 4): WFA2 wrappers,
  * (iterative noisy-region MSA variant calling).  Functions that touch TE
  * detection, BAM re-writing, or somatic calling are not ported.
  */
@@ -26,7 +26,7 @@ extern "C" {
 #include "alignment/cigar.h"
 }
 
-// longcallD uses edlib_xgaps as part of noisy-region sampling.
+// edlib X-gap counting used for noisy-region read sampling.
 // Ported here for strict parity.
 #include "edlib.h"
 
@@ -43,7 +43,7 @@ namespace pgphase_collect {
 // ════════════════════════════════════════════════════════════════════════════
 
 // seq_nt16_int[] maps bam_seqi nibble → 2-bit base (0=A, 1=C, 2=G, 3=T, 4=N).
-// Matches longcallD's `seq_nt16_int` from seq.h.
+// BAM 4-bit encoding to integer (0-3=ACGT, 4=N).
 static const uint8_t kSeqNt16Int[16] = {4,0,1,4, 2,4,4,4, 3,4,4,4, 4,4,4,4};
 
 static inline int add_phase_set(hts_pos_t ps,
@@ -74,7 +74,7 @@ static bool is_homopolymer(const uint8_t* seq, int seq_len, int flank_len,
     return false;
 }
 
-// longcallD align.c wfa_collect_pretty_alignment (verbatim control flow; vectors vs malloc).
+// Format a WFA2 alignment as a pretty-printed string (query/match/target rows).
 static int wfa_collect_pretty_alignment(cigar_t* cigar,
                                         const uint8_t* pattern, int plen,
                                         const uint8_t* text, int tlen,
@@ -128,7 +128,7 @@ static int wfa_collect_pretty_alignment(cigar_t* cigar,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// calc_read_error_rate  (mirrors longcallD seq.c)
+// Calculate per-read error rate from NM tag and aligned length.
 // ════════════════════════════════════════════════════════════════════════════
 
 double calc_read_error_rate(int len, const uint8_t* qual) {
@@ -140,7 +140,7 @@ double calc_read_error_rate(int len, const uint8_t* qual) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// full_cover_cmp  (mirrors longcallD align.c)
+// Compare two reads by full-cover flag, then by error rate (ascending).
 // ════════════════════════════════════════════════════════════════════════════
 
 int full_cover_cmp(int c1, int c2) {
@@ -165,8 +165,8 @@ static inline int digar_type_to_bam_op(DigarType t) {
     return BAM_CEQUAL;
 }
 
-/** longcallD `bam_utils.h` `digar2qlen` on the pre-MSA digar stream (uses last op only). */
-// longcallD `collect_*_msa_digars`: `d.alt_seq[0] = read_str[i]` (0–4), not ASCII letters.
+// Query length from the last digar op (end position of the read's aligned region).
+// MSA digar alt_seq uses nt4 encoding (0–4), not ASCII letters.
 static inline std::string msa_digar_alt1(uint8_t qb) {
     return std::string(1, static_cast<char>(qb < 5 ? qb : 4));
 }
@@ -183,17 +183,17 @@ static inline int digar2qlen_lcd(const std::vector<DigarOp>& digars) {
     return qlen;
 }
 
-/** longcallD `digar_t.qlen` after `longcalld_copy_digar_read_buffers`: packed `l_qseq`, not recomputed from digars. */
+// Query length from the BAM record (l_qseq), not recomputed from digars.
 static inline int read_packed_qlen_lcd(const ReadRecord& read) {
     if (read.alignment) return static_cast<int>(read.alignment->core.l_qseq);
     return digar2qlen_lcd(read.digars);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// collect_noisy_read_info  (mirrors longcallD align.c lines 1377–1461)
+// Collect per-read alignment info for reads overlapping a noisy region.
 // ════════════════════════════════════════════════════════════════════════════
 
-NoisyReadInfo collect_noisy_read_info(const Options& opts, const BamChunk& chunk,
+NoisyReadInfo collect_noisy_read_info(const Options& opts, const PhasingChunk& chunk,
                                       hts_pos_t reg_beg, hts_pos_t reg_end,
                                       const std::vector<int>& noisy_read_ids) {
     const int n = static_cast<int>(noisy_read_ids.size());
@@ -223,7 +223,7 @@ NoisyReadInfo collect_noisy_read_info(const Options& opts, const BamChunk& chunk
         info.haps   [static_cast<size_t>(i)] = chunk.haps[static_cast<size_t>(read_id)];
         info.phase_sets[static_cast<size_t>(i)] = chunk.phase_sets[static_cast<size_t>(read_id)];
 
-        // Match longcallD collect_noisy_read_info exactly:
+        // Classify read coverage of the noisy region:
         // reg_read_end = digar2qlen(read_digars)-1, then hard-clips adjust both ends.
         int reg_read_beg = 0;
         int reg_read_end = digar2qlen_lcd(digars) - 1;
@@ -371,7 +371,7 @@ static inline void push_digar_alt_seq(std::vector<DigarOp>& out, const DigarOp& 
     out.back().len += d.len;
 }
 
-/** longcallD `bam_utils.h` `double_check_digar`: returns 1 if invalid qi chain, else 0. */
+// Validate digar qi chain continuity; returns 1 if invalid, 0 if valid.
 static inline int double_check_digar(const std::vector<DigarOp>& digars) {
     const int n_digar = static_cast<int>(digars.size());
     if (n_digar == 0) return 0;
@@ -479,7 +479,7 @@ static std::vector<DigarOp> collect_right_digars(const std::vector<DigarOp>& dig
     return right;
 }
 
-// longcallD align.c `collect_full_msa_digars` (read_end unused; kept for parity with caller signature).
+// Build MSA digars for a read that fully covers the noisy region.
 static std::vector<DigarOp> collect_full_msa_digars(int read_beg, int /*read_end*/, hts_pos_t ref_beg,
                                                      const AlnStr& ref_read) {
     std::vector<DigarOp> out;
@@ -520,7 +520,7 @@ static std::vector<DigarOp> collect_full_msa_digars(int read_beg, int /*read_end
     return out;
 }
 
-// longcallD align.c `collect_left_msa_digars` (read_end overwritten immediately in LCD; unused).
+// Build MSA digars for a read that covers only the left portion of the noisy region.
 static std::vector<DigarOp> collect_left_msa_digars(int read_beg, int /*read_end*/, int qlen,
                                                      hts_pos_t ref_beg, const AlnStr& ref_read) {
     std::vector<DigarOp> out;
@@ -582,7 +582,7 @@ static std::vector<DigarOp> collect_left_msa_digars(int read_beg, int /*read_end
     return out;
 }
 
-// longcallD align.c `collect_right_msa_digars` (read_beg unused in LCD).
+// Build MSA digars for a read that covers only the right portion of the noisy region.
 static std::vector<DigarOp> collect_right_msa_digars(int /*read_beg*/, int read_end, hts_pos_t ref_beg,
                                                       hts_pos_t ref_end, const AlnStr& ref_read) {
     std::vector<DigarOp> out;
@@ -658,7 +658,7 @@ static void update_digars_from_msa1(ReadRecord& read, const AlnStr& ref_read_aln
         for (const DigarOp& d : right) push_digar_alt_seq(merged, d);
     } else if (noisyIsLeftCover(full_cover)) {
         left = collect_left_digars(read.digars, read_beg, noisy_reg_beg);
-        // longcallD passes digar->qlen (BAM l_qseq), not digar2qlen(digars).
+        // Use BAM l_qseq, not recomputed digar2qlen.
         msa = collect_left_msa_digars(read_beg, read_end, read_packed_qlen_lcd(read), noisy_reg_beg,
                                        ref_read_aln);
         for (const DigarOp& d : left) push_digar_alt_seq(merged, d);
@@ -669,14 +669,14 @@ static void update_digars_from_msa1(ReadRecord& read, const AlnStr& ref_read_aln
         for (const DigarOp& d : msa) push_digar0(merged, d);
         for (const DigarOp& d : right) push_digar_alt_seq(merged, d);
     }
-    // longcallD align.c `update_digars_from_msa1`: replace digars only if `double_check_digar` returns 0.
+    // Replace digars only if the new digar chain passes validation.
     if (double_check_digar(merged)) {
         return;
     }
     read.digars = std::move(merged);
 }
 
-static void update_digars_from_aln_str(BamChunk& chunk,
+static void update_digars_from_aln_str(PhasingChunk& chunk,
                                        hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                                        const std::vector<int>& read_id_to_full_covers,
                                        const std::vector<int>& read_reg_beg,
@@ -702,7 +702,7 @@ static void update_digars_from_aln_str(BamChunk& chunk,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// sort_noisy_region_reads  (mirrors longcallD align.c)
+// Sort noisy-region reads: full-cover first, then by error rate.
 // ════════════════════════════════════════════════════════════════════════════
 
 void sort_noisy_region_reads(NoisyReadInfo& info, bool use_error_rate) {
@@ -715,7 +715,7 @@ void sort_noisy_region_reads(NoisyReadInfo& info, bool use_error_rate) {
                 info.lens[static_cast<size_t>(i)], q.data());
         }
     }
-    // bubble sort matching longcallD exactly
+    // Bubble sort (preserves relative order for equal-priority reads).
     for (int i = 0; i < n - 1; ++i) {
         for (int j = i + 1; j < n; ++j) {
             int cc = full_cover_cmp(info.fully_covers[static_cast<size_t>(i)],
@@ -748,7 +748,7 @@ void sort_noisy_region_reads(NoisyReadInfo& info, bool use_error_rate) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// collect_phase_set_with_both_haps  (mirrors longcallD align.c)
+// Find phase sets that have reads on both haplotypes in the noisy region.
 // ════════════════════════════════════════════════════════════════════════════
 
 hts_pos_t collect_phase_set_with_both_haps(const NoisyReadInfo& info,
@@ -803,7 +803,7 @@ hts_pos_t collect_phase_set_with_both_haps(const NoisyReadInfo& info,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// wfa_end2end_aln  (mirrors longcallD align.c)
+// End-to-end WFA2 alignment of query against target.
 // ════════════════════════════════════════════════════════════════════════════
 
 int wfa_end2end_aln(const uint8_t* pattern, int plen,
@@ -869,7 +869,7 @@ int wfa_end2end_aln(const uint8_t* pattern, int plen,
     return aln_len;
 }
 
-// Mirrors longcallD wfa_end2end_aln(..., cigar_buf, cigar_length, ...) cigar branch (align.c).
+// Extract CIGAR from WFA2 alignment result.
 static int wfa_end2end_aln_collect_cigar(const uint8_t* pattern, int plen,
                                          const uint8_t* text, int tlen,
                                          int gap_aln, int b, int q, int e, int q2, int e2,
@@ -944,7 +944,7 @@ static int wfa_end2end_aln_collect_cigar(const uint8_t* pattern, int plen,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// wfa_trim_aln_str  (mirrors longcallD align.c)
+// Trim leading/trailing gaps from an alignment string.
 // ════════════════════════════════════════════════════════════════════════════
 
 void wfa_trim_aln_str(int full_cover, AlnStr& s) {
@@ -1005,7 +1005,7 @@ void wfa_trim_aln_str(int full_cover, AlnStr& s) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// wfa_collect_aln_str  (mirrors longcallD align.c)
+// Extract an AlnStr from a WFA2 alignment result.
 // ════════════════════════════════════════════════════════════════════════════
 
 int wfa_collect_aln_str(const Options& opts, const uint8_t* target, int tlen,
@@ -1062,7 +1062,7 @@ int wfa_collect_aln_str(const Options& opts, const uint8_t* target, int tlen,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// make_cons_read_aln_str  (mirrors longcallD align.c)
+// Build consensus-vs-read alignment string from WFA2 output.
 // ════════════════════════════════════════════════════════════════════════════
 
 int make_cons_read_aln_str(const uint8_t* cons_row, const uint8_t* read_row,
@@ -1071,7 +1071,7 @@ int make_cons_read_aln_str(const uint8_t* cons_row, const uint8_t* read_row,
     out.target_aln.reserve(static_cast<size_t>(msa_len));
     out.query_aln .reserve(static_cast<size_t>(msa_len));
     for (int i = 0; i < msa_len; ++i) {
-        // longcallD: read_str[i] != 5 || cons_str[i] != 5
+        // Skip positions where both are gaps.
         if (read_row[i] != 5 || cons_row[i] != 5) {
             out.target_aln.push_back(cons_row[i]);
             out.query_aln .push_back(read_row[i]);
@@ -1085,7 +1085,7 @@ int make_cons_read_aln_str(const uint8_t* cons_row, const uint8_t* read_row,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// make_ref_read_aln_str  (mirrors longcallD align.c)
+// Build reference-vs-read alignment string from WFA2 output.
 // ════════════════════════════════════════════════════════════════════════════
 
 int make_ref_read_aln_str(const Options& opts, const AlnStr& ref_cons,
@@ -1154,7 +1154,7 @@ int make_ref_read_aln_str(const Options& opts, const AlnStr& ref_cons,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// abpoa_aln_msa_cons  (mirrors longcallD align.c)
+// Full-length abPOA MSA consensus from a set of reads.
 // ════════════════════════════════════════════════════════════════════════════
 
 int abpoa_aln_msa_cons(const Options& opts, int n_reads,
@@ -1172,7 +1172,7 @@ int abpoa_aln_msa_cons(const Options& opts, int n_reads,
     abpoa_para_t* abpt = abpoa_init_para();
     abpt->wb = -1;
     abpt->inc_path_score = 1;
-    // longcallD align.c abpoa_aln_msa_cons: out_msa toggled like lcd (we always collect MSA).
+    // Always collect MSA rows (needed for digar update).
     abpt->out_msa = 0;
     abpt->out_cons = 1;
     abpt->out_msa = 1;
@@ -1219,7 +1219,7 @@ int abpoa_aln_msa_cons(const Options& opts, int n_reads,
                 clu_read_ids[0][static_cast<size_t>(k)] = read_ids[static_cast<size_t>(k)];
         }
 
-        // Collect MSA rows split by cluster (longcallD align.c abpoa_aln_msa_cons: always
+        // Collect MSA rows split by cluster (always
         // abc->clu_read_ids[ci][k] -> abc->msa_base[src], never assume row k == input k).
         msa_seq_lens.resize(static_cast<size_t>(abc->n_cons));
         for (int ci = 0; ci < abc->n_cons; ++ci) {
@@ -1244,13 +1244,13 @@ int abpoa_aln_msa_cons(const Options& opts, int n_reads,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// abpoa_partial_aln_msa_cons  (mirrors longcallD align.c)
+// Partial-overlap abPOA MSA consensus (reads may not span full region).
 // ════════════════════════════════════════════════════════════════════════════
 
-// ── longcallD exact X-gap counting (edlib_xgaps) ─────────────────────────────
+// edlib X-gap counting for noisy-region read sampling.
 
 static int edlibAlignmentToXGAPS(const unsigned char* const alignment, const int alignmentLength) {
-    // Mirrors longcallD edlibAlignmentToXGAPS:
+    // Convert edlib alignment to X-gap count:
     // mismatch counts as 1; insert/delete counts as 1 per run (gap-open events).
     int n_gaps = 0, n_mismatch = 0;
     for (int i = 0; i < alignmentLength; i++) {
@@ -1277,7 +1277,7 @@ static int edlib_xgaps(const uint8_t* target, int tlen, const uint8_t* query, in
     return n_x_gaps;
 }
 
-// Mirrors longcallD collect_aln_beg_end (align.c) — SAM CIGAR from cigar_get_CIGAR(..., true).
+// Extract aligned region begin/end from a SAM CIGAR string.
 static void collect_aln_beg_end(const uint32_t* cigar_buf, int cigar_len, int ext_direction,
                                 int ref_len, int* ref_beg, int* ref_end,
                                 int read_len, int* read_beg, int* read_end) {
@@ -1536,7 +1536,7 @@ int abpoa_partial_aln_msa_cons(const Options& opts, int sampling_reads,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// wfa_collect_noisy_aln_str_no_ps_hap  (mirrors longcallD align.c)
+// WFA2 alignment of noisy-region reads without haplotype separation.
 // ════════════════════════════════════════════════════════════════════════════
 
 int wfa_collect_noisy_aln_str_no_ps_hap(const Options& opts, NoisyReadInfo& info,
@@ -1628,7 +1628,7 @@ int wfa_collect_noisy_aln_str_no_ps_hap(const Options& opts, NoisyReadInfo& info
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// wfa_collect_noisy_aln_str_with_ps_hap  (mirrors longcallD align.c)
+// WFA2 alignment of noisy-region reads with per-haplotype separation.
 // ════════════════════════════════════════════════════════════════════════════
 
 int wfa_collect_noisy_aln_str_with_ps_hap(const Options& opts, bool sampling_reads,
@@ -1683,7 +1683,7 @@ int wfa_collect_noisy_aln_str_with_ps_hap(const Options& opts, bool sampling_rea
         std::vector<std::vector<uint8_t>> out_msa;
 
         const int n_ps = static_cast<int>(ps_ids.size());
-        // longcallD passes global read ids into abPOA, not 0..n_ps-1.
+        // Pass global read ids into abPOA, not 0..n_ps-1.
         // This matters because abPOA cluster read-ids are propagated downstream.
         int ret = abpoa_partial_aln_msa_cons(opts, sampling_reads, n_ps,
                                              ps_ids, ps_seqs, ps_quals, ps_lens, ps_covers,
@@ -1763,10 +1763,10 @@ int wfa_collect_noisy_aln_str_with_ps_hap(const Options& opts, bool sampling_rea
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// collect_noisy_reg_aln_strs  (mirrors longcallD align.c / align.h)
+// Top-level noisy-region alignment: collect reads, align, build consensus.
 // ════════════════════════════════════════════════════════════════════════════
 
-int collect_noisy_reg_aln_strs(const Options& opts, BamChunk& chunk,
+int collect_noisy_reg_aln_strs(const Options& opts, PhasingChunk& chunk,
                                 hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                                 const std::vector<int>& noisy_read_ids,
                                 const std::vector<uint8_t>& ref_seq_vec,
@@ -1800,7 +1800,7 @@ int collect_noisy_reg_aln_strs(const Options& opts, BamChunk& chunk,
         std::fprintf(stderr, "BranchSelect ps=%" PRId64 " n_full_reads=%d n_reads=%d\n",
                      static_cast<int64_t>(ps), n_full_reads, info.n_reads);
     }
-    // longcallD align.c: collect_ref_read_aln_str = ((refine_bam && out_aln_fp) || out_somatic); pgPhase has no somatic port.
+    // Build ref-vs-read alignment strings when phased-BAM output is requested.
     const bool collect_ref_read_aln_str =
         (opts.refine_aln && !opts.output_aln.empty());
 
@@ -1816,7 +1816,7 @@ int collect_noisy_reg_aln_strs(const Options& opts, BamChunk& chunk,
             clu_n_seqs, clu_read_ids, aln_strs);
     }
 
-    // longcallD: if (n_cons > 0 && ((refine_bam && out_aln_fp) || out_somatic)) update_digars_from_aln_str(...)
+    // Update digars from MSA consensus when phased-BAM output is requested.
     if (n_cons > 0 && opts.refine_aln && !opts.output_aln.empty()) {
         update_digars_from_aln_str(chunk, noisy_reg_beg, noisy_reg_end,
                                    info.read_id_to_full_covers,

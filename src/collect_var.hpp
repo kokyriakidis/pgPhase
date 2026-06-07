@@ -1,14 +1,11 @@
 #ifndef PGPHASE_COLLECT_VAR_HPP
 #define PGPHASE_COLLECT_VAR_HPP
 
-/**
- * @file collect_var.hpp
- * @brief Candidate collection, intervals, noisy regions, and classification API.
- *
- * The public entry point for the per-chunk biological workflow is `collect_var_main`,
- * modeled after longcallD's numbered `collect_var_main` pipeline. Higher-level code
- * still owns BAM/FASTA I/O, chunk loading, threading, and output streaming.
- */
+// Candidate collection, intervals, noisy regions, and classification API.
+//
+// The public entry point for the per-chunk biological workflow is
+// collect_var_main.  Higher-level code owns BAM/FASTA I/O, chunk loading,
+// threading, and output streaming.
 
 #include "collect_types.hpp"
 
@@ -20,9 +17,7 @@ extern "C" {
 
 namespace pgphase_collect {
 
-/**
- * @brief Move-only RAII owner for heap-allocated `cgranges_t`.
- */
+// Move-only RAII owner for heap-allocated cgranges_t.
 struct CrangesOwner {
     cgranges_t* cr = nullptr;
     CrangesOwner() = default;
@@ -34,176 +29,93 @@ struct CrangesOwner {
         return *this;
     }
     ~CrangesOwner() { reset(); }
-    /** @brief Destroys held tree and nulls pointer. */
     void reset() { if (cr) { cr_destroy(cr); cr = nullptr; } }
-    /** @brief Replaces ownership with \a p (previous tree destroyed). */
     void adopt(cgranges_t* p) { reset(); if (p) cr = p; }
-    /** @brief Returns raw pointer and clears ownership without destroy. */
     cgranges_t* release() { cgranges_t* t = cr; cr = nullptr; return t; }
 };
 
-/**
- * @brief Total order on `VariantKey` (longcallD `exact_comp_var_site`).
- * @return Negative if `*var1 < *var2`, zero if equal, positive if greater.
- */
+// Total order on VariantKey: negative if *var1 < *var2, zero if equal, positive if greater.
 int exact_comp_var_site(const VariantKey* var1, const VariantKey* var2);
 
-/**
- * @brief Total order on candidates (longcallD `exact_comp_cand_var` → `make_var_site_from_cand_var` +
- *        `exact_comp_var_site`). Same chunk uses canonical `VariantKey` encoding as lcd `cand_var_t`.
- */
+// Total order on CandidateVariant via canonical VariantKey encoding.
 int exact_comp_cand_var(const CandidateVariant* var1, const CandidateVariant* var2);
 
-/**
- * @brief Same ordering with large-insertion fuzzy collapse (longcallD `exact_comp_var_site_ins`).
- * @param min_sv_len Length threshold for insertion fuzzy merge rule.
- * @return Negative / zero / positive as `exact_comp_var_site`.
- */
+// Same ordering with large-insertion fuzzy collapse: insertions within
+// min_sv_len of each other at the same position are treated as equivalent.
 int exact_comp_var_site_ins(const VariantKey* var1, const VariantKey* var2, int min_sv_len);
 
-/**
- * @brief Strict-weak ordering functor delegating to `exact_comp_var_site`.
- */
+// Strict-weak ordering functor delegating to exact_comp_var_site.
 struct VariantKeyLess {
     bool operator()(const VariantKey& lhs, const VariantKey& rhs) const;
 };
 
-/**
- * @brief Maps one `DigarOp` to a `VariantKey` (longcallD `make_var_site_from_digar`).
- * @param tid Read contig index.
- * @param op SNP/indel digar operation.
- */
+// Maps one DigarOp (SNP/indel alignment event) to a VariantKey.
 VariantKey variant_key_from_digar(int tid, const DigarOp& op);
 
-/**
- * @brief Sorts and deduplicates candidates using fuzzy large-insertion equivalence.
- * longcallD uses `exact_comp_var_site_ins` with `opt->min_sv_len` after sorting by locus.
- * SNP/INS ALT tie-break uses `nst_nt4_table`-encoded bytes (`memcmp` on `var_site_t.alt_seq`), not raw ASCII order (`seq.c`).
- * @param variants In/out table.
- * @param min_sv_len Minimum SV length threshold for fuzzy INS dedupe (LCD `opt->min_sv_len`).
- */
+// Sort and deduplicate candidates using fuzzy large-insertion equivalence.
+// SNP/INS ALT tie-break uses nt4-encoded bytes, not raw ASCII order.
 void collapse_fuzzy_large_insertions(CandidateTable& variants, int min_sv_len);
 
-/**
- * @brief Sort and drop rows whose `VariantKey` compares equal under `exact_comp_var_site` (memcmp-grade).
- *
- * Used when concatenating per-window candidate tables: longcallD emits one VCF stream per BAM chunk
- * (`call_var_main.c` step 2) and never applies `exact_comp_var_site_ins` across chunks — only per-chunk
- * `collect_all_cand_var_sites`. Cross-chunk dedupe must not fuzzy-merge large insertions.
- */
+// Sort and drop rows whose VariantKey compares equal under exact_comp_var_site.
+// Used when concatenating per-window candidate tables — cross-chunk dedupe
+// must not fuzzy-merge large insertions (only per-chunk collapse does that).
 void collapse_exact_duplicate_variants(CandidateTable& variants);
 
-/**
- * @brief Gathers candidate keys from digars overlapping `chunk`, then collapses fuzzy INS.
- * @param chunk 1-based inclusive region bounds.
- * @param reads Parsed reads for the chunk.
- * @param variants Output candidate rows (counts still zero).
- * @param min_sv_len Passed to fuzzy INS collapse (`exact_comp_var_site_ins` threshold).
- */
+// Gather candidate keys from digars overlapping the chunk region, then
+// collapse fuzzy large insertions.  Output counts are still zero.
 void collect_candidate_sites_from_records(const RegionChunk& chunk,
                                           const std::vector<ReadRecord>& reads,
                                           CandidateTable& variants,
                                           int min_sv_len);
 
-/**
- * @brief Fills allele/strand depth from digars vs sorted candidates.
- * @param reads Chunk reads.
- * @param variants Sorted candidate table.
- * @param min_bq Minimum base quality for high-quality alt tally.
- * @param min_sv_len Passed to `exact_comp_var_site_ins` (LCD `opt->min_sv_len`).
- */
+// Fill allele/strand depth from digars vs sorted candidates.
 void collect_allele_counts_from_records(const std::vector<ReadRecord>& reads,
                                         CandidateTable& variants,
                                         int min_bq,
                                         int min_sv_len);
 
-/**
- * @brief Sorts and merges overlapping/adjacent intervals; merged label is max of inputs.
- * @param intervals In/out vector.
- */
-void merge_intervals(std::vector<Interval>& intervals);
-
-/**
- * @brief Builds unindexed `cgranges_t` on synthetic contig `"cr"` (0-based half-open storage).
- * @return New tree or nullptr if nothing to add.
- */
+// Build an unindexed cgranges_t on synthetic contig "cr" (0-based half-open).
+// Returns nullptr if intervals is empty.
 cgranges_t* intervals_to_cr(const std::vector<Interval>& intervals);
 
-/**
- * @brief Reads intervals from contig `"cr"` into \a out.
- * @param cr Source tree (may be null).
- * @param out Cleared and filled with 1-based inclusive intervals.
- */
+// Read intervals from contig "cr" into out (1-based inclusive).
 void intervals_from_cr(const cgranges_t* cr, std::vector<Interval>& out);
 
-/**
- * @brief Indexed `cgranges_t` for one read's `noisy_regions`.
- */
+// Build an indexed cgranges_t for one read's noisy_regions.
 cgranges_t* build_read_noisy_cr(const ReadRecord& read);
 
-/**
- * @brief Reference span used for overlap and noisy logic (insertion is zero-width).
- * @param key Variant locus.
- * @param var_start Set to first reference base of span (1-based).
- * @param var_end Set to last reference base (may be `key.pos - 1` for INS).
- */
+// Reference span for overlap and noisy logic (insertion is zero-width).
 void variant_genomic_span(const VariantKey& key, hts_pos_t& var_start, hts_pos_t& var_end);
 
-/**
- * @brief Merges and filters read-level noisy intervals into `chunk.noisy_regions`.
- * @param chunk Chunk state with reads and optional low-complexity intervals.
- * @param opts Depth/ratio/merge thresholds.
- */
-/** @brief longcallD `pre_process_noisy_regs`: after sites + allele counts, before classification. */
-void pre_process_noisy_regs_pgphase(BamChunk& chunk, const Options& opts);
+// Merge and filter read-level noisy intervals into chunk.noisy_regions.
+// Called after candidate sites and allele counts, before classification.
+void pre_process_noisy_regs_pgphase(PhasingChunk& chunk, const Options& opts);
 
-/**
- * @brief Expands noisy intervals using classified candidates; re-merges (longcallD post-process).
- * @param chunk Chunk whose `noisy_regions` are updated.
- * @param cand Current candidate table (categories consulted).
- */
-void post_process_noisy_regs_pgphase(BamChunk& chunk, const CandidateTable& cand);
+// Expand noisy intervals using classified candidates and re-merge.
+// Called after classification to capture additional noisy spans.
+void post_process_noisy_regs_pgphase(PhasingChunk& chunk, const CandidateTable& cand);
 
-/**
- * @brief Sets category to `NonVariant` for sites fully contained in noisy spans (non-ONT).
- * @param chunk Chunk with candidates and `noisy_regions`.
- */
-void apply_noisy_containment_filter(BamChunk& chunk);
+// Set category to NonVariant for sites fully contained in noisy spans (non-ONT).
+void apply_noisy_containment_filter(PhasingChunk& chunk);
 
-/**
- * @brief Runs sdust on `chunk.ref_seq` slice to fill `low_complexity_regions`.
- * @param chunk Must have reference sequence loaded for the window.
- */
-void populate_low_complexity_intervals(BamChunk& chunk);
+// Run sdust on chunk.ref_seq to fill low_complexity_regions.
+void populate_low_complexity_intervals(PhasingChunk& chunk);
 
-/**
- * @brief Fills `ordered_read_ids` and unions per-read noisy intervals into the chunk list.
- * @param chunk Chunk whose `reads` are already populated.
- */
-void populate_chunk_read_indexes(BamChunk& chunk);
+// Fill ordered_read_ids and union per-read noisy intervals into the chunk list.
+void populate_chunk_read_indexes(PhasingChunk& chunk);
 
-/**
- * @brief Runs full candidate classification for one chunk (two-pass longcallD-shaped logic).
- * @param chunk Chunk with counts populated.
- * @param opts Technology and thresholds.
- * @param header BAM header (reserved for future use; currently unused).
- */
-void classify_chunk_candidates(BamChunk& chunk, const Options& opts, const bam_hdr_t* header);
+// Two-pass candidate classification: first pass assigns initial categories
+// (clean het/hom, low-cov, strand-bias, repeat-het), second pass applies
+// noisy-region adjustments and AF→LowCov rewrites.
+void classify_chunk_candidates(PhasingChunk& chunk, const Options& opts, const bam_hdr_t* header);
 
-/**
- * @brief Runs the longcallD-shaped per-chunk candidate collection pipeline.
- *
- * Expects `chunk.reads`, `chunk.ref_seq`, read indexes, low-complexity intervals, and
- * initial noisy regions to already be populated by the BAM/FASTA loading layer. The
- * numbered body in `collect_var.cpp` mirrors longcallD `collect_var_main`: collect
- * sites, count alleles, pre-process noisy spans, classify candidates, post-process
- * noisy spans, and apply final containment filtering.
- *
- * @param chunk Prepared chunk to fill/classify in place.
- * @param opts Collection and classification options.
- * @param header Primary BAM header for classification context.
- */
-void collect_var_main(BamChunk& chunk,
+// Per-chunk candidate collection pipeline: collect sites from digars, count
+// alleles, pre-process noisy spans, classify candidates, post-process noisy
+// spans, and apply final containment filtering.
+//
+// Expects chunk.reads, chunk.ref_seq, read indexes, low-complexity intervals,
+// and initial noisy regions to already be populated by the BAM/FASTA layer.
+void collect_var_main(PhasingChunk& chunk,
                       const Options& opts,
                       const bam_hdr_t* header);
 

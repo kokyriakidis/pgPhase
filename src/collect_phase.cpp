@@ -1,6 +1,6 @@
 /**
  * @file collect_phase.cpp
- * @brief k-means read-haplotype clustering, porting longcallD assign_hap.c.
+ * k-means read-haplotype clustering for diploid phasing.
  */
 
 #include "collect_phase.hpp"
@@ -19,16 +19,16 @@ extern "C" {
 
 namespace pgphase_collect {
 
-/** longcallD `LONGCALLD_DEF_PLOID` (assign_hap.c flip loop bound). */
+// Default ploidy (diploid).
 constexpr int kLongcalldDefPloid = 2;
 
-/** Read visit count / index: longcallD always uses `ordered_read_ids[i]` with `n_reads` slots. */
-static inline int read_visit_count(const BamChunk& chunk) {
+// Read visit count / index (one slot per read).
+static inline int read_visit_count(const PhasingChunk& chunk) {
     return chunk.ordered_read_ids.empty() ? static_cast<int>(chunk.reads.size())
                                          : static_cast<int>(chunk.ordered_read_ids.size());
 }
 
-static inline int read_at_visit_ord(const BamChunk& chunk, int ord) {
+static inline int read_at_visit_ord(const PhasingChunk& chunk, int ord) {
     return chunk.ordered_read_ids.empty() ? ord : chunk.ordered_read_ids[static_cast<size_t>(ord)];
 }
 
@@ -53,7 +53,7 @@ static bool parse_debug_site_pos(const std::string& site, hts_pos_t& pos_out) {
 // ════════════════════════════════════════════════════════════════════════════
 
 uint32_t category_to_flag(VariantCategory c) {
-    // longcallD collect_var.h `var_i_to_cate` values from classify_var_cate / classify_cand_vars.
+    // Map VariantCategory enum to its lcd_var_i_to_cate bitmask flag.
     switch (c) {
         case VariantCategory::LowCoverage:
             return kLongcalldLowCovVar;
@@ -72,7 +72,7 @@ uint32_t category_to_flag(VariantCategory c) {
         case VariantCategory::NoisyCandHom:
             return kCandNoisyCandHom;
         case VariantCategory::NoisyResolved:
-            return 0; // no LONGCALLD_* germline phasing category; LCD path does not assign this bit.
+            return 0; // unmapped category
         case VariantCategory::RepeatHetIndel:
             return kLongcalldRepHetVar;
         case VariantCategory::NonVariant:
@@ -82,18 +82,18 @@ uint32_t category_to_flag(VariantCategory c) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Helper functions (static, matching longcallD assign_hap.c internals)
+// Helper functions for k-means phasing.
 // ════════════════════════════════════════════════════════════════════════════
 
-// Mirrors longcallD read_init_hap_phase_set.
-static void read_init_hap_phase_set(BamChunk& chunk) {
+// Read_init_hap_phase_set.
+static void read_init_hap_phase_set(PhasingChunk& chunk) {
     for (size_t i = 0; i < chunk.reads.size(); ++i) {
         chunk.haps[i] = 0;
         chunk.phase_sets[i] = -1;
     }
 }
 
-/** Width of `hap_to_alle_profile[1/2]` (longcallD `n_uniq_alles` with optional `alle_covs`). */
+// Width of hap_to_alle_profile[1/2] (n_uniq_alles, or 2 if alle_covs is empty).
 static int variant_allele_slots(const CandidateVariant& var) {
     const VariantCounts& c = var.counts;
     if (c.n_uniq_alles > 0) return c.n_uniq_alles;
@@ -101,8 +101,8 @@ static int variant_allele_slots(const CandidateVariant& var) {
     return 2;
 }
 
-// Returns majority allele index or -1 if inconclusive (longcallD `get_var_init_max_cov_allele`).
-// Strict `>` on coverage so ties keep the lower index (ref-first), matching longcallD.
+// Returns majority allele index or -1 if inconclusive.
+// Strict > on coverage so ties keep the lower index (ref-first).
 static int get_var_init_max_cov_allele(bool is_ont, const CandidateVariant& var) {
     if (is_ont && var.is_homopolymer_indel) return -1;
     const VariantCounts& c = var.counts;
@@ -133,7 +133,7 @@ static int get_var_init_max_cov_allele(bool is_ont, const CandidateVariant& var)
 
 // Initialize hap_to_alle_profile (zeroed) and hap_to_cons_alle for all valid vars.
 // Hom vars get cons_alle[1]=cons_alle[2]=1; het vars get -1/-1.
-// Mirrors longcallD var_init_hap_profile_cons_allele.
+// Var_init_hap_profile_cons_allele.
 static void var_init_hap_profile_cons_allele(bool is_ont,
                                               CandidateTable& variants,
                                               const std::vector<int>& valid_var_idx) {
@@ -159,7 +159,7 @@ static void var_init_hap_profile_cons_allele(bool is_ont,
 }
 
 // Zero all hap allele profiles (0, 1, 2) for the valid vars; preserves cons_alle.
-// Mirrors longcallD var_init_hap_to_alle_profile (j = 0..PLOID).
+// Initialize per-haplotype allele count profiles to zero.
 static void var_init_hap_to_alle_profile(CandidateTable& variants,
                                           const std::vector<int>& valid_var_idx) {
     for (int vi : valid_var_idx) {
@@ -173,7 +173,7 @@ static void var_init_hap_to_alle_profile(CandidateTable& variants,
 
 // Pick pivot: deepest CleanHetSnp > CleanHetIndel > NoisyHetSnp > NoisyHetIndel.
 // Returns index into valid_var_idx, or -1.
-// Mirrors longcallD select_init_var.
+// Select_init_var.
 static int select_init_var(const CandidateTable& variants,
                             const std::vector<int>& valid_var_idx) {
     int snp_i = -1, indel_i = -1, noisy_snp_i = -1, noisy_indel_i = -1;
@@ -208,7 +208,7 @@ static int select_init_var(const CandidateTable& variants,
 }
 
 // Update hap_to_cons_alle[hap] via argmax of the allele profile, with ONT 67% guard.
-// Mirrors longcallD update_var_hap_to_cons_alle.
+// Update_var_hap_to_cons_alle.
 static void update_var_hap_to_cons_alle(bool is_ont, CandidateVariant& var, int hap) {
     if (hap == 0) return;
     const auto& prof = var.hap_to_alle_profile[hap];
@@ -227,7 +227,7 @@ static void update_var_hap_to_cons_alle(bool is_ont, CandidateVariant& var, int 
 // Score a read allele against the hap consensus; infers complement when one hap is unknown.
 // Returns +var_score (match), −var_score (mismatch), or 0 (no info).
 // Side effect: may set hap_to_cons_alle[hap] or [3-hap] when one is -1.
-// Mirrors longcallD read_to_cons_allele_score (`assign_hap.c`): var_score from `var_cate` equality.
+// Score a read against consensus alleles: +1 for agreement, -1 for conflict.
 static int read_to_cons_allele_score(CandidateVariant& var, int hap, uint32_t var_i_to_cate, int allele_i) {
     int var_score = 1;
     if (var_i_to_cate == kCandCleanHetSnp) var_score = 2;
@@ -243,8 +243,8 @@ static int read_to_cons_allele_score(CandidateVariant& var, int hap, uint32_t va
 // Assign a read to hap 1, 2, 0 (tied), or -1 (no informative variants).
 // Updates n_clean_agree_snps / n_clean_conflict_snps on the read (for max_hap only).
 // CleanHom variants contribute to agree/conflict stats but not to hap_scores.
-// Mirrors longcallD init_assign_read_hap_based_on_cons_alle.
-static int init_assign_read_hap(BamChunk& chunk, int read_i, uint32_t flags) {
+// Init_assign_read_hap_based_on_cons_alle.
+static int init_assign_read_hap(PhasingChunk& chunk, int read_i, uint32_t flags) {
     ReadRecord& read = chunk.reads[read_i];
     read.n_clean_agree_snps = 0;
     read.n_clean_conflict_snps = 0;
@@ -261,7 +261,7 @@ static int init_assign_read_hap(BamChunk& chunk, int read_i, uint32_t flags) {
         CandidateVariant& var = chunk.candidates[vi];
         const uint32_t vic = var.lcd_var_i_to_cate;
         if ((vic & flags) == 0) continue;
-        // longcallD init_assign_read_hap_based_on_cons_alle: HP-indel or NOISY_CAND_HOM only.
+        // HP-indel or noisy-hom candidates: score only, do not use as pivot.
         if (var.is_homopolymer_indel || vic == kCandNoisyCandHom) continue;
 
         const int aidx = prof.alleles[vi - prof.start_var_idx];
@@ -298,8 +298,8 @@ static int init_assign_read_hap(BamChunk& chunk, int read_i, uint32_t flags) {
 
 // Update allele profile + cons_alle for all vars a read covers (used in Phase 1).
 // hap==0 means unassigned — both hap 1 and 2 are updated identically.
-// Mirrors longcallD update_var_hap_profile_cons_alle_based_on_read_hap.
-static void update_var_hap_profile_cons_alle(BamChunk& chunk, bool is_ont,
+// Update_var_hap_profile_cons_alle_based_on_read_hap.
+static void update_var_hap_profile_cons_alle(PhasingChunk& chunk, bool is_ont,
                                               int read_i, int hap, uint32_t flags) {
     const ReadVariantProfile& prof = chunk.read_var_profile[read_i];
     if (prof.start_var_idx < 0) return;
@@ -322,8 +322,8 @@ static void update_var_hap_profile_cons_alle(BamChunk& chunk, bool is_ont,
 }
 
 // Update allele profile only for all vars a read covers (used in Phase 2).
-// Mirrors longcallD update_var_hap_profile_based_on_read_hap.
-static void update_var_hap_profile(BamChunk& chunk, int read_i, int hap, uint32_t flags) {
+// Update_var_hap_profile_based_on_read_hap.
+static void update_var_hap_profile(PhasingChunk& chunk, int read_i, int hap, uint32_t flags) {
     const ReadVariantProfile& prof = chunk.read_var_profile[read_i];
     if (prof.start_var_idx < 0) return;
     for (int vi = prof.start_var_idx; vi <= prof.end_var_idx; ++vi) {
@@ -342,8 +342,8 @@ static void update_var_hap_profile(BamChunk& chunk, int read_i, int hap, uint32_
 }
 
 // Returns 1=agree, 0=conflict, -1=uninformative.
-// Mirrors longcallD check_agree_haps.
-static int check_agree_haps(const BamChunk& chunk, int read_i, int hap, int var1, int var2) {
+// Check_agree_haps.
+static int check_agree_haps(const PhasingChunk& chunk, int read_i, int hap, int var1, int var2) {
     const ReadVariantProfile& prof = chunk.read_var_profile[read_i];
     if (var1 < prof.start_var_idx || var2 > prof.end_var_idx) return -1;
     if (hap == 0) return -1;
@@ -361,8 +361,8 @@ static int check_agree_haps(const BamChunk& chunk, int read_i, int hap, int var1
 
 // Phase-set assignment + flip for one k-means iteration.
 // Returns 1 if any flip occurred (changed), 0 if converged.
-// Mirrors longcallD iter_update_var_hap_cons_phase_set.
-static int iter_update_var_hap_cons_phase_set(BamChunk& chunk,
+// Iter_update_var_hap_cons_phase_set.
+static int iter_update_var_hap_cons_phase_set(PhasingChunk& chunk,
                                                const std::vector<int>& valid_var_idx,
                                                const Options& opts) {
     const int n = (int)valid_var_idx.size();
@@ -426,7 +426,7 @@ static int iter_update_var_hap_cons_phase_set(BamChunk& chunk,
             }
             if (flip == 1) {
                 changed = 1;
-                // longcallD: swap hap_to_cons_alle[hap] with [3-hap] for hap=1..LONGCALLD_DEF_PLOID
+                // Swap consensus alleles between hap 1 and hap 2.
                 // (with ploidy 2 this is two swaps → net identity; matches released assign_hap.c).
                 for (int hap = 1; hap <= kLongcalldDefPloid; ++hap) {
                     const int tmp = var.hap_to_cons_alle[hap];
@@ -441,8 +441,8 @@ static int iter_update_var_hap_cons_phase_set(BamChunk& chunk,
 }
 
 // Rebuild allele profiles and consensus; returns 1 if any cons_alle changed.
-// Mirrors longcallD iter_update_var_hap_to_cons_alle.
-static int iter_update_var_hap_to_cons_alle(BamChunk& chunk, bool is_ont,
+// Iter_update_var_hap_to_cons_alle.
+static int iter_update_var_hap_to_cons_alle(PhasingChunk& chunk, bool is_ont,
                                              const std::vector<int>& valid_var_idx,
                                              uint32_t flags) {
     const int n = (int)valid_var_idx.size();
@@ -480,8 +480,8 @@ static int iter_update_var_hap_to_cons_alle(BamChunk& chunk, bool is_ont,
 }
 
 // Assign per-read phase_sets from the first phased het var each read covers.
-// Mirrors longcallD update_read_phase_set.
-static void update_read_phase_set(BamChunk& chunk, const std::vector<bool>& var_is_valid) {
+// Update_read_phase_set.
+static void update_read_phase_set(PhasingChunk& chunk, const std::vector<bool>& var_is_valid) {
     for (int oi = 0; oi < read_visit_count(chunk); ++oi) {
         const int read_i = read_at_visit_ord(chunk, oi);
         if (read_i < 0 || static_cast<size_t>(read_i) >= chunk.reads.size()) continue;
@@ -506,7 +506,7 @@ static void update_read_phase_set(BamChunk& chunk, const std::vector<bool>& var_
 // Public entry point
 // ════════════════════════════════════════════════════════════════════════════
 
-void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
+void assign_hap_based_on_germline_het_vars_kmeans(PhasingChunk& chunk,
                                                    const Options& opts,
                                                    uint32_t flags) {
     const int n_cands = (int)chunk.candidates.size();
@@ -547,7 +547,7 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
         for (int idx = 0; idx < nv; ++idx) {
             const int vi = valid_var_idx[var_ii[idx]];
             const uint32_t vic = chunk.candidates[vi].lcd_var_i_to_cate;
-            // longcallD 1st loop: HOM vars not used in the 1st round.
+            // HOM variants are not used in the first round.
             if (vic == kCandCleanHom || vic == kCandNoisyCandHom) continue;
 
             const int64_t ovlp_n = cr_overlap(cr, "cr", vi, vi + 1, &ovlp_b, &max_b);
@@ -574,9 +574,9 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
     update_read_phase_set(chunk, var_is_valid);
 
     // Phase 4: fill hap_alt / hap_ref from finalized hap_to_cons_alle.
-    // Mirrors longcallD make_variants() allele-resolution logic (collect_var.c):
+    // Resolve hap_alt/hap_ref from finalized consensus alleles:
     //   both -1 -> fall back to hap_to_cons_alle[0] (hom_idx);
-    //   one -1  -> treat as ref (0), matching LONGCALLD_REF_ALLELE;
+    //   one -1  -> treat as ref (0);
     //   any non-zero allele index is treated as ALT for GT projection.
     for (auto& var : chunk.candidates) {
         int c1 = var.hap_to_cons_alle[1];
@@ -627,21 +627,17 @@ void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk,
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Chunk-boundary stitching (mirrors longcallD flip_variant_hap / stitch_var_main)
+// Chunk-boundary stitching: flip downstream hap labels when overlap reads disagree.
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * @brief Stitch one pair of adjacent chunks (strict longcallD flip_variant_hap).
- *
- * Mirrors the candidate phase-set merge and keeps read HP/PS in sync with the
- * final stitched phase sets. We update read-side assignments unconditionally so
- * every downstream output sees the same in-memory phasing.
- */
-static void apply_chunk_flip_and_merge(BamChunk& cur,
+// Stitch one pair of adjacent chunks: optionally flip hap labels in the
+// downstream chunk, then merge its phase set into the upstream chunk's PS.
+// Keeps both candidate and read-level HP/PS in sync.
+static void apply_chunk_flip_and_merge(PhasingChunk& cur,
                                        bool do_flip,
                                        hts_pos_t max_pre_ps,
                                        hts_pos_t min_cur_ps) {
-    // Mirrors collect_var.c: hap flip iff flip_hap && flip_cur_PS != -1.
+    // Flip hap labels when overlap reads voted for a flip and a valid PS exists.
     if (do_flip && min_cur_ps != INT64_MAX && min_cur_ps != static_cast<hts_pos_t>(-1)) {
         for (CandidateVariant& v : cur.candidates) {
             if (v.phase_set != min_cur_ps) continue;
@@ -664,11 +660,9 @@ static void apply_chunk_flip_and_merge(BamChunk& cur,
     }
 }
 
-/**
- * Mirrors longcallD `flip_variant_hap` guard order and overlap-read voting,
- * then updates candidate and read phase assignments together.
- */
-static bool flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
+// Overlap-read voting between adjacent chunks: count reads that agree vs
+// disagree on hap assignment, then flip + merge if disagreement wins.
+static bool flip_chunk_hap(PhasingChunk& pre, PhasingChunk& cur, const Options* opts) {
     (void)opts;
     if (pre.region.tid != cur.region.tid) return false;
 
@@ -734,7 +728,7 @@ static bool flip_chunk_hap(BamChunk& pre, BamChunk& cur, const Options* opts) {
 
 // The phased-alignment writer emits upstream-overlap reads from the previous chunk.
 // Copy only already-decided downstream HP/PS onto an unphased upstream owner.
-static void propagate_overlap_read_phase_to_output_owner(BamChunk& pre, const BamChunk& cur) {
+static void propagate_overlap_read_phase_to_output_owner(PhasingChunk& pre, const PhasingChunk& cur) {
     if (pre.region.tid != cur.region.tid) return;
     const size_t n_bams = std::min(pre.down_ovlp_read_i.size(), cur.up_ovlp_read_i.size());
     for (size_t bi = 0; bi < n_bams; ++bi) {
@@ -764,12 +758,12 @@ static void propagate_overlap_read_phase_to_output_owner(BamChunk& pre, const Ba
     }
 }
 
-void stitch_chunk_haps(std::vector<BamChunk>& chunks,
+void stitch_chunk_haps(std::vector<PhasingChunk>& chunks,
                        const Options* opts,
                        const PgbamSidecarData* pgbam_sidecar) {
     const bool use_pgbam = opts != nullptr && pgbam_sidecar != nullptr && !opts->pgbam_file.empty();
     if (use_pgbam) {
-        for (BamChunk& chunk : chunks) {
+        for (PhasingChunk& chunk : chunks) {
             stitch_phase_blocks_with_pgbam(chunk,
                                           *pgbam_sidecar,
                                           opts->pgbam_primary_min_winning_threads,

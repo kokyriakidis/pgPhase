@@ -53,8 +53,8 @@ int main() {
     build_opts.min_depth = 1;
     build_opts.min_alt_depth = 1;
 
-    std::vector<GraphBamChunkBuildResult> chunks;
-    chunks.push_back(build_graph_bam_chunk(catalog, rows, "chr1", 0, 300, 0, build_opts));
+    std::vector<GraphChunkBuildResult> chunks;
+    chunks.push_back(build_graph_chunk(catalog, rows, "chr1", 0, 300, 0, build_opts));
     ok &= check(chunks[0].chunk.candidates.size() == 2, "adapter builds two candidates");
     ok &= check(chunks[0].chunk.reads.size() == 4, "adapter builds four reads");
     ok &= check(chunks[0].chunk.read_var_profile.size() == 4, "adapter builds read profiles");
@@ -62,7 +62,7 @@ int main() {
 
     Options opts;
     opts.read_technology = ReadTechnology::Hifi;
-    phase_graph_bam_chunks(chunks, opts);
+    phase_graph_chunks(chunks, opts);
     ok &= check(chunks[0].chunk.candidates[0].phase_set > 0, "BAM k-means phases graph candidate");
     ok &= check(chunks[0].chunk.haps.size() == 4, "BAM k-means assigns graph read hap vector");
     for (int hap : chunks[0].chunk.haps) {
@@ -85,8 +85,8 @@ int main() {
     no_af_opts.min_alt_depth = 1;
     no_af_opts.min_af = 0.0;
     no_af_opts.max_af = 1.0;
-    GraphBamChunkBuildResult conditional_chunk =
-        build_graph_bam_chunk(conditional_catalog, conditional_rows, "chr1", 0, 200, 0, no_af_opts);
+    GraphChunkBuildResult conditional_chunk =
+        build_graph_chunk(conditional_catalog, conditional_rows, "chr1", 0, 200, 0, no_af_opts);
     ok &= check(conditional_chunk.chunk.reads.size() == 1,
                 "conditional child-only graph read is missing");
     ok &= check(!conditional_chunk.chunk.reads.empty() &&
@@ -129,8 +129,8 @@ int main() {
         af_rows.push_back({"af_hom_alt", "chr1", 200, "cross_read", 1});
 
         Options default_opts;  // min_depth=5, min_alt_depth=2, min_af=0.20, max_af=0.80
-        GraphBamChunkBuildResult af_chunk =
-            build_graph_bam_chunk(af_catalog, af_rows, "chr1", 0, 500, 0, default_opts);
+        GraphChunkBuildResult af_chunk =
+            build_graph_chunk(af_catalog, af_rows, "chr1", 0, 500, 0, default_opts);
 
         ok &= check(af_chunk.chunk.candidates.size() == 1,
                     "af filter: only het site survives");
@@ -177,8 +177,8 @@ int main() {
         tri_rows.push_back({"tri", "chr1", 100, "noise_read", 2});
 
         Options default_opts;
-        GraphBamChunkBuildResult tri_chunk =
-            build_graph_bam_chunk(tri_catalog, tri_rows, "chr1", 0, 200, 0, default_opts);
+        GraphChunkBuildResult tri_chunk =
+            build_graph_chunk(tri_catalog, tri_rows, "chr1", 0, 200, 0, default_opts);
 
         // Site survives: after dropping allele 2, alle_covs=[5,5], AF=0.5, total=10 >= min_depth=5
         ok &= check(tri_chunk.chunk.candidates.size() == 1,
@@ -222,7 +222,7 @@ int main() {
             tb_rows.push_back({"tri_both", "chr1", 100, "a2_" + std::to_string(i), 2});
 
         Options default_opts;
-        auto tb = build_graph_bam_chunk(tri_both_cat, tb_rows, "chr1", 0, 200, 0, default_opts);
+        auto tb = build_graph_chunk(tri_both_cat, tb_rows, "chr1", 0, 200, 0, default_opts);
 
         ok &= check(tb.chunk.candidates.size() == 2,
                     "multiallelic decomp: triallelic → 2 biallelic pairs");
@@ -266,7 +266,7 @@ int main() {
             pf_rows.push_back({"tri_pf", "chr1", 100, "a2_" + std::to_string(i), 2});
 
         Options default_opts;
-        auto pf = build_graph_bam_chunk(tri_pf_cat, pf_rows, "chr1", 0, 200, 0, default_opts);
+        auto pf = build_graph_chunk(tri_pf_cat, pf_rows, "chr1", 0, 200, 0, default_opts);
 
         ok &= check(pf.chunk.candidates.size() == 1,
                     "per-pair AF filter: only alt1 pair survives (alt2 high_af filtered)");
@@ -284,7 +284,7 @@ int main() {
     // A site whose ref_beg is at 0-based position 199 (1-based pos=200) spans the
     // boundary between chunk0=[0,200) and chunk1=[200,400).  The start-position
     // check assigns it only to chunk0.  The test pre-filters the catalog per chunk
-    // (mirroring the production path) so build_graph_bam_chunk receives only the
+    // (mirroring the production path) so build_graph_chunk receives only the
     // sites that belong to each chunk.
     {
         GraphSiteCatalog full_catalog;
@@ -320,10 +320,10 @@ int main() {
         }
 
         Options default_opts;
-        GraphBamChunkBuildResult chunk0 =
-            build_graph_bam_chunk(cat0, boundary_rows, "chr1", 0,   200, 0, default_opts);
-        GraphBamChunkBuildResult chunk1 =
-            build_graph_bam_chunk(cat1, boundary_rows, "chr1", 200, 400, 1, default_opts);
+        GraphChunkBuildResult chunk0 =
+            build_graph_chunk(cat0, boundary_rows, "chr1", 0,   200, 0, default_opts);
+        GraphChunkBuildResult chunk1 =
+            build_graph_chunk(cat1, boundary_rows, "chr1", 200, 400, 1, default_opts);
 
         // "left" (beg0=99) and "boundary" (beg0=199) both start in [0,200)
         ok &= check(chunk0.chunk.candidates.size() == 2,
@@ -336,7 +336,7 @@ int main() {
     }
 
     std::ostringstream sites;
-    write_graph_bam_phase_sites_tsv(sites, chunks);
+    write_graph_phase_sites_tsv(sites, chunks);
     ok &= check(sites.str().find("HAP1_ALLELE") != std::string::npos,
                 "BAM-derived graph phase site output");
     if (ok) {

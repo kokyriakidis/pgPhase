@@ -1,14 +1,9 @@
 #ifndef PGPHASE_COLLECT_PHASE_HPP
 #define PGPHASE_COLLECT_PHASE_HPP
 
-/**
- * @file collect_phase.hpp
- * @brief k-means read-haplotype clustering declarations for collect-bam-variation.
- *
- * Implements the germline phasing scaffold from longcallD's `assign_hap.c`:
- * iterative read→haplotype assignment driven by per-variant consensus allele
- * profiles (`hap_to_cons_alle`), up to 10 refinement rounds.
- */
+// k-means read-haplotype clustering: iterative read→haplotype assignment
+// driven by per-variant consensus allele profiles (hap_to_cons_alle),
+// up to 10 refinement rounds, plus cross-chunk stitching.
 
 #include "collect_types.hpp"
 
@@ -20,116 +15,71 @@ namespace pgphase_collect {
 // Candidate-category bitmask flags
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * @name Category flags
- * @brief Bitmask constants for `assign_hap_based_on_germline_het_vars_kmeans`.
- *
- * Values and composites are copied verbatim from longcallD `collect_var.h` (lines 11–27): the same
- * integers used for `var_i_to_cate[]` and `target_var_cate` in `assign_hap.c`.
- */
-///@{
-/** `LONGCALLD_LOW_COV_VAR` */
-constexpr uint32_t kLongcalldLowCovVar = 0x001u;
-/** `LONGCALLD_STRAND_BIAS_VAR` */
-constexpr uint32_t kLongcalldStrandBiasVar = 0x002u;
-/** `LONGCALLD_CLEAN_HET_SNP` */
-constexpr uint32_t kCandCleanHetSnp = 0x004u;
-/** `LONGCALLD_CLEAN_HET_INDEL` */
-constexpr uint32_t kCandCleanHetIndel = 0x008u;
-/** `LONGCALLD_REP_HET_VAR` */
-constexpr uint32_t kLongcalldRepHetVar = 0x010u;
-/** `LONGCALLD_CAND_SOMATIC_VAR` */
-constexpr uint32_t kLongcalldCandSomaticVar = 0x040u;
-/** `LONGCALLD_CLEAN_HOM_VAR` */
-constexpr uint32_t kCandCleanHom = 0x080u;
-/** `LONGCALLD_NOISY_CAND_HET_VAR` */
-constexpr uint32_t kCandNoisyCandHet = 0x100u;
-/** `LONGCALLD_NOISY_CAND_HOM_VAR` */
-constexpr uint32_t kCandNoisyCandHom = 0x200u;
-/** `LONGCALLD_LOW_AF_VAR` */
-constexpr uint32_t kLongcalldLowAfVar = 0x400u;
-/** `LONGCALLD_NON_VAR` */
-constexpr uint32_t kLongcalldNonVar = 0x800u;
+// Candidate-category bitmask flags for lcd_var_i_to_cate and k-means target selection.
+// Individual category bits:
+constexpr uint32_t kLongcalldLowCovVar      = 0x001u;  // low coverage / low alt depth
+constexpr uint32_t kLongcalldStrandBiasVar   = 0x002u;  // strand bias
+constexpr uint32_t kCandCleanHetSnp          = 0x004u;  // clean het SNP
+constexpr uint32_t kCandCleanHetIndel        = 0x008u;  // clean het indel
+constexpr uint32_t kLongcalldRepHetVar       = 0x010u;  // repeat/homopolymer het indel
+constexpr uint32_t kLongcalldCandSomaticVar  = 0x040u;  // candidate somatic variant
+constexpr uint32_t kCandCleanHom             = 0x080u;  // clean homozygous
+constexpr uint32_t kCandNoisyCandHet         = 0x100u;  // noisy-region MSA het
+constexpr uint32_t kCandNoisyCandHom         = 0x200u;  // noisy-region MSA hom
+constexpr uint32_t kLongcalldLowAfVar        = 0x400u;  // low allele fraction
+constexpr uint32_t kLongcalldNonVar          = 0x800u;  // non-variant placeholder
 
-/** `LONGCALLD_NOT_CAND_VAR_CATE` — skipped before `cr_is_contained` in classify compaction. */
+// Composite masks:
+// Categories excluded from noisy-region containment checks.
 constexpr uint32_t kLongcalldNotCandVarCate =
     kLongcalldNonVar | kLongcalldLowCovVar | kLongcalldStrandBiasVar;
-
-/** `LONGCALLD_CAND_HET_VAR_CATE` */
+// All het candidate categories.
 constexpr uint32_t kCandHetVarCate =
     kCandCleanHetSnp | kCandCleanHetIndel | kCandNoisyCandHet;
-
-/** `LONGCALLD_CAND_GERMLINE_CLEAN_VAR_CATE` */
+// Clean germline categories (used for VCF INFO CLEAN flag).
 constexpr uint32_t kCandGermlineClean = kCandCleanHetSnp | kCandCleanHetIndel | kCandCleanHom;
-
-/** `LONGCALLD_CAND_GERMLINE_VAR_CATE` */
+// All germline categories (clean + noisy-recalled).
 constexpr uint32_t kCandGermlineVarCate =
     kCandGermlineClean | kCandNoisyCandHet | kCandNoisyCandHom;
-///@}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Public interface
 // ════════════════════════════════════════════════════════════════════════════
 
-/**
- * @brief Maps a `VariantCategory` to its bitmask flag (0 for unmapped categories).
- */
+// Maps a VariantCategory enum to its bitmask flag (0 for unmapped categories).
 uint32_t category_to_flag(VariantCategory c);
 
-/**
- * @brief Stitch haplotype assignments across chunk boundaries.
- *
- * Matches longcallD `stitch_var_main` exactly: for each adjacent pair on the same contig,
- * calls `flip_variant_hap` logic only — overlapping boundary reads (`down_ovlp_read_i` /
- * `up_ovlp_read_i`, same pairing order as longcallD load) vote on orientation; when the
- * vote is decisive (`flip_hap_score != 0`), applies `update_chunk_var_hap_phase_set1` and,
- * only if phased alignment output is requested (`opts != nullptr &&
- * !opts->output_aln.empty()`, analogous to `opt->out_aln_fp != NULL`), read-level hap/PS updates.
- *
- * When `pgbam_sidecar` is provided through `--pgbam-file`, annotated-BAM `hs` tags and sidecar
- * thread IDs are used to merge phase blocks that lack decisive common-read overlap.
- *
- * @param chunks Ordered, adjacent `BamChunk` objects, each already phased by k-means.
- */
-void stitch_chunk_haps(std::vector<BamChunk>& chunks,
+// Stitch haplotype assignments across chunk boundaries.  For each adjacent
+// pair on the same contig, overlapping boundary reads vote on whether the
+// downstream chunk's hap labels should be flipped.  When the vote is decisive,
+// candidate and read-level hap/PS assignments are updated.
+//
+// When pgbam_sidecar is provided, annotated-BAM thread IDs are used to merge
+// phase blocks that lack decisive common-read overlap.
+void stitch_chunk_haps(std::vector<PhasingChunk>& chunks,
                        const Options* opts = nullptr,
                        const PgbamSidecarData* pgbam_sidecar = nullptr);
 
-/**
- * @brief Assign haplotypes and phase sets to reads via iterative k-means clustering.
- *
- * Mirrors longcallD `assign_hap_based_on_germline_het_vars_kmeans` from `assign_hap.c`.
- *
- * @note Parity is with **assign_hap.c**: `flags` is a `LONGCALLD_*` composite (`target_var_cate`);
- *       masking uses `CandidateVariant::lcd_var_i_to_cate` (longcallD `var_i_to_cate[i]`), not
- *       `counts.category` alone — matching `assign_hap_based_on_germline_het_vars_kmeans` /
- *       `init_assign_read_hap_based_on_cons_alle` / `select_init_var` / profile updates.
- *       This function does **not** set VCF-style output; pgPhase additionally
- *       fills `hap_alt`/`hap_ref` after the k-means loop using logic shaped like longcallD
- *       `make_variants`, which downstream longcallD does in a separate pass.
- *
- * **Phase 1** — initial sweep from the highest-confidence pivot variant outward,
- * assigning each read to hap 1 or 2 based on the current per-variant consensus
- * allele profile (`hap_to_cons_alle`), and updating the profile after each assignment.
- *
- * **Phase 2** — up to 10 k-means iterations:
- *  - `iter_update_var_hap_cons_phase_set`: detect phase-set breaks (too few spanning reads)
- *    and flip `hap_to_cons_alle[1]/[2]` when conflict reads outnumber agreement reads.
- *  - `iter_update_var_hap_to_cons_alle`: re-assign all reads from scratch and rebuild
- *    allele profiles; stop early if consensus alleles converge.
- *
- * **Phase 3** — assign `chunk.phase_sets[read_i]` from the first phased het variant
- * each read overlaps.
- *
- * **Phase 4** — fill `hap_alt` / `hap_ref` on every `CandidateVariant` from the
- * finalized `hap_to_cons_alle[1..2]` (0=ref, 1=alt, −1=unresolved).
- *
- * @param chunk    Working chunk; `read_var_profile` and `read_var_cr` must be populated
- *                 by `collect_read_var_profile` before calling this function.
- * @param opts     Thresholds — `is_ont()` controls the ONT homopolymer 67% guard.
- * @param flags    Bitmask of `kCand*` constants selecting which categories participate.
- */
-void assign_hap_based_on_germline_het_vars_kmeans(BamChunk& chunk, const Options& opts, uint32_t flags);
+// Assign haplotypes and phase sets to reads via iterative k-means clustering.
+//
+// Phase 1: initial sweep from the highest-confidence pivot variant outward,
+//   assigning each read to hap 1 or 2 based on per-variant consensus allele
+//   profiles (hap_to_cons_alle), updating profiles after each assignment.
+//
+// Phase 2: up to 10 k-means iterations — detect phase-set breaks, flip
+//   consensus alleles when conflict reads outnumber agreement, re-assign all
+//   reads and rebuild profiles.  Stops early on convergence.
+//
+// Phase 3: assign chunk.phase_sets[read_i] from the first phased het variant
+//   each read overlaps.
+//
+// Phase 4: fill hap_alt/hap_ref on every CandidateVariant from the finalized
+//   consensus alleles (0=ref, 1=alt, -1=unresolved).
+//
+// `flags` is a bitmask of kCand* constants selecting which candidate categories
+// participate.  Masking uses lcd_var_i_to_cate, not counts.category.
+// read_var_profile and read_var_cr must be populated before calling.
+void assign_hap_based_on_germline_het_vars_kmeans(PhasingChunk& chunk, const Options& opts, uint32_t flags);
 
 } // namespace pgphase_collect
 
