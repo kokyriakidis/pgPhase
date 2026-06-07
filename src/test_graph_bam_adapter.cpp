@@ -39,14 +39,14 @@ int main() {
     catalog.sites.push_back(make_site("s2", 200, ">5>6>7", ">5>8>7"));
 
     std::vector<GraphReadAllele> rows = {
-        {"s1", "chr1", 100, "read_a", 0, ">1>2>3"},
-        {"s2", "chr1", 200, "read_a", 0, ">5>6>7"},
-        {"s1", "chr1", 100, "read_b", 0, ">1>2>3"},
-        {"s2", "chr1", 200, "read_b", 0, ">5>6>7"},
-        {"s1", "chr1", 100, "read_c", 1, ">1>4>3"},
-        {"s2", "chr1", 200, "read_c", 1, ">5>8>7"},
-        {"s1", "chr1", 100, "read_d", 1, ">1>4>3"},
-        {"s2", "chr1", 200, "read_d", 1, ">5>8>7"},
+        {"s1", "chr1", 100, "read_a", 0},
+        {"s2", "chr1", 200, "read_a", 0},
+        {"s1", "chr1", 100, "read_b", 0},
+        {"s2", "chr1", 200, "read_b", 0},
+        {"s1", "chr1", 100, "read_c", 1},
+        {"s2", "chr1", 200, "read_c", 1},
+        {"s1", "chr1", 100, "read_d", 1},
+        {"s2", "chr1", 200, "read_d", 1},
     };
 
     Options build_opts;
@@ -76,9 +76,9 @@ int main() {
     child.conditional_parent_alleles = {1};
     conditional_catalog.sites.push_back(child);
     std::vector<GraphReadAllele> conditional_rows = {
-        {"child", "chr1", 110, "child_only", 1, ">20>23>22"},
-        {"parent", "chr1", 100, "with_parent", 1, ">10>13>12"},
-        {"child", "chr1", 110, "with_parent", 1, ">20>23>22"},
+        {"child", "chr1", 110, "child_only", 1},
+        {"parent", "chr1", 100, "with_parent", 1},
+        {"child", "chr1", 110, "with_parent", 1},
     };
     Options no_af_opts;
     no_af_opts.min_depth = 1;
@@ -108,25 +108,25 @@ int main() {
         std::vector<GraphReadAllele> af_rows;
         // af_het: 4 ref + 4 alt → total=8, AF=0.5 → passes
         for (int i = 0; i < 4; ++i) {
-            af_rows.push_back({"af_het", "chr1", 100, "het_ref_" + std::to_string(i), 0, ">1>2>3"});
-            af_rows.push_back({"af_het", "chr1", 100, "het_alt_" + std::to_string(i), 1, ">1>4>3"});
+            af_rows.push_back({"af_het", "chr1", 100, "het_ref_" + std::to_string(i), 0});
+            af_rows.push_back({"af_het", "chr1", 100, "het_alt_" + std::to_string(i), 1});
         }
         // af_hom_alt: 6 alt reads → AF=1.0 > max_af → filtered
         for (int i = 0; i < 6; ++i)
-            af_rows.push_back({"af_hom_alt", "chr1", 200, "hom_" + std::to_string(i), 1, ">5>8>7"});
+            af_rows.push_back({"af_hom_alt", "chr1", 200, "hom_" + std::to_string(i), 1});
         // af_low_depth: 2 ref + 2 alt → total=4 < min_depth=5 → filtered
         for (int i = 0; i < 2; ++i) {
-            af_rows.push_back({"af_low_depth", "chr1", 300, "ld_ref_" + std::to_string(i), 0, ">9>10>11"});
-            af_rows.push_back({"af_low_depth", "chr1", 300, "ld_alt_" + std::to_string(i), 1, ">9>12>11"});
+            af_rows.push_back({"af_low_depth", "chr1", 300, "ld_ref_" + std::to_string(i), 0});
+            af_rows.push_back({"af_low_depth", "chr1", 300, "ld_alt_" + std::to_string(i), 1});
         }
         // af_low_alt: 6 ref + 1 alt → alt=1 < min_alt_depth=2 → filtered
         for (int i = 0; i < 6; ++i)
-            af_rows.push_back({"af_low_alt", "chr1", 400, "la_ref_" + std::to_string(i), 0, ">13>14>15"});
-        af_rows.push_back({"af_low_alt", "chr1", 400, "la_alt_0", 1, ">13>16>15"});
+            af_rows.push_back({"af_low_alt", "chr1", 400, "la_ref_" + std::to_string(i), 0});
+        af_rows.push_back({"af_low_alt", "chr1", 400, "la_alt_0", 1});
         // cross_read: observes af_het (allele 0) and af_hom_alt (allele 1);
         // after filter only the af_het observation survives in its profile
-        af_rows.push_back({"af_het",     "chr1", 100, "cross_read", 0, ">1>2>3"});
-        af_rows.push_back({"af_hom_alt", "chr1", 200, "cross_read", 1, ">5>8>7"});
+        af_rows.push_back({"af_het",     "chr1", 100, "cross_read", 0});
+        af_rows.push_back({"af_hom_alt", "chr1", 200, "cross_read", 1});
 
         Options default_opts;  // min_depth=5, min_alt_depth=2, min_af=0.20, max_af=0.80
         GraphBamChunkBuildResult af_chunk =
@@ -169,12 +169,12 @@ int main() {
         std::vector<GraphReadAllele> tri_rows;
         // allele 0 (ref): 5 reads
         for (int i = 0; i < 5; ++i)
-            tri_rows.push_back({"tri", "chr1", 100, "ref_" + std::to_string(i), 0, ">1>2>3"});
+            tri_rows.push_back({"tri", "chr1", 100, "ref_" + std::to_string(i), 0});
         // allele 1 (alt1): 5 reads — passes min_alt_depth=2
         for (int i = 0; i < 5; ++i)
-            tri_rows.push_back({"tri", "chr1", 100, "alt1_" + std::to_string(i), 1, ">1>4>3"});
+            tri_rows.push_back({"tri", "chr1", 100, "alt1_" + std::to_string(i), 1});
         // allele 2 (alt2): 1 read — below min_alt_depth=2, must be dropped
-        tri_rows.push_back({"tri", "chr1", 100, "noise_read", 2, ">1>5>3"});
+        tri_rows.push_back({"tri", "chr1", 100, "noise_read", 2});
 
         Options default_opts;
         GraphBamChunkBuildResult tri_chunk =
@@ -214,12 +214,12 @@ int main() {
 
         std::vector<GraphReadAllele> tb_rows;
         for (int i = 0; i < 5; ++i)
-            tb_rows.push_back({"tri_both", "chr1", 100, "ref_" + std::to_string(i), 0, ">1>2>3"});
-        tb_rows.push_back({"tri_both", "chr1", 100, "ref_cross", 0, ">1>2>3"});
+            tb_rows.push_back({"tri_both", "chr1", 100, "ref_" + std::to_string(i), 0});
+        tb_rows.push_back({"tri_both", "chr1", 100, "ref_cross", 0});
         for (int i = 0; i < 5; ++i)
-            tb_rows.push_back({"tri_both", "chr1", 100, "a1_" + std::to_string(i), 1, ">1>4>3"});
+            tb_rows.push_back({"tri_both", "chr1", 100, "a1_" + std::to_string(i), 1});
         for (int i = 0; i < 5; ++i)
-            tb_rows.push_back({"tri_both", "chr1", 100, "a2_" + std::to_string(i), 2, ">1>5>3"});
+            tb_rows.push_back({"tri_both", "chr1", 100, "a2_" + std::to_string(i), 2});
 
         Options default_opts;
         auto tb = build_graph_bam_chunk(tri_both_cat, tb_rows, "chr1", 0, 200, 0, default_opts);
@@ -258,12 +258,12 @@ int main() {
 
         std::vector<GraphReadAllele> pf_rows;
         for (int i = 0; i < 5; ++i)
-            pf_rows.push_back({"tri_pf", "chr1", 100, "ref_" + std::to_string(i), 0, ">1>2>3"});
+            pf_rows.push_back({"tri_pf", "chr1", 100, "ref_" + std::to_string(i), 0});
         for (int i = 0; i < 5; ++i)
-            pf_rows.push_back({"tri_pf", "chr1", 100, "a1_" + std::to_string(i), 1, ">1>4>3"});
+            pf_rows.push_back({"tri_pf", "chr1", 100, "a1_" + std::to_string(i), 1});
         // alt2: 50 reads → AF = 50/55 > max_af=0.80 → pair filtered
         for (int i = 0; i < 50; ++i)
-            pf_rows.push_back({"tri_pf", "chr1", 100, "a2_" + std::to_string(i), 2, ">1>5>3"});
+            pf_rows.push_back({"tri_pf", "chr1", 100, "a2_" + std::to_string(i), 2});
 
         Options default_opts;
         auto pf = build_graph_bam_chunk(tri_pf_cat, pf_rows, "chr1", 0, 200, 0, default_opts);
@@ -282,13 +282,30 @@ int main() {
 
     // --- Chunk boundary: site assigned to exactly one chunk ---
     // A site whose ref_beg is at 0-based position 199 (1-based pos=200) spans the
-    // boundary between chunk0=[0,200) and chunk1=[200,400).  The old overlap check
-    // included it in both; the start-position check assigns it only to chunk0.
+    // boundary between chunk0=[0,200) and chunk1=[200,400).  The start-position
+    // check assigns it only to chunk0.  The test pre-filters the catalog per chunk
+    // (mirroring the production path) so build_graph_bam_chunk receives only the
+    // sites that belong to each chunk.
     {
-        GraphSiteCatalog boundary_catalog;
-        boundary_catalog.sites.push_back(make_site("left",     100, ">1>2>3",  ">1>4>3"));
-        boundary_catalog.sites.push_back(make_site("boundary", 200, ">5>6>7",  ">5>8>7"));
-        boundary_catalog.sites.push_back(make_site("right",    300, ">9>10>11",">9>12>11"));
+        GraphSiteCatalog full_catalog;
+        full_catalog.sites.push_back(make_site("left",     100, ">1>2>3",  ">1>4>3"));
+        full_catalog.sites.push_back(make_site("boundary", 200, ">5>6>7",  ">5>8>7"));
+        full_catalog.sites.push_back(make_site("right",    300, ">9>10>11",">9>12>11"));
+
+        // Pre-filter catalog per chunk interval (same as production path).
+        auto filter_catalog = [](const GraphSiteCatalog& cat,
+                                 hts_pos_t beg, hts_pos_t end) {
+            GraphSiteCatalog out;
+            for (const GraphSite& site : cat.sites) {
+                const hts_pos_t site_beg0 =
+                    (site.ref_beg > 0 ? site.ref_beg : site.pos) - 1;
+                if (site_beg0 >= beg && site_beg0 < end)
+                    out.sites.push_back(site);
+            }
+            return out;
+        };
+        GraphSiteCatalog cat0 = filter_catalog(full_catalog, 0, 200);
+        GraphSiteCatalog cat1 = filter_catalog(full_catalog, 200, 400);
 
         // Give every site 6 ref + 6 alt reads so all pass default depth/AF filters.
         std::vector<GraphReadAllele> boundary_rows;
@@ -296,17 +313,17 @@ int main() {
                  {"left",100}, {"boundary",200}, {"right",300}}) {
             for (int i = 0; i < 6; ++i) {
                 boundary_rows.push_back({sid, "chr1", pos,
-                                         sid + "_ref_" + std::to_string(i), 0, ""});
+                                         sid + "_ref_" + std::to_string(i), 0});
                 boundary_rows.push_back({sid, "chr1", pos,
-                                         sid + "_alt_" + std::to_string(i), 1, ""});
+                                         sid + "_alt_" + std::to_string(i), 1});
             }
         }
 
         Options default_opts;
         GraphBamChunkBuildResult chunk0 =
-            build_graph_bam_chunk(boundary_catalog, boundary_rows, "chr1", 0,   200, 0, default_opts);
+            build_graph_bam_chunk(cat0, boundary_rows, "chr1", 0,   200, 0, default_opts);
         GraphBamChunkBuildResult chunk1 =
-            build_graph_bam_chunk(boundary_catalog, boundary_rows, "chr1", 200, 400, 1, default_opts);
+            build_graph_bam_chunk(cat1, boundary_rows, "chr1", 200, 400, 1, default_opts);
 
         // "left" (beg0=99) and "boundary" (beg0=199) both start in [0,200)
         ok &= check(chunk0.chunk.candidates.size() == 2,

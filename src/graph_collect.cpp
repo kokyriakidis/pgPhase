@@ -42,24 +42,36 @@ static std::string graph_site_key_str(const GraphSite& site, size_t /*index*/) {
     return site.chrom + ":" + std::to_string(site.pos) + ":" + site.ref;
 }
 
-static bool graph_site_starts_in_interval(const GraphSite& site,
-                                          const std::string& contig,
-                                          hts_pos_t beg,
-                                          hts_pos_t end) {
-    const std::string site_contig = site.ref_contig.empty() ? site.chrom : site.ref_contig;
-    if (!contig.empty() && site_contig != contig) return false;
-    const hts_pos_t site_beg0 = (site.ref_beg > 0 ? site.ref_beg : site.pos) - 1;
-    return site_beg0 >= beg && site_beg0 < end;
+// Pre-filter catalog to a single contig, returning indices into the original.
+// Called once per batch (all chunks in a batch share the same contig).
+static std::vector<size_t> filter_catalog_indices_for_contig(
+    const GraphSiteCatalog& catalog, const std::string& contig) {
+    std::vector<size_t> indices;
+    for (size_t i = 0; i < catalog.sites.size(); ++i) {
+        const GraphSite& site = catalog.sites[i];
+        const std::string& site_contig = site.ref_contig.empty() ? site.chrom : site.ref_contig;
+        if (contig.empty() || site_contig == contig)
+            indices.push_back(i);
+    }
+    return indices;
 }
 
-static GraphSiteCatalog filter_graph_catalog_for_interval(const GraphSiteCatalog& catalog,
-                                                          const std::string& contig,
-                                                          hts_pos_t beg,
-                                                          hts_pos_t end) {
+// Build a chunk catalog from pre-filtered contig indices + position range.
+// Only copies sites that fall within [beg, end), avoiding a full catalog scan.
+static GraphSiteCatalog build_chunk_catalog_from_indices(
+    const GraphSiteCatalog& catalog,
+    const std::vector<size_t>& contig_indices,
+    const std::string& contig,
+    hts_pos_t beg, hts_pos_t end) {
     GraphSiteCatalog out;
-    for (const GraphSite& site : catalog.sites) {
-        if (graph_site_starts_in_interval(site, contig, beg, end)) out.sites.push_back(site);
+    out.sites.reserve(contig_indices.size());  // upper bound
+    for (size_t idx : contig_indices) {
+        const GraphSite& site = catalog.sites[idx];
+        const hts_pos_t site_beg0 = (site.ref_beg > 0 ? site.ref_beg : site.pos) - 1;
+        if (site_beg0 >= beg && site_beg0 < end)
+            out.sites.push_back(site);
     }
+    (void)contig;
     return out;
 }
 
@@ -264,6 +276,18 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
     const size_t batch_size = batch_end - batch_begin;
     std::vector<GraphBamChunkBuildResult> graph_chunks(batch_size);
 
+    // All chunks in a batch share the same contig (reg_chunk_i). Pre-filter
+    // the catalog to that contig once to avoid scanning the full catalog per chunk.
+    const std::string batch_contig = header->target_name[chunks[batch_begin].tid];
+    const std::vector<size_t> contig_site_indices =
+        filter_catalog_indices_for_contig(catalog, batch_contig);
+
+    // Pre-compute the query contig (pangenome suffix) once for the batch.
+    const std::string batch_query_contig = [&]() -> std::string {
+        auto it = fai_full_to_suffix.find(batch_contig);
+        return (it != fai_full_to_suffix.end()) ? it->second : batch_contig;
+    }();
+
     const size_t worker_count = std::min<size_t>(static_cast<size_t>(opts.threads), batch_size);
     std::atomic<size_t> next_offset{0};
     std::exception_ptr first_error;
@@ -323,21 +347,15 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
                     const size_t offset = next_offset.fetch_add(1);
                     if (offset >= batch_size) break;
                     const RegionChunk& region = chunks[batch_begin + offset];
-                    const std::string contig_name = header->target_name[region.tid];
 
-                    // Strip pangenome sample prefix:
-                    // "CHM13#0#chr20" → "chr20"; plain "chr20" stays unchanged.
-                    const std::string query_contig = [&]() -> std::string {
-                        auto it = fai_full_to_suffix.find(contig_name);
-                        return (it != fai_full_to_suffix.end()) ? it->second : contig_name;
-                    }();
-                    GraphSiteCatalog chunk_catalog = filter_graph_catalog_for_interval(
-                        catalog, contig_name, region.beg - 1, region.end);
+                    GraphSiteCatalog chunk_catalog = build_chunk_catalog_from_indices(
+                        catalog, contig_site_indices, batch_contig,
+                        region.beg - 1, region.end);
 
                     std::vector<GraphReadAllele> chunk_rows;
                     if (!chunk_catalog.sites.empty()) {
                         chunk_rows = query_gbz_interval_gaf_ffi(
-                            gbz_h, gaf_h, ref_sample, query_contig,
+                            gbz_h, gaf_h, ref_sample, batch_query_contig,
                             region.beg - 1, region.end,
                             chunk_catalog, qconfig.min_mapq);
                     }
@@ -345,7 +363,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch(
                     graph_chunks[offset] = build_graph_bam_chunk(
                         chunk_catalog,
                         chunk_rows,
-                        contig_name,
+                        batch_contig,
                         region.beg - 1,
                         region.end,
                         region.chunk_id,
@@ -397,6 +415,15 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
     const size_t batch_size = batch_end - batch_begin;
     std::vector<GraphBamChunkBuildResult> graph_chunks(batch_size);
 
+    // Pre-filter catalog to the batch contig once (same optimization as FFI path).
+    const std::string batch_contig_gaf = header->target_name[chunks[batch_begin].tid];
+    const std::vector<size_t> contig_site_indices_gaf =
+        filter_catalog_indices_for_contig(catalog, batch_contig_gaf);
+    const std::string batch_query_contig_gaf = [&]() -> std::string {
+        auto it = fai_full_to_suffix.find(batch_contig_gaf);
+        return (it != fai_full_to_suffix.end()) ? it->second : batch_contig_gaf;
+    }();
+
     const size_t worker_count = std::min<size_t>(static_cast<size_t>(opts.threads), batch_size);
     std::atomic<size_t> next_offset{0};
     std::exception_ptr first_error;
@@ -411,25 +438,15 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
                     const size_t offset = next_offset.fetch_add(1);
                     if (offset >= batch_size) break;
                     const RegionChunk& region = chunks[batch_begin + offset];
-                    const std::string contig_name = header->target_name[region.tid];
 
-                    // The tabix index uses reference-suffix names ("chr20"),
-                    // while the header may use pangenome names ("CHM13#0#chr20").
-                    // scan_indexed_gaf_chunk handles this via
-                    // tbx_seq_tid_with_pangenome_fallback, but we also try
-                    // the suffix directly for a faster first lookup.
-                    const std::string query_contig = [&]() -> std::string {
-                        auto it = fai_full_to_suffix.find(contig_name);
-                        return (it != fai_full_to_suffix.end()) ? it->second : contig_name;
-                    }();
-
-                    GraphSiteCatalog chunk_catalog = filter_graph_catalog_for_interval(
-                        catalog, contig_name, region.beg - 1, region.end);
+                    GraphSiteCatalog chunk_catalog = build_chunk_catalog_from_indices(
+                        catalog, contig_site_indices_gaf, batch_contig_gaf,
+                        region.beg - 1, region.end);
 
                     std::vector<GraphReadAllele> chunk_rows;
                     if (!chunk_catalog.sites.empty()) {
                         chunk_rows = scan_indexed_gaf_chunk(
-                            gaf_file, query_contig,
+                            gaf_file, batch_query_contig_gaf,
                             region.beg - 1, region.end,
                             chunk_catalog, min_mapq);
                     }
@@ -437,7 +454,7 @@ static std::vector<GraphBamChunkBuildResult> process_graph_chunk_batch_indexed_g
                     graph_chunks[offset] = build_graph_bam_chunk(
                         chunk_catalog,
                         chunk_rows,
-                        contig_name,
+                        batch_contig_gaf,
                         region.beg - 1,
                         region.end,
                         region.chunk_id,
@@ -585,7 +602,7 @@ void run_collect_graph_variation(const Options& opts) {
     }
 
     // 4a. Normalize site chrom/ref_contig to match the FAI naming convention.
-    //     After this, all downstream comparisons (site_starts_in_interval, contig_to_tid,
+    //     After this, all downstream comparisons (catalog filtering, contig_to_tid,
     //     build_site_to_chunk_map) use exact string matching with no special cases.
     //     The remap covers both directions detected above.
     {

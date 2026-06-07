@@ -15,7 +15,6 @@ struct GraphReadAllele {
     hts_pos_t pos = 0;
     std::string read_name;
     int allele = kGraphAlleleMissing;
-    std::string walk;
     int mapq = 255;
     bool reverse = false; // true when the read traverses the snarl in reverse-complement
 };

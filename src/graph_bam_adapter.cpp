@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <numeric>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -35,16 +36,6 @@ std::string site_key(const GraphSite& site, size_t /*index*/) {
 // Assigns a site to the chunk whose half-open interval [beg, end) contains the
 // site's start position.  Using start-position (not overlap) ensures each site
 // lands in exactly one chunk even when a snarl spans a chunk boundary.
-bool site_starts_in_interval(const GraphSite& site,
-                              const std::string& contig,
-                              hts_pos_t beg,
-                              hts_pos_t end) {
-    const std::string site_contig = site.ref_contig.empty() ? site.chrom : site.ref_contig;
-    if (!contig.empty() && site_contig != contig) return false;
-    const hts_pos_t site_beg0 = (site.ref_beg > 0 ? site.ref_beg : site.pos) - 1;
-    return site_beg0 >= beg && site_beg0 < end;
-}
-
 bool graph_site_has_released_walk_storage(const GraphSite& site) {
     if (!site.eligible || site.allele_walks.size() < 2) return false;
     return std::all_of(site.allele_walks.begin(), site.allele_walks.end(),
@@ -128,15 +119,6 @@ void rebuild_read_var_cr(BamChunk& chunk) {
     }
     cr_index(cr);
     chunk.read_var_cr.reset(cr);
-}
-
-std::unordered_map<std::string, int> read_index_by_name(const BamChunk& chunk) {
-    std::unordered_map<std::string, int> out;
-    out.reserve(chunk.reads.size());
-    for (size_t i = 0; i < chunk.reads.size(); ++i) {
-        out.emplace(chunk.reads[i].qname, static_cast<int>(i));
-    }
-    return out;
 }
 
 void write_observations(std::ostream& out,
@@ -250,16 +232,9 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
                                                hts_pos_t end,
                                                int chunk_id,
                                                const Options& opts) {
-    // Build a local contig→tid map.  The graph pipeline processes one contig at a
-    // time, so this map always has a single entry and every site resolves to tid=0.
-    // The map keeps key.tid and region.tid in sync and makes multi-contig extension
-    // straightforward without any BAM header dependency.
-    std::unordered_map<std::string, int> contig_tid_map;
-    auto contig_tid = [&](const std::string& name) -> int {
-        auto [it, inserted] = contig_tid_map.emplace(name, static_cast<int>(contig_tid_map.size()));
-        return it->second;
-    };
-    const int chunk_tid = contig.empty() ? 0 : contig_tid(contig);
+    // The graph pipeline processes one contig at a time; all sites in the
+    // pre-filtered catalog share the same contig, so a single tid suffices.
+    const int chunk_tid = 0;
 
     GraphBamChunkBuildResult out;
     out.graph_phase_contig = contig;
@@ -290,7 +265,6 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     std::vector<size_t> catalog_site_idx_phase1;
     for (size_t site_i = 0; site_i < catalog.sites.size(); ++site_i) {
         const GraphSite& site = catalog.sites[site_i];
-        if (!site_starts_in_interval(site, contig, beg, end)) continue;
         const std::string sid = site_key(site, site_i);
         if (!site.eligible) {
             out.filtered_sites.push_back({sid, 0, 0, 0, 0.0, "precandidate_ineligible"});
@@ -312,10 +286,8 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         rev_strand_counts.emplace_back(static_cast<size_t>(n_alleles), 0);
         parent_candidate.push_back(-1);
         conditional_parent_alleles.push_back(site.conditional_parent_alleles);
-        const std::string& site_contig = site.ref_contig.empty() ? site.chrom : site.ref_contig;
-        const int site_tid = site_contig.empty() ? chunk_tid : contig_tid(site_contig);
         catalog_site_idx_phase1.push_back(site_i);
-        add_graph_candidate(out, site, sid, allele_counts.back(), site_tid);
+        add_graph_candidate(out, site, sid, allele_counts.back(), chunk_tid);
     }
 
     for (size_t site_i = 0; site_i < catalog.sites.size(); ++site_i) {
@@ -328,11 +300,15 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         parent_candidate[static_cast<size_t>(child_it->second)] = parent_it->second;
     }
 
-    std::unordered_map<std::string, int> read_max_mapq;
-    for (const GraphReadAllele& row : rows) {
-        auto [it, inserted] = read_max_mapq.emplace(row.read_name, row.mapq);
-        if (!inserted && row.mapq > it->second) it->second = row.mapq;
-    }
+    // Intern read names into contiguous integer IDs to replace string-keyed maps.
+    std::unordered_map<std::string, uint32_t> read_name_to_id;
+    std::vector<std::string> read_id_to_name;
+    read_name_to_id.reserve(rows.size());
+    auto intern_read = [&](const std::string& name) -> uint32_t {
+        auto [it, inserted] = read_name_to_id.emplace(name, static_cast<uint32_t>(read_id_to_name.size()));
+        if (inserted) read_id_to_name.push_back(name);
+        return it->second;
+    };
 
     // Pack allele + reverse into a single int: low 16 bits = allele, bit 16 = reverse.
     // Conflict sentinel is -1 (allele < 0).
@@ -343,27 +319,70 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     auto unpack_allele = [](int packed) -> int { return packed & 0xFFFF; };
     auto unpack_reverse = [&](int packed) -> bool { return (packed & kRevBit) != 0; };
 
-    std::unordered_map<std::string, std::unordered_map<int, int>> allele_by_read_site;
+    // Single pass over rows: intern read names, track max mapq, and collect
+    // per-read site allele observations. Replaces three separate passes.
+    struct SiteAlleleEntry { int site_i; int packed; };
+    // Temporary per-row (rid, site_i, packed) triples; sorted into per-read
+    // vectors after the pass when n_reads is known.
+    struct RowTriple { uint32_t rid; int site_i; int packed; int mapq; };
+    std::vector<RowTriple> row_triples;
+    row_triples.reserve(rows.size());
     for (const GraphReadAllele& row : rows) {
+        const uint32_t rid = intern_read(row.read_name);
         auto it = site_to_candidate.find(row.site_id);
         if (it == site_to_candidate.end()) continue;
         const int site_i = it->second;
         CandidateVariant& candidate = out.chunk.candidates[static_cast<size_t>(site_i)];
         if (row.allele < 0 || row.allele >= candidate.counts.n_uniq_alles) continue;
-        std::unordered_map<int, int>& by_site = allele_by_read_site[row.read_name];
-        auto obs_it = by_site.find(site_i);
-        if (obs_it == by_site.end()) {
-            by_site.emplace(site_i, pack_allele_rev(row.allele, row.reverse));
-        } else if (obs_it->second >= 0 && unpack_allele(obs_it->second) != row.allele) {
-            obs_it->second = -1;  // conflict
+        row_triples.push_back({rid, site_i, pack_allele_rev(row.allele, row.reverse), row.mapq});
+    }
+    const uint32_t n_reads = static_cast<uint32_t>(read_id_to_name.size());
+
+    // Build max mapq and per-read allele vectors from the collected triples.
+    std::vector<int> read_max_mapq(n_reads, 0);
+    std::vector<std::vector<SiteAlleleEntry>> allele_by_read_site(n_reads);
+    for (const RowTriple& t : row_triples) {
+        if (t.mapq > read_max_mapq[t.rid]) read_max_mapq[t.rid] = t.mapq;
+        allele_by_read_site[t.rid].push_back({t.site_i, t.packed});
+    }
+    // Sort each read's entries by site_i, then deduplicate (mark conflicts as -1).
+    for (auto& entries : allele_by_read_site) {
+        if (entries.empty()) continue;
+        std::sort(entries.begin(), entries.end(),
+                  [](const SiteAlleleEntry& a, const SiteAlleleEntry& b) {
+                      return a.site_i < b.site_i;
+                  });
+        size_t out_i = 0;
+        for (size_t j = 1; j < entries.size(); ++j) {
+            if (entries[j].site_i == entries[out_i].site_i) {
+                // Same site: mark conflict if alleles differ.
+                if (entries[out_i].packed >= 0 &&
+                    unpack_allele(entries[out_i].packed) != unpack_allele(entries[j].packed)) {
+                    entries[out_i].packed = -1;
+                }
+            } else {
+                entries[++out_i] = entries[j];
+            }
         }
+        entries.resize(out_i + 1);
     }
 
-    std::unordered_map<std::string, std::vector<GraphProfileObservation>> read_obs;
-    for (const auto& read_item : allele_by_read_site) {
-        for (const auto& site_item : read_item.second) {
-            const int site_i = site_item.first;
-            const int packed = site_item.second;
+    // Binary search helper for sorted SiteAlleleEntry vectors.
+    auto find_site_entry = [](const std::vector<SiteAlleleEntry>& v, int site_i)
+        -> const SiteAlleleEntry* {
+        auto it = std::lower_bound(v.begin(), v.end(), site_i,
+                                   [](const SiteAlleleEntry& e, int s) { return e.site_i < s; });
+        if (it != v.end() && it->site_i == site_i) return &*it;
+        return nullptr;
+    };
+
+    // Build per-read observation lists, applying parent gating.
+    std::vector<std::vector<GraphProfileObservation>> read_obs(n_reads);
+    for (uint32_t rid = 0; rid < n_reads; ++rid) {
+        const auto& by_site = allele_by_read_site[rid];
+        for (const auto& entry : by_site) {
+            const int site_i = entry.site_i;
+            const int packed = entry.packed;
             if (packed < 0) continue;
             const int allele = unpack_allele(packed);
             const bool rev = unpack_reverse(packed);
@@ -371,9 +390,9 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
             const int parent_i = parent_candidate[static_cast<size_t>(site_i)];
             if (!conditional.empty()) {
                 if (parent_i < 0) continue;
-                auto parent_obs = read_item.second.find(parent_i);
-                if (parent_obs == read_item.second.end() || parent_obs->second < 0) continue;
-                const int parent_allele = unpack_allele(parent_obs->second);
+                const SiteAlleleEntry* parent_obs = find_site_entry(by_site, parent_i);
+                if (!parent_obs || parent_obs->packed < 0) continue;
+                const int parent_allele = unpack_allele(parent_obs->packed);
                 if (std::find(conditional.begin(), conditional.end(), parent_allele) ==
                     conditional.end()) {
                     continue;
@@ -383,7 +402,7 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
             auto& sc = rev ? rev_strand_counts[static_cast<size_t>(site_i)]
                            : fwd_strand_counts[static_cast<size_t>(site_i)];
             ++sc[static_cast<size_t>(allele)];
-            read_obs[read_item.first].push_back(GraphProfileObservation{site_i, allele});
+            read_obs[rid].push_back(GraphProfileObservation{site_i, allele});
         }
     }
 
@@ -610,9 +629,10 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
     // Allele 0 (ref) fans out to all new pairs from its original site (allele 0 in each).
     // Allele j (alt) maps to allele 1 in the one pair that holds alt j.
     // Observations at pruned candidates are dropped.
-    for (auto& [read_name, obs] : read_obs) {
+    for (uint32_t rid = 0; rid < n_reads; ++rid) {
+        auto& obs = read_obs[rid];
         std::vector<GraphProfileObservation> new_obs;
-        new_obs.reserve(obs.size());  // biallelic sites: exact; multiallelic: slight under-reserve
+        new_obs.reserve(obs.size());
         for (const auto& o : obs) {
             if (o.site_index < 0 || static_cast<size_t>(o.site_index) >= n_cands) continue;
             const size_t old_si = static_cast<size_t>(o.site_index);
@@ -652,13 +672,15 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         obs = std::move(new_obs);
     }
 
-    std::vector<std::string> read_obs_order;
-    read_obs_order.reserve(read_obs.size());
-    for (const auto& item : read_obs) read_obs_order.push_back(item.first);
-    std::sort(read_obs_order.begin(), read_obs_order.end());
+    // Build sorted read order by name for deterministic output.
+    std::vector<uint32_t> read_order(n_reads);
+    std::iota(read_order.begin(), read_order.end(), 0);
+    std::sort(read_order.begin(), read_order.end(),
+              [&](uint32_t a, uint32_t b) { return read_id_to_name[a] < read_id_to_name[b]; });
 
-    for (const std::string& read_name : read_obs_order) {
-        std::vector<GraphProfileObservation>& observations = read_obs[read_name];
+    for (uint32_t rid : read_order) {
+        auto& observations = read_obs[rid];
+        if (observations.empty()) continue;
         std::sort(observations.begin(), observations.end(),
                   [](const GraphProfileObservation& lhs, const GraphProfileObservation& rhs) {
                       if (lhs.site_index != rhs.site_index) return lhs.site_index < rhs.site_index;
@@ -676,9 +698,8 @@ GraphBamChunkBuildResult build_graph_bam_chunk(const GraphSiteCatalog& catalog,
         dedup.erase(std::remove_if(dedup.begin(), dedup.end(),
                                    [](const GraphProfileObservation& obs) { return obs.allele < 0; }),
                     dedup.end());
-        const auto mapq_it = read_max_mapq.find(read_name);
-        const int mapq = mapq_it != read_max_mapq.end() ? mapq_it->second : 255;
-        add_read_profile(out, read_name, dedup, mapq);
+        const int mapq = read_max_mapq[rid];
+        add_read_profile(out, read_id_to_name[rid], dedup, mapq);
     }
 
     out.chunk.haps.assign(out.chunk.reads.size(), 0);
@@ -741,41 +762,36 @@ void write_graph_bam_filtered_sites_tsv(std::ostream& out,
         write_graph_bam_filtered_sites_tsv_rows(out, gc);
 }
 
-void populate_graph_chunk_overlaps(std::vector<GraphBamChunkBuildResult>& graph_chunks) {
-    for (size_t i = 1; i < graph_chunks.size(); ++i) {
-        BamChunk& pre = graph_chunks[i - 1].chunk;
-        BamChunk& cur = graph_chunks[i].chunk;
-        pre.down_ovlp_read_i.assign(1, {});
-        cur.up_ovlp_read_i.assign(1, {});
-        pre.n_down_ovlp_skip_reads.assign(1, 0);
-        cur.n_up_ovlp_skip_reads.assign(1, 0);
-        const std::unordered_map<std::string, int> pre_reads = read_index_by_name(pre);
-        const std::unordered_map<std::string, int> cur_reads = read_index_by_name(cur);
-        for (const auto& item : cur_reads) {
-            auto pre_it = pre_reads.find(item.first);
-            if (pre_it == pre_reads.end()) continue;
-            pre.down_ovlp_read_i[0].push_back(pre_it->second);
-            cur.up_ovlp_read_i[0].push_back(item.second);
+// Merge-intersect overlap detection between adjacent chunks.
+// Reads are inserted in sorted name order by build_graph_bam_chunk,
+// so we can merge-intersect directly in O(n+m) without sorting.
+static void populate_graph_chunk_pair_overlap_impl(BamChunk& pre, BamChunk& cur) {
+    pre.down_ovlp_read_i.assign(1, {});
+    cur.up_ovlp_read_i.assign(1, {});
+    pre.n_down_ovlp_skip_reads.assign(1, 0);
+    cur.n_up_ovlp_skip_reads.assign(1, 0);
+
+    size_t pi = 0, ci = 0;
+    while (pi < pre.reads.size() && ci < cur.reads.size()) {
+        const int cmp = pre.reads[pi].qname.compare(cur.reads[ci].qname);
+        if (cmp < 0) { ++pi; }
+        else if (cmp > 0) { ++ci; }
+        else {
+            pre.down_ovlp_read_i[0].push_back(static_cast<int>(pi));
+            cur.up_ovlp_read_i[0].push_back(static_cast<int>(ci));
+            ++pi; ++ci;
         }
     }
 }
 
+void populate_graph_chunk_overlaps(std::vector<GraphBamChunkBuildResult>& graph_chunks) {
+    for (size_t i = 1; i < graph_chunks.size(); ++i)
+        populate_graph_chunk_pair_overlap_impl(graph_chunks[i - 1].chunk, graph_chunks[i].chunk);
+}
+
 void populate_graph_chunk_pair_overlaps(GraphBamChunkBuildResult& pre,
                                         GraphBamChunkBuildResult& cur) {
-    BamChunk& pre_c = pre.chunk;
-    BamChunk& cur_c = cur.chunk;
-    pre_c.down_ovlp_read_i.assign(1, {});
-    cur_c.up_ovlp_read_i.assign(1, {});
-    pre_c.n_down_ovlp_skip_reads.assign(1, 0);
-    cur_c.n_up_ovlp_skip_reads.assign(1, 0);
-    const std::unordered_map<std::string, int> pre_reads = read_index_by_name(pre_c);
-    const std::unordered_map<std::string, int> cur_reads = read_index_by_name(cur_c);
-    for (const auto& item : cur_reads) {
-        auto pre_it = pre_reads.find(item.first);
-        if (pre_it == pre_reads.end()) continue;
-        pre_c.down_ovlp_read_i[0].push_back(pre_it->second);
-        cur_c.up_ovlp_read_i[0].push_back(item.second);
-    }
+    populate_graph_chunk_pair_overlap_impl(pre.chunk, cur.chunk);
 }
 
 void assign_graph_chunk_hap(GraphBamChunkBuildResult& gc, const Options& opts) {

@@ -296,6 +296,11 @@ pub extern "C" fn pgphase_gbz_query_interval_structured(
     };
 
     // Emit each alignment as structured data.
+    // On 64-bit platforms usize == u64, so we can pass the GBWT handle
+    // slice directly without allocating a conversion Vec per alignment.
+    #[cfg(not(target_pointer_width = "64"))]
+    compile_error!("pgphase FFI requires a 64-bit target (usize == u64)");
+
     for alignment in read_set.iter() {
         let path = match alignment.target_path() {
             Some(p) => p,
@@ -303,14 +308,16 @@ pub extern "C" fn pgphase_gbz_query_interval_structured(
         };
         let mapq = alignment.mapq.unwrap_or(255) as i32;
 
-        // Convert usize GBWT handles to u64 for C ABI stability.
-        let nodes_u64: Vec<u64> = path.iter().map(|&h| h as u64).collect();
+        // Safety: on 64-bit targets usize and u64 have identical size,
+        // alignment, and representation. The slice is valid for the
+        // duration of the callback.
+        let nodes_ptr = path.as_ptr() as *const u64;
 
         callback(
             alignment.name.as_ptr(),
             alignment.name.len(),
-            nodes_u64.as_ptr(),
-            nodes_u64.len(),
+            nodes_ptr,
+            path.len(),
             mapq,
             user_data,
         );

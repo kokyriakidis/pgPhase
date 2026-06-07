@@ -1,9 +1,11 @@
 #include "graph_query.hpp"
 #include "gbz_ffi.h"
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <cstdlib>
 #include <iostream>
@@ -54,19 +56,6 @@ bool parse_unsigned_node(std::string_view value, uint64_t& out) {
     return true;
 }
 
-bool graph_walk_to_compact_handles(const GraphWalk& walk,
-                                   std::vector<CompactHandle>& out) {
-    out.clear();
-    out.reserve(walk.size());
-    for (const GraphWalkStep& step : walk) {
-        uint64_t node = 0;
-        if (!parse_unsigned_node(step.node, node)) return false;
-        if (node > kMaxCompactNodeId) return false;
-        out.push_back(encode_handle(node, step.reverse));
-    }
-    return true;
-}
-
 bool parse_gaf_path_compact(std::string_view walk,
                             std::vector<CompactHandle>& out) {
     out.clear();
@@ -84,10 +73,10 @@ bool parse_gaf_path_compact(std::string_view walk,
             const uint64_t digit = static_cast<uint64_t>(c - '0');
             if (node > (std::numeric_limits<uint64_t>::max() - digit) / 10ULL) return false;
             node = node * 10ULL + digit;
-            if (node > kMaxCompactNodeId) return false;
             ++i;
         }
         if (beg == i) return false;
+        if (node > kMaxCompactNodeId) return false;
         out.push_back(encode_handle(node, reverse));
     }
     return true;
@@ -133,6 +122,18 @@ bool parse_gaf_core_fields_from_column(std::string_view line,
     return true;
 }
 
+// Allele walks stored in a single contiguous buffer for cache locality.
+// Each allele is described by an offset+length into the shared buffer.
+struct FlatAllelePack {
+    std::vector<CompactHandle> data;       // contiguous walk data for all alleles
+    std::vector<uint32_t>      offsets;    // offsets[i] = start of allele i in data
+    std::vector<uint16_t>      lengths;    // lengths[i] = number of handles in allele i
+    size_t n_alleles = 0;
+
+    const CompactHandle* allele_ptr(size_t i) const { return data.data() + offsets[i]; }
+    size_t allele_len(size_t i) const { return lengths[i]; }
+};
+
 struct CompactGraphSite {
     size_t original_index = 0;
     std::string site_id;
@@ -142,27 +143,50 @@ struct CompactGraphSite {
     CompactHandle right = 0;
     CompactHandle left_rev = 0;
     CompactHandle right_rev = 0;
-    std::vector<std::vector<CompactHandle>> allele_walks;
-    size_t max_walk_len = 0;  // longest allele walk (for early-break bound)
+    FlatAllelePack alleles;
+    size_t max_walk_len = 0;
+};
+
+// Flat sorted boundary→sites index. Sorted by handle for binary search.
+struct BoundarySiteEntry {
+    CompactHandle handle;
+    uint32_t site_index;
 };
 
 struct CompactGraphSiteIndex {
     std::vector<CompactGraphSite> sites;
-    std::unordered_map<CompactHandle, std::vector<size_t>> boundary_to_sites;
+    std::vector<BoundarySiteEntry> boundary_entries;  // sorted by handle
+
+    // Find all site indices for a given boundary handle via binary search.
+    // Returns a pair of pointers into boundary_entries [begin, end).
+    std::pair<const BoundarySiteEntry*, const BoundarySiteEntry*>
+    find_boundary(CompactHandle handle) const {
+        auto cmp = [](const BoundarySiteEntry& a, const BoundarySiteEntry& b) {
+            return a.handle < b.handle;
+        };
+        BoundarySiteEntry key{handle, 0};
+        auto beg = std::lower_bound(boundary_entries.begin(), boundary_entries.end(), key, cmp);
+        if (beg == boundary_entries.end() || beg->handle != handle)
+            return {nullptr, nullptr};
+        auto end = std::upper_bound(beg, boundary_entries.end(), key, cmp);
+        const BoundarySiteEntry* base = boundary_entries.data();
+        return {base + (beg - boundary_entries.begin()),
+                base + (end - boundary_entries.begin())};
+    }
 };
 
-bool add_boundary_site(std::unordered_map<CompactHandle, std::vector<size_t>>& boundary_to_sites,
-                       CompactHandle handle,
-                       size_t site_index) {
-    std::vector<size_t>& sites = boundary_to_sites[handle];
-    if (sites.empty() || sites.back() != site_index) sites.push_back(site_index);
-    return true;
+void add_boundary_entry(std::vector<BoundarySiteEntry>& entries,
+                        CompactHandle handle, uint32_t site_index) {
+    entries.push_back({handle, site_index});
 }
 
 bool build_compact_graph_site_index(const GraphSiteCatalog& catalog,
                                     CompactGraphSiteIndex& out) {
     out = {};
     out.sites.reserve(catalog.sites.size());
+    // Pre-allocate boundary entries: ~4 entries per site (left, right, left_rev, right_rev).
+    out.boundary_entries.reserve(catalog.sites.size() * 4);
+
     for (size_t i = 0; i < catalog.sites.size(); ++i) {
         const GraphSite& site = catalog.sites[i];
         if (!graph_site_is_queryable(site)) continue;
@@ -173,64 +197,117 @@ bool build_compact_graph_site_index(const GraphSiteCatalog& catalog,
         compact.site_id = graph_site_key_str(site, i);
         compact.chrom = site.ref_contig.empty() ? site.chrom : site.ref_contig;
         compact.pos = site.pos;
-        compact.allele_walks.reserve(site.allele_walks.size());
-        for (const GraphWalk& walk : site.allele_walks) {
+
+        // Flatten allele walks into a contiguous buffer.
+        FlatAllelePack& pack = compact.alleles;
+        pack.n_alleles = site.allele_walks.size();
+        pack.offsets.resize(pack.n_alleles);
+        pack.lengths.resize(pack.n_alleles);
+        size_t total_handles = 0;
+        for (const GraphWalk& walk : site.allele_walks) total_handles += walk.size();
+        pack.data.reserve(total_handles);
+
+        for (size_t ai = 0; ai < site.allele_walks.size(); ++ai) {
+            const GraphWalk& walk = site.allele_walks[ai];
+            pack.offsets[ai] = static_cast<uint32_t>(pack.data.size());
             if (walk.empty()) {
-                // Spanning deletion (*) — push empty walk so allele indices
-                // stay aligned with the original site; it will never match.
-                compact.allele_walks.push_back({});
+                // Spanning deletion (*) — zero-length entry, never matches.
+                pack.lengths[ai] = 0;
                 continue;
             }
-            std::vector<CompactHandle> handles;
-            if (!graph_walk_to_compact_handles(walk, handles)) return false;
-            if (handles.empty()) return false;
-            compact.max_walk_len = std::max(compact.max_walk_len, handles.size());
-            compact.allele_walks.push_back(std::move(handles));
+            const size_t walk_start = pack.data.size();
+            for (const GraphWalkStep& step : walk) {
+                uint64_t node = 0;
+                if (!parse_unsigned_node(step.node, node)) return false;
+                if (node > kMaxCompactNodeId) return false;
+                pack.data.push_back(encode_handle(node, step.reverse));
+            }
+            const size_t walk_len = pack.data.size() - walk_start;
+            if (walk_len == 0) return false;
+            pack.lengths[ai] = static_cast<uint16_t>(walk_len);
+            compact.max_walk_len = std::max(compact.max_walk_len, walk_len);
         }
-        compact.left = compact.allele_walks[0].front();
-        compact.right = compact.allele_walks[0].back();
+
+        // Ref walk (allele 0) boundaries.
+        compact.left = pack.data[pack.offsets[0]];
+        compact.right = pack.data[pack.offsets[0] + pack.lengths[0] - 1];
         compact.left_rev = reverse_handle(compact.left);
         compact.right_rev = reverse_handle(compact.right);
 
-        const size_t compact_index = out.sites.size();
+        const auto compact_index = static_cast<uint32_t>(out.sites.size());
         out.sites.push_back(std::move(compact));
-        add_boundary_site(out.boundary_to_sites, out.sites.back().left, compact_index);
-        add_boundary_site(out.boundary_to_sites, out.sites.back().right, compact_index);
-        add_boundary_site(out.boundary_to_sites, out.sites.back().left_rev, compact_index);
-        add_boundary_site(out.boundary_to_sites, out.sites.back().right_rev, compact_index);
+        add_boundary_entry(out.boundary_entries, out.sites.back().left, compact_index);
+        add_boundary_entry(out.boundary_entries, out.sites.back().right, compact_index);
+        add_boundary_entry(out.boundary_entries, out.sites.back().left_rev, compact_index);
+        add_boundary_entry(out.boundary_entries, out.sites.back().right_rev, compact_index);
     }
+
+    // Sort boundary entries by handle for binary search.
+    std::sort(out.boundary_entries.begin(), out.boundary_entries.end(),
+              [](const BoundarySiteEntry& a, const BoundarySiteEntry& b) {
+                  return a.handle < b.handle ||
+                         (a.handle == b.handle && a.site_index < b.site_index);
+              });
+    // Deduplicate (same handle+site_index).
+    out.boundary_entries.erase(
+        std::unique(out.boundary_entries.begin(), out.boundary_entries.end(),
+                    [](const BoundarySiteEntry& a, const BoundarySiteEntry& b) {
+                        return a.handle == b.handle && a.site_index == b.site_index;
+                    }),
+        out.boundary_entries.end());
+
     return !out.sites.empty();
 }
 
-bool compact_span_matches_allele(const std::vector<CompactHandle>& read_walk,
-                                 size_t beg,
-                                 size_t end,
-                                 const std::vector<CompactHandle>& allele,
+// Per-read boundary position index: flat sorted vector of (handle, position).
+// Replaces unordered_map<CompactHandle, vector<size_t>> to avoid per-read
+// heap allocation. Sorted by handle for binary-search lookup.
+struct FlatBoundaryPositions {
+    struct Entry { CompactHandle handle; uint32_t pos; };
+    std::vector<Entry> entries;
+
+    void clear() { entries.clear(); }
+    void add(CompactHandle h, uint32_t pos) { entries.push_back({h, pos}); }
+    void sort() {
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry& a, const Entry& b) { return a.handle < b.handle; });
+    }
+
+    // Returns [begin, end) pointers for all positions with the given handle.
+    std::pair<const Entry*, const Entry*> find(CompactHandle h) const {
+        auto cmp = [](const Entry& a, const Entry& b) { return a.handle < b.handle; };
+        Entry key{h, 0};
+        auto beg = std::lower_bound(entries.begin(), entries.end(), key, cmp);
+        if (beg == entries.end() || beg->handle != h) return {nullptr, nullptr};
+        auto end = std::upper_bound(beg, entries.end(), key, cmp);
+        const Entry* base = entries.data();
+        return {base + (beg - entries.begin()),
+                base + (end - entries.begin())};
+    }
+};
+
+bool compact_span_matches_allele(const CompactHandle* read_ptr, size_t span_len,
+                                 const CompactHandle* allele_ptr, size_t allele_len,
                                  bool reverse) {
-    if (end < beg) return false;
-    const size_t len = end - beg + 1;
-    if (len != allele.size()) return false;
+    if (span_len != allele_len || allele_len == 0) return false;
     if (!reverse) {
-        for (size_t i = 0; i < len; ++i) {
-            if (read_walk[beg + i] != allele[i]) return false;
-        }
-    } else {
-        for (size_t i = 0; i < len; ++i) {
-            if (read_walk[beg + i] != reverse_handle(allele[len - 1 - i])) return false;
-        }
+        return std::memcmp(read_ptr, allele_ptr, span_len * sizeof(CompactHandle)) == 0;
+    }
+    for (size_t i = 0; i < span_len; ++i) {
+        if (read_ptr[i] != reverse_handle(allele_ptr[span_len - 1 - i])) return false;
     }
     return true;
 }
 
-int match_compact_span(const std::vector<CompactHandle>& read_walk,
-                       size_t beg,
-                       size_t end,
+int match_compact_span(const CompactHandle* read_ptr, size_t span_len,
                        const CompactGraphSite& site,
                        bool reverse) {
     int match = kGraphAlleleMissing;
-    for (size_t allele_i = 0; allele_i < site.allele_walks.size(); ++allele_i) {
-        if (!compact_span_matches_allele(read_walk, beg, end,
-                                         site.allele_walks[allele_i], reverse)) {
+    const FlatAllelePack& pack = site.alleles;
+    for (size_t allele_i = 0; allele_i < pack.n_alleles; ++allele_i) {
+        if (!compact_span_matches_allele(read_ptr, span_len,
+                                         pack.allele_ptr(allele_i),
+                                         pack.allele_len(allele_i), reverse)) {
             continue;
         }
         if (match != kGraphAlleleMissing) return kGraphAlleleAmbiguous;
@@ -241,41 +318,37 @@ int match_compact_span(const std::vector<CompactHandle>& read_walk,
 
 int match_compact_site_on_read(
     const std::vector<CompactHandle>& read_walk,
-    const std::unordered_map<CompactHandle, std::vector<size_t>>& boundary_positions,
+    const FlatBoundaryPositions& boundary_positions,
     const CompactGraphSite& site,
     bool* reverse_out = nullptr) {
-    auto left_it = boundary_positions.find(site.left);
-    auto right_it = boundary_positions.find(site.right);
-    if (left_it != boundary_positions.end() && right_it != boundary_positions.end()) {
-        for (size_t left_pos : left_it->second) {
-            for (size_t right_pos : right_it->second) {
-                if (right_pos < left_pos) continue;
-                const int allele = match_compact_span(read_walk, left_pos, right_pos,
-                                                      site, false);
+    auto [left_beg, left_end] = boundary_positions.find(site.left);
+    auto [right_beg, right_end] = boundary_positions.find(site.right);
+    if (left_beg && right_beg) {
+        for (auto lp = left_beg; lp != left_end; ++lp) {
+            for (auto rp = right_beg; rp != right_end; ++rp) {
+                if (rp->pos < lp->pos) continue;
+                const size_t span = rp->pos - lp->pos + 1;
+                const int allele = match_compact_span(
+                    read_walk.data() + lp->pos, span, site, false);
                 if (allele >= 0) { if (reverse_out) *reverse_out = false; return allele; }
                 if (allele == kGraphAlleleAmbiguous) return allele;
-                if (site.max_walk_len > 0 &&
-                    right_pos - left_pos + 1 > site.max_walk_len) {
-                    break;
-                }
+                if (site.max_walk_len > 0 && span > site.max_walk_len) break;
             }
         }
     }
 
-    auto right_rev_it = boundary_positions.find(site.right_rev);
-    auto left_rev_it = boundary_positions.find(site.left_rev);
-    if (right_rev_it != boundary_positions.end() && left_rev_it != boundary_positions.end()) {
-        for (size_t right_pos : right_rev_it->second) {
-            for (size_t left_pos : left_rev_it->second) {
-                if (left_pos < right_pos) continue;
-                const int allele = match_compact_span(read_walk, right_pos, left_pos,
-                                                      site, true);
+    auto [rrev_beg, rrev_end] = boundary_positions.find(site.right_rev);
+    auto [lrev_beg, lrev_end] = boundary_positions.find(site.left_rev);
+    if (rrev_beg && lrev_beg) {
+        for (auto rp = rrev_beg; rp != rrev_end; ++rp) {
+            for (auto lp = lrev_beg; lp != lrev_end; ++lp) {
+                if (lp->pos < rp->pos) continue;
+                const size_t span = lp->pos - rp->pos + 1;
+                const int allele = match_compact_span(
+                    read_walk.data() + rp->pos, span, site, true);
                 if (allele >= 0) { if (reverse_out) *reverse_out = true; return allele; }
                 if (allele == kGraphAlleleAmbiguous) return allele;
-                if (site.max_walk_len > 0 &&
-                    left_pos - right_pos + 1 > site.max_walk_len) {
-                    break;
-                }
+                if (site.max_walk_len > 0 && span > site.max_walk_len) break;
             }
         }
     }
@@ -289,7 +362,7 @@ size_t scan_gaf_line_compact(std::string_view line,
                              int min_mapq,
                              size_t worker_id,
                              std::vector<CompactHandle>& read_walk,
-                             std::unordered_map<CompactHandle, std::vector<size_t>>& boundary_positions,
+                             FlatBoundaryPositions& boundary_positions,
                              std::vector<size_t>& candidates,
                              std::vector<uint32_t>& site_marks,
                              uint32_t& mark_stamp,
@@ -310,16 +383,17 @@ size_t scan_gaf_line_compact(std::string_view line,
 
     for (size_t step_i = 0; step_i < read_walk.size(); ++step_i) {
         const CompactHandle handle = read_walk[step_i];
-        auto site_it = compact_index.boundary_to_sites.find(handle);
-        if (site_it == compact_index.boundary_to_sites.end()) continue;
-        boundary_positions[handle].push_back(step_i);
-        for (size_t site_index : site_it->second) {
-            if (site_marks[site_index] == mark_stamp) continue;
-            site_marks[site_index] = mark_stamp;
-            candidates.push_back(site_index);
+        auto [beg, end] = compact_index.find_boundary(handle);
+        if (!beg) continue;
+        boundary_positions.add(handle, static_cast<uint32_t>(step_i));
+        for (auto it = beg; it != end; ++it) {
+            if (site_marks[it->site_index] == mark_stamp) continue;
+            site_marks[it->site_index] = mark_stamp;
+            candidates.push_back(it->site_index);
         }
     }
     if (candidates.empty()) return 0;
+    boundary_positions.sort();
 
     size_t emitted = 0;
     const std::string read_name(fields.read_name);
@@ -334,7 +408,6 @@ size_t scan_gaf_line_compact(std::string_view line,
             site.pos,
             read_name,
             allele,
-            "",
             fields.mapq,
             rev
         });
@@ -422,7 +495,7 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
     std::vector<uint32_t> site_marks(compact_index.sites.size(), 0);
     std::vector<size_t> candidates;
     std::vector<CompactHandle> read_walk;
-    std::unordered_map<CompactHandle, std::vector<size_t>> boundary_positions;
+    FlatBoundaryPositions boundary_positions;
 
     kstring_t line = KS_INITIALIZE;
     struct KStringGuard {
@@ -453,7 +526,7 @@ struct CompactFFIContext {
     std::vector<GraphReadAllele>* results;
     // Per-callback scratch buffers (avoid repeated allocation).
     std::vector<CompactHandle> read_walk;
-    std::unordered_map<CompactHandle, std::vector<size_t>> boundary_positions;
+    FlatBoundaryPositions boundary_positions;
     std::vector<size_t> candidates;
     std::vector<uint32_t> site_marks;
     uint32_t mark_stamp = 0;
@@ -494,16 +567,17 @@ extern "C" void structured_alignment_callback(
 
     for (size_t step_i = 0; step_i < ctx->read_walk.size(); ++step_i) {
         const CompactHandle handle = ctx->read_walk[step_i];
-        auto site_it = index.boundary_to_sites.find(handle);
-        if (site_it == index.boundary_to_sites.end()) continue;
-        ctx->boundary_positions[handle].push_back(step_i);
-        for (size_t site_index : site_it->second) {
-            if (ctx->site_marks[site_index] == ctx->mark_stamp) continue;
-            ctx->site_marks[site_index] = ctx->mark_stamp;
-            ctx->candidates.push_back(site_index);
+        auto [beg, end] = index.find_boundary(handle);
+        if (!beg) continue;
+        ctx->boundary_positions.add(handle, static_cast<uint32_t>(step_i));
+        for (auto it = beg; it != end; ++it) {
+            if (ctx->site_marks[it->site_index] == ctx->mark_stamp) continue;
+            ctx->site_marks[it->site_index] = ctx->mark_stamp;
+            ctx->candidates.push_back(it->site_index);
         }
     }
     if (ctx->candidates.empty()) return;
+    ctx->boundary_positions.sort();
 
     const std::string read_name(reinterpret_cast<const char*>(name), name_len);
 
@@ -520,7 +594,6 @@ extern "C" void structured_alignment_callback(
             site.pos,
             read_name,
             allele,
-            "",
             mapq,
             rev
         });
