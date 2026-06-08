@@ -701,6 +701,8 @@ enum LongOption {
     kPgbamRelaxedCleanupMarginOption,
     kPgbamRelaxedCleanupMinWinningOption,
     kAmbBaseOption,
+    kRefOption,
+    kBamOption,
 
 };
 
@@ -877,6 +879,8 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"short-reads",               no_argument,       nullptr, kShortReadsOption},
         {"strand-bias-pval",          required_argument, nullptr, kStrandBiasPvalOption},
         {"noisy-max-xgaps",           required_argument, nullptr, kNoisyMaxXgapsOption},
+        {"ref",                       required_argument, nullptr, kRefOption},
+        {"bam",                       required_argument, nullptr, kBamOption},
         {"verbose",                  required_argument, nullptr, 'V'},
         {"help",                      no_argument,       nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -950,6 +954,8 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kShortReadsOption:     set_read_technology(ReadTechnology::ShortReads); break;
             case kStrandBiasPvalOption: opts.strand_bias_pval = std::stod(optarg); break;
             case kNoisyMaxXgapsOption:  opts.noisy_reg_max_xgaps = std::stoi(optarg); break;
+            case kRefOption:            opts.ref_fasta = optarg; break;
+            case kBamOption:            opts.bam_files.push_back(optarg); break;
             case 'V': opts.verbose = std::stoi(optarg); break;
             case 'h': print_collect_help(); return 0;
             default:  print_collect_help(); return 1;
@@ -973,23 +979,28 @@ int collect_bam_variation(int argc, char* argv[]) {
         std::cerr << "Error: choose only one of --hifi, --ont, or --short-reads\n";
         return 1;
     }
-    if (optind + 2 > argc) {
+    if (opts.input_is_list && !opts.bam_files.empty()) {
+        const std::string list_path = opts.bam_files.front();
+        opts.bam_files = load_bam_list(list_path);
+    }
+    opts.bam_files.insert(opts.bam_files.end(), extra_bam_files.begin(), extra_bam_files.end());
+
+    if (optind < argc) {
+        std::cerr << "Error: unexpected positional argument: " << argv[optind]
+                  << "\n       Use --ref and --bam instead of positional arguments.\n";
+        return 1;
+    }
+    if (opts.ref_fasta.empty()) {
+        std::cerr << "Error: --ref is required\n";
         print_collect_help();
         return 1;
     }
-
-    opts.ref_fasta = argv[optind];
-    const std::string input_path = argv[optind + 1];
-    if (opts.input_is_list) {
-        opts.bam_files = load_bam_list(input_path);
-    } else {
-        opts.bam_files.push_back(input_path);
+    if (opts.bam_files.empty()) {
+        std::cerr << "Error: --bam is required\n";
+        print_collect_help();
+        return 1;
     }
-    opts.bam_files.insert(opts.bam_files.end(), extra_bam_files.begin(), extra_bam_files.end());
     opts.bam_file = opts.bam_files.front();
-    for (int arg_i = optind + 2; arg_i < argc; ++arg_i) {
-        opts.regions.push_back(argv[arg_i]);
-    }
 
     try {
         run_collect_bam_variation(opts);
