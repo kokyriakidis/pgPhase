@@ -43,12 +43,23 @@ struct FilteredGraphSite {
     std::string filter_reason;  // e.g. "ref_only", "low_depth", "high_af"
 };
 
+// VCF-level metadata for a snarl site, stored per candidate so the output
+// converter doesn't need a global site lookup table.
+struct GraphSiteMeta {
+    std::string chrom;       // output contig (ref_contig or chrom)
+    hts_pos_t pos = 0;
+    std::string ref;
+    std::vector<std::string> alts;
+};
+
 // Output of build_graph_chunk: a PhasingChunk ready for k-means phasing,
 // plus graph-specific bookkeeping for VCF output and diagnostics.
 struct GraphChunkBuildResult {
     PhasingChunk chunk;
     // Snarl site ID per candidate (parallel to chunk.candidates).
     std::vector<std::string> site_ids;
+    // VCF-level metadata per candidate (parallel to chunk.candidates).
+    std::vector<GraphSiteMeta> site_meta;
     // Maps final biallelic allele indices back to original allele-walk indices
     // in GraphSite (0 = ref walk, 1 = first alt walk, etc.).
     std::vector<std::vector<int>> site_allele_orig_idx;

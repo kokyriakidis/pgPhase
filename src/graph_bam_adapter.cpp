@@ -72,6 +72,12 @@ void add_graph_candidate(GraphChunkBuildResult& out,
     candidate.phase_set = -1;
     out.chunk.candidates.push_back(std::move(candidate));
     out.site_ids.push_back(key);
+    out.site_meta.push_back({
+        site.ref_contig.empty() ? site.chrom : site.ref_contig,
+        site.pos,
+        site.ref,
+        site.alts
+    });
 }
 
 // Build a ReadRecord + ReadVariantProfile from a read's site observations
@@ -264,7 +270,6 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
     std::vector<std::vector<int>> rev_strand_counts;
     std::vector<int> parent_candidate;
     std::vector<std::vector<int>> conditional_parent_alleles;
-    std::vector<size_t> catalog_site_idx_phase1;
     for (size_t site_i = 0; site_i < catalog.size(); ++site_i) {
         const GraphSite& site = catalog[site_i];
         const std::string sid = graph_site_key_str(site);
@@ -288,7 +293,6 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
         rev_strand_counts.emplace_back(static_cast<size_t>(n_alleles), 0);
         parent_candidate.push_back(-1);
         conditional_parent_alleles.push_back(site.conditional_parent_alleles);
-        catalog_site_idx_phase1.push_back(site_i);
         add_graph_candidate(out, site, sid, allele_counts.back(), chunk_tid);
     }
 
@@ -501,6 +505,7 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
 
     std::vector<CandidateVariant> new_cands;
     std::vector<std::string>      new_ids;
+    std::vector<GraphSiteMeta>    new_meta;
     std::vector<std::vector<int>> new_allele_counts;
     std::vector<std::vector<int>> new_fwd_strand;
     std::vector<std::vector<int>> new_rev_strand;
@@ -508,6 +513,7 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
     // Most sites are biallelic (1 surviving alt); reserve n_cands as a lower bound.
     new_cands.reserve(n_cands);
     new_ids.reserve(n_cands);
+    new_meta.reserve(n_cands);
     new_allele_counts.reserve(n_cands);
     new_fwd_strand.reserve(n_cands);
     new_rev_strand.reserve(n_cands);
@@ -558,10 +564,10 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
 
             // Derive variant type from VCF REF/ALT sequence lengths.
             {
-                const GraphSite& site = catalog[catalog_site_idx_phase1[i]];
-                const size_t ref_len = site.ref.size();
+                const GraphSiteMeta& meta = out.site_meta[i];
+                const size_t ref_len = meta.ref.size();
                 const size_t alt_idx = static_cast<size_t>(orig_alt - 1);
-                const size_t alt_len = alt_idx < site.alts.size() ? site.alts[alt_idx].size() : ref_len;
+                const size_t alt_len = alt_idx < meta.alts.size() ? meta.alts[alt_idx].size() : ref_len;
                 if (ref_len < alt_len) {
                     pair_cand.key.type = VariantType::Insertion;
                     pair_cand.key.ref_len = 1;
@@ -586,6 +592,7 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
             pair_cand.counts.allele_fraction = af;
             new_cands.push_back(pair_cand);
             new_ids.push_back(pair_id);
+            new_meta.push_back(out.site_meta[i]);
             new_allele_counts.push_back({ref_c, alt_c});
             new_fwd_strand.push_back({fwd_ref, fwd_alt});
             new_rev_strand.push_back({rev_ref, rev_alt});
@@ -595,6 +602,7 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
 
     out.chunk.candidates       = std::move(new_cands);
     out.site_ids               = std::move(new_ids);
+    out.site_meta              = std::move(new_meta);
     allele_counts              = std::move(new_allele_counts);
     fwd_strand_counts          = std::move(new_fwd_strand);
     rev_strand_counts          = std::move(new_rev_strand);

@@ -675,4 +675,55 @@ void write_graph_site_catalog_tsv(std::ostream& out, const GraphSiteCatalog& cat
     }
 }
 
+// --- SitesVcfHandle RAII implementation ---
+
+SitesVcfHandle::SitesVcfHandle(const std::string& path) {
+    fp = hts_open(path.c_str(), "r");
+    if (fp == nullptr)
+        throw std::runtime_error("failed to open sites VCF: " + path);
+    tbx = tbx_index_load(path.c_str());
+    if (tbx == nullptr) {
+        hts_close(fp);
+        fp = nullptr;
+        throw std::runtime_error("sites VCF requires a tabix index (.tbi): " + path);
+    }
+}
+
+SitesVcfHandle::~SitesVcfHandle() {
+    if (tbx != nullptr) tbx_destroy(tbx);
+    if (fp != nullptr) hts_close(fp);
+}
+
+SitesVcfHandle::SitesVcfHandle(SitesVcfHandle&& o) noexcept
+    : fp(o.fp), tbx(o.tbx) {
+    o.fp  = nullptr;
+    o.tbx = nullptr;
+}
+
+SitesVcfHandle& SitesVcfHandle::operator=(SitesVcfHandle&& o) noexcept {
+    if (this != &o) {
+        if (tbx != nullptr) tbx_destroy(tbx);
+        if (fp != nullptr) hts_close(fp);
+        fp    = o.fp;
+        tbx   = o.tbx;
+        o.fp  = nullptr;
+        o.tbx = nullptr;
+    }
+    return *this;
+}
+
+GraphSiteCatalog load_sites_for_region(SitesVcfHandle& handle,
+                                       const std::string& contig,
+                                       hts_pos_t beg, hts_pos_t end) {
+    GraphSiteCatalog catalog;
+    if (!handle || contig.empty() || end <= beg) return catalog;
+
+    std::vector<RegionFilter> filters = {
+        {true, contig, beg, end}
+    };
+    append_graph_sites_tabix_filtered(handle.fp, handle.tbx, filters, catalog, true);
+    finalize_graph_site_catalog_inplace(catalog);
+    return catalog;
+}
+
 } // namespace pgphase_collect

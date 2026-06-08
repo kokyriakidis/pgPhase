@@ -7,6 +7,7 @@
 
 #include "collect_types.hpp"
 
+#include <htslib/tbx.h>
 #include <cstdint>
 #include <iosfwd>
 #include <string>
@@ -88,6 +89,28 @@ GraphSiteCatalog load_graph_site_catalog_from_vcf(
     const std::string& path,
     const std::vector<RegionFilter>& filters = {},
     bool keep_allele_traversal_strings = true);
+
+// RAII handle for a tabix-indexed sites VCF.  Opened once per thread,
+// reused across chunks to avoid repeated file open / index load.
+struct SitesVcfHandle {
+    htsFile* fp  = nullptr;
+    tbx_t*   tbx = nullptr;
+
+    SitesVcfHandle() = default;
+    explicit SitesVcfHandle(const std::string& path);
+    ~SitesVcfHandle();
+    SitesVcfHandle(const SitesVcfHandle&) = delete;
+    SitesVcfHandle& operator=(const SitesVcfHandle&) = delete;
+    SitesVcfHandle(SitesVcfHandle&& o) noexcept;
+    SitesVcfHandle& operator=(SitesVcfHandle&& o) noexcept;
+    explicit operator bool() const { return fp && tbx; }
+};
+
+// Load sites overlapping [beg, end) on `contig` from a pre-opened handle.
+// The returned catalog is finalized (sorted, validated).
+GraphSiteCatalog load_sites_for_region(SitesVcfHandle& handle,
+                                       const std::string& contig,
+                                       hts_pos_t beg, hts_pos_t end);
 
 // True if `path` has a tabix index (.tbi/.csi) loadable by htslib.
 bool graph_site_vcf_has_tabix_index(const std::string& path);
