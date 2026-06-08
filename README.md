@@ -110,9 +110,8 @@ Collects and phases variants using a pangenome graph site catalog and GAF read a
 |---|---|---|
 | `--ref FILE` | Reference FASTA (indexed) | required |
 | `--sites FILE` | Sites VCF (bgzipped + tabix-indexed) | required |
-| `--gaf FILE` | Raw GAF alignments | — |
-| `--gbz-db FILE` | GBZ graph database | — |
-| `--gaf-db FILE` | GAF-base read alignment database | — |
+| `--gbz-db FILE` | GBZ graph database (from `gbz2db`) | required |
+| `--gaf-db FILE` | GAF-base read alignment database (from `gaf2db`) | required |
 | `--sample NAME` | Reference sample name for GBZ queries | auto-detected |
 | `--hifi` | HiFi read mode | default |
 | `--ont` | ONT read mode (enables strand-bias filter) | off |
@@ -123,7 +122,7 @@ Collects and phases variants using a pangenome graph site catalog and GAF read a
 | `-r STR` | Restrict to region (repeatable) | whole genome |
 | `-t INT` | Worker threads | 1 |
 
-Provide either `--gaf` (builds an observation index on the fly) or `--gbz-db` + `--gaf-db`.
+Build databases with `gbz2db` and `gaf2db` from the [gbz-base](https://github.com/jltsiren/gbz-base) tools (included under `third_party/gbz-base/`).
 
 ### `collect-bam-variation`
 

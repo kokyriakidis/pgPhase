@@ -4,19 +4,14 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
 #include <htslib/hts.h>
-#include <htslib/kstring.h>
-#include <htslib/tbx.h>
 
 namespace pgphase_collect {
-
-using GraphReadAlleleThreadEmitter = std::function<void(size_t, GraphReadAllele&&)>;
 
 namespace {
 
@@ -51,72 +46,6 @@ bool parse_unsigned_node(std::string_view value, uint64_t& out) {
 }
 
 // Parse a GAF path field (e.g. ">12>34<56>78") into a vector of CompactHandles.
-bool parse_gaf_path_compact(std::string_view walk,
-                            std::vector<CompactHandle>& out) {
-    out.clear();
-    size_t i = 0;
-    while (i < walk.size()) {
-        const char orient = walk[i];
-        if (orient != '>' && orient != '<') return false;
-        const bool reverse = orient == '<';
-        ++i;
-        const size_t beg = i;
-        uint64_t node = 0;
-        while (i < walk.size() && walk[i] != '>' && walk[i] != '<') {
-            const char c = walk[i];
-            if (c < '0' || c > '9') return false;
-            const uint64_t digit = static_cast<uint64_t>(c - '0');
-            if (node > (std::numeric_limits<uint64_t>::max() - digit) / 10ULL) return false;
-            node = node * 10ULL + digit;
-            ++i;
-        }
-        if (beg == i) return false;
-        if (node > kMaxCompactNodeId) return false;
-        out.push_back(encode_handle(node, reverse));
-    }
-    return true;
-}
-
-struct GafCoreFields {
-    std::string_view read_name;
-    std::string_view walk;
-    int mapq = 0;
-};
-
-bool parse_gaf_core_fields_from_column(std::string_view line,
-                                       int first_gaf_column,
-                                       GafCoreFields& out);
-
-bool parse_gaf_core_fields_from_column(std::string_view line,
-                                       int first_gaf_column,
-                                       GafCoreFields& out) {
-    std::array<std::pair<const char*, size_t>, 12> fld{};
-    int fi = -first_gaf_column;
-    const char* fs = line.data();
-    const char* le = fs + line.size();
-    for (const char* p = fs; p <= le && fi < 12; ++p) {
-        if (p == le || *p == '\t') {
-            if (fi >= 0) fld[fi] = {fs, static_cast<size_t>(p - fs)};
-            ++fi;
-            fs = p + 1;
-        }
-    }
-    if (fi < 12) return false;
-
-    int mapq = 0;
-    const char* mp = fld[11].first;
-    const char* me = mp + fld[11].second;
-    if (mp == me) return false;
-    for (; mp < me; ++mp) {
-        if (*mp < '0' || *mp > '9') return false;
-        mapq = mapq * 10 + (*mp - '0');
-    }
-    out.read_name = std::string_view(fld[0].first, fld[0].second);
-    out.walk = std::string_view(fld[5].first, fld[5].second);
-    out.mapq = mapq;
-    return true;
-}
-
 // Allele walks stored in a single contiguous buffer for cache locality.
 // Each allele is described by an offset+length into the shared buffer.
 struct FlatAllelePack {
@@ -370,169 +299,6 @@ int match_compact_site_on_read(
 
     return kGraphAlleleMissing;
 }
-
-// Process one GAF line: parse the read walk, find candidate sites whose
-// boundary handles appear in the walk, then match each candidate.
-// Emits a GraphReadAllele for every successful match.  Scratch buffers
-// (read_walk, boundary_positions, candidates, site_marks) are caller-owned
-// to avoid per-line allocation.
-size_t scan_gaf_line_compact(std::string_view line,
-                             int first_gaf_column,
-                             const CompactGraphSiteIndex& compact_index,
-                             int min_mapq,
-                             size_t worker_id,
-                             std::vector<CompactHandle>& read_walk,
-                             FlatBoundaryPositions& boundary_positions,
-                             std::vector<size_t>& candidates,
-                             std::vector<uint32_t>& site_marks,
-                             uint32_t& mark_stamp,
-                             const GraphReadAlleleThreadEmitter& emit) {
-    if (line.empty() || line[0] == '#') return 0;
-
-    GafCoreFields fields;
-    if (!parse_gaf_core_fields_from_column(line, first_gaf_column, fields)) return 0;
-    if (fields.mapq < min_mapq) return 0;
-    if (!parse_gaf_path_compact(fields.walk, read_walk) || read_walk.empty()) return 0;
-
-    candidates.clear();
-    boundary_positions.clear();
-    if (++mark_stamp == 0) {
-        std::fill(site_marks.begin(), site_marks.end(), 0);
-        mark_stamp = 1;
-    }
-
-    for (size_t step_i = 0; step_i < read_walk.size(); ++step_i) {
-        const CompactHandle handle = read_walk[step_i];
-        auto [beg, end] = compact_index.find_boundary(handle);
-        if (!beg) continue;
-        boundary_positions.add(handle, static_cast<uint32_t>(step_i));
-        for (auto it = beg; it != end; ++it) {
-            if (site_marks[it->site_index] == mark_stamp) continue;
-            site_marks[it->site_index] = mark_stamp;
-            candidates.push_back(it->site_index);
-        }
-    }
-    if (candidates.empty()) return 0;
-    boundary_positions.sort();
-
-    size_t emitted = 0;
-    const std::string read_name(fields.read_name);
-    for (size_t compact_site_index : candidates) {
-        const CompactGraphSite& site = compact_index.sites[compact_site_index];
-        bool rev = false;
-        const int allele = match_compact_site_on_read(read_walk, boundary_positions, site, &rev);
-        if (allele < 0) continue;
-        emit(worker_id, GraphReadAllele{
-            site.site_id,
-            site.chrom,
-            site.pos,
-            read_name,
-            allele,
-            fields.mapq,
-            rev
-        });
-        ++emitted;
-    }
-    return emitted;
-}
-
-} // namespace
-
-// pggaf coordinate-indexed GAF tabix often names sequences by reference suffix ("chr20")
-// while graph-site VCFs use pangenome paths ("CHM13#0#chr20"). Mirrors graph_sites
-// chrom_suffix matching so tabix queries succeed without a separate FAI map.
-static int tbx_seq_tid_with_pangenome_fallback(tbx_t* tbx, const std::string& contig) {
-    int tid = tbx_name2id(tbx, contig.c_str());
-    if (tid >= 0) return tid;
-    const size_t h = contig.rfind('#');
-    if (h == std::string::npos) return -1;
-    return tbx_name2id(tbx, contig.substr(h + 1).c_str());
-}
-
-void require_indexed_gaf(const std::string& indexed_gaf_file) {
-    htsFile* fp = hts_open(indexed_gaf_file.c_str(), "r");
-    if (fp == nullptr) {
-        throw std::runtime_error("failed to open indexed GAF: " + indexed_gaf_file);
-    }
-    hts_close(fp);
-
-    tbx_t* tbx = tbx_index_load(indexed_gaf_file.c_str());
-    if (tbx == nullptr) {
-        throw std::runtime_error(
-            "indexed GAF requires a tabix index (.tbi): " + indexed_gaf_file);
-    }
-    tbx_destroy(tbx);
-}
-
-std::vector<GraphReadAllele>
-scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
-                       const std::string& contig,
-                       hts_pos_t beg,
-                       hts_pos_t end,
-                       const GraphSiteCatalog& catalog,
-                       int min_mapq) {
-    if (contig.empty() || end <= beg) return {};
-    if (catalog.sites.empty()) return {};
-
-    CompactGraphSiteIndex compact_index;
-    if (!build_compact_graph_site_index(catalog, compact_index)) {
-        throw std::runtime_error(
-            "indexed GAF chunk scan requires queryable graph sites with numeric node IDs");
-    }
-
-    htsFile* raw_fp = hts_open(indexed_gaf_file.c_str(), "r");
-    if (raw_fp == nullptr) {
-        throw std::runtime_error("failed to open indexed GAF: " + indexed_gaf_file);
-    }
-    struct HtsFileGuard {
-        htsFile* fp = nullptr;
-        ~HtsFileGuard() { if (fp != nullptr) hts_close(fp); }
-    } fp_guard{raw_fp};
-
-    tbx_t* raw_tbx = tbx_index_load(indexed_gaf_file.c_str());
-    if (raw_tbx == nullptr) {
-        throw std::runtime_error(
-            "indexed GAF requires a tabix index (.tbi): " + indexed_gaf_file);
-    }
-    struct TbxGuard {
-        tbx_t* tbx = nullptr;
-        ~TbxGuard() { if (tbx != nullptr) tbx_destroy(tbx); }
-    } tbx_guard{raw_tbx};
-
-    const int tid = tbx_seq_tid_with_pangenome_fallback(raw_tbx, contig);
-    if (tid < 0) return {};
-
-    hts_itr_t* raw_itr = tbx_itr_queryi(raw_tbx, tid, beg, end);
-    if (raw_itr == nullptr) return {};
-    struct IterGuard {
-        hts_itr_t* itr = nullptr;
-        ~IterGuard() { if (itr != nullptr) hts_itr_destroy(itr); }
-    } itr_guard{raw_itr};
-
-    std::vector<GraphReadAllele> rows;
-    uint32_t mark_stamp = 1;
-    std::vector<uint32_t> site_marks(compact_index.sites.size(), 0);
-    std::vector<size_t> candidates;
-    std::vector<CompactHandle> read_walk;
-    FlatBoundaryPositions boundary_positions;
-
-    kstring_t line = KS_INITIALIZE;
-    struct KStringGuard {
-        kstring_t* line = nullptr;
-        ~KStringGuard() { if (line != nullptr) ks_free(line); }
-    } line_guard{&line};
-
-    while (tbx_itr_next(raw_fp, raw_tbx, raw_itr, &line) >= 0) {
-        scan_gaf_line_compact(
-            std::string_view(line.s, line.l), 3, compact_index, min_mapq, 0,
-            read_walk, boundary_positions, candidates, site_marks, mark_stamp,
-            [&](size_t, GraphReadAllele&& row) { rows.push_back(std::move(row)); });
-    }
-
-    return rows;
-}
-
-namespace {
 
 // Callback context for the Rust FFI path: receives pre-parsed GBWT handle
 // arrays instead of GAF text.  GBWT handles (2*node_id + orientation) share

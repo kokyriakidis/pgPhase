@@ -183,11 +183,9 @@ struct Options {
     int pgbam_relaxed_cleanup_min_winning_threads = 1;
     /** Reference sample name for GBZ interval queries (e.g. "CHM13"; auto-derived from FASTA if empty). */
     std::string graph_sample;
-    /** Optional GBZ-base database for future graph-native snarl/read queries. */
+    /** GBZ-base graph database (from gbz2db). */
     std::string gbz_db;
-    /** Optional raw GAF alignments for future graph-native read traversal support. */
-    std::string gaf_file;
-    /** Optional GAF-base database/cache for graph-native ReadSet queries. */
+    /** GAF-base read alignment database (from gaf2db). */
     std::string gaf_db;
     /** Optional precomputed vg deconstruct VCF used as a development/debug graph-site catalog. */
     std::string graph_sites_vcf;
