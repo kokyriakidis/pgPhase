@@ -54,7 +54,7 @@ int main() {
     build_opts.min_alt_depth = 1;
 
     std::vector<GraphChunkBuildResult> chunks;
-    chunks.push_back(build_graph_chunk(catalog, rows, "chr1", 0, 300, 0, build_opts));
+    chunks.push_back(build_graph_chunk(catalog.view_all(), rows, "chr1", 0, 300, 0, build_opts));
     ok &= check(chunks[0].chunk.candidates.size() == 2, "adapter builds two candidates");
     ok &= check(chunks[0].chunk.reads.size() == 4, "adapter builds four reads");
     ok &= check(chunks[0].chunk.read_var_profile.size() == 4, "adapter builds read profiles");
@@ -86,7 +86,7 @@ int main() {
     no_af_opts.min_af = 0.0;
     no_af_opts.max_af = 1.0;
     GraphChunkBuildResult conditional_chunk =
-        build_graph_chunk(conditional_catalog, conditional_rows, "chr1", 0, 200, 0, no_af_opts);
+        build_graph_chunk(conditional_catalog.view_all(), conditional_rows, "chr1", 0, 200, 0, no_af_opts);
     ok &= check(conditional_chunk.chunk.reads.size() == 1,
                 "conditional child-only graph read is missing");
     ok &= check(!conditional_chunk.chunk.reads.empty() &&
@@ -130,7 +130,7 @@ int main() {
 
         Options default_opts;  // min_depth=5, min_alt_depth=2, min_af=0.20, max_af=0.80
         GraphChunkBuildResult af_chunk =
-            build_graph_chunk(af_catalog, af_rows, "chr1", 0, 500, 0, default_opts);
+            build_graph_chunk(af_catalog.view_all(), af_rows, "chr1", 0, 500, 0, default_opts);
 
         ok &= check(af_chunk.chunk.candidates.size() == 1,
                     "af filter: only het site survives");
@@ -178,7 +178,7 @@ int main() {
 
         Options default_opts;
         GraphChunkBuildResult tri_chunk =
-            build_graph_chunk(tri_catalog, tri_rows, "chr1", 0, 200, 0, default_opts);
+            build_graph_chunk(tri_catalog.view_all(), tri_rows, "chr1", 0, 200, 0, default_opts);
 
         // Site survives: after dropping allele 2, alle_covs=[5,5], AF=0.5, total=10 >= min_depth=5
         ok &= check(tri_chunk.chunk.candidates.size() == 1,
@@ -222,7 +222,7 @@ int main() {
             tb_rows.push_back({"tri_both", "chr1", 100, "a2_" + std::to_string(i), 2});
 
         Options default_opts;
-        auto tb = build_graph_chunk(tri_both_cat, tb_rows, "chr1", 0, 200, 0, default_opts);
+        auto tb = build_graph_chunk(tri_both_cat.view_all(), tb_rows, "chr1", 0, 200, 0, default_opts);
 
         ok &= check(tb.chunk.candidates.size() == 2,
                     "multiallelic decomp: triallelic → 2 biallelic pairs");
@@ -266,7 +266,7 @@ int main() {
             pf_rows.push_back({"tri_pf", "chr1", 100, "a2_" + std::to_string(i), 2});
 
         Options default_opts;
-        auto pf = build_graph_chunk(tri_pf_cat, pf_rows, "chr1", 0, 200, 0, default_opts);
+        auto pf = build_graph_chunk(tri_pf_cat.view_all(), pf_rows, "chr1", 0, 200, 0, default_opts);
 
         ok &= check(pf.chunk.candidates.size() == 1,
                     "per-pair AF filter: only alt1 pair survives (alt2 high_af filtered)");
@@ -321,9 +321,9 @@ int main() {
 
         Options default_opts;
         GraphChunkBuildResult chunk0 =
-            build_graph_chunk(cat0, boundary_rows, "chr1", 0,   200, 0, default_opts);
+            build_graph_chunk(cat0.view_all(), boundary_rows, "chr1", 0,   200, 0, default_opts);
         GraphChunkBuildResult chunk1 =
-            build_graph_chunk(cat1, boundary_rows, "chr1", 200, 400, 1, default_opts);
+            build_graph_chunk(cat1.view_all(), boundary_rows, "chr1", 200, 400, 1, default_opts);
 
         // "left" (beg0=99) and "boundary" (beg0=199) both start in [0,200)
         ok &= check(chunk0.chunk.candidates.size() == 2,

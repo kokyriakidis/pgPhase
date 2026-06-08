@@ -50,23 +50,35 @@ static std::vector<size_t> filter_catalog_indices_for_contig(
     return indices;
 }
 
-// Build a chunk catalog from pre-filtered contig indices + position range.
-// Only copies sites that fall within [beg, end), avoiding a full catalog scan.
-static GraphSiteCatalog build_chunk_catalog_from_indices(
+// Build a view into the catalog for sites within [beg, end).
+// contig_indices are sorted by position (inherited from the catalog sort order),
+// so we binary-search for the first site >= beg and scan forward until >= end.
+// Returns a non-owning view — the original catalog must outlive it.
+static GraphSiteCatalogView build_chunk_catalog_view(
     const GraphSiteCatalog& catalog,
     const std::vector<size_t>& contig_indices,
-    const std::string& contig,
     hts_pos_t beg, hts_pos_t end) {
-    GraphSiteCatalog out;
-    out.sites.reserve(contig_indices.size());  // upper bound
-    for (size_t idx : contig_indices) {
-        const GraphSite& site = catalog.sites[idx];
-        const hts_pos_t site_beg0 = (site.ref_beg > 0 ? site.ref_beg : site.pos) - 1;
-        if (site_beg0 >= beg && site_beg0 < end)
-            out.sites.push_back(site);
+
+    auto site_pos0 = [&](size_t ci) -> hts_pos_t {
+        const GraphSite& s = catalog.sites[contig_indices[ci]];
+        return (s.ref_beg > 0 ? s.ref_beg : s.pos) - 1;
+    };
+
+    // Binary search for the first index whose site position >= beg.
+    size_t lo = 0, hi = contig_indices.size();
+    while (lo < hi) {
+        const size_t mid = lo + (hi - lo) / 2;
+        if (site_pos0(mid) < beg) lo = mid + 1;
+        else hi = mid;
     }
-    (void)contig;
-    return out;
+
+    GraphSiteCatalogView view;
+    view.source = &catalog.sites;
+    for (size_t i = lo; i < contig_indices.size(); ++i) {
+        if (site_pos0(i) >= end) break;
+        view.indices.push_back(contig_indices[i]);
+    }
+    return view;
 }
 
 static bam_hdr_t* build_synthetic_header(faidx_t* fai) {
@@ -360,12 +372,12 @@ static std::vector<GraphChunkBuildResult> process_graph_chunk_batch(
                     if (offset >= batch_size) break;
                     const RegionChunk& region = chunks[batch_begin + offset];
 
-                    GraphSiteCatalog chunk_catalog = build_chunk_catalog_from_indices(
-                        catalog, contig_site_indices, batch_contig,
+                    GraphSiteCatalogView chunk_view = build_chunk_catalog_view(
+                        catalog, contig_site_indices,
                         region.beg - 1, region.end);
 
                     std::vector<GraphReadAllele> chunk_rows;
-                    if (!chunk_catalog.sites.empty()) {
+                    if (!chunk_view.empty()) {
                         // Clamp the query interval to the GBZ path range.
                         // Chunks entirely outside the path are skipped.
                         hts_pos_t q_beg = region.beg - 1;
@@ -378,12 +390,12 @@ static std::vector<GraphChunkBuildResult> process_graph_chunk_batch(
                             chunk_rows = query_gbz_interval_gaf_ffi(
                                 gbz_h, gaf_h, ref_sample, batch_query_contig,
                                 q_beg, q_end,
-                                chunk_catalog, qconfig.min_mapq);
+                                chunk_view, qconfig.min_mapq);
                         }
                     }
 
                     graph_chunks[offset] = build_graph_chunk(
-                        chunk_catalog,
+                        chunk_view,
                         chunk_rows,
                         batch_contig,
                         region.beg - 1,
@@ -456,25 +468,28 @@ static std::vector<GraphChunkBuildResult> process_graph_chunk_batch_indexed_gaf(
     for (size_t w = 0; w < worker_count; ++w) {
         workers.emplace_back([&]() {
             try {
+                // One handle per thread — avoids reopening the file per chunk.
+                IndexedGafHandle gaf_handle(gaf_file);
+
                 while (true) {
                     const size_t offset = next_offset.fetch_add(1);
                     if (offset >= batch_size) break;
                     const RegionChunk& region = chunks[batch_begin + offset];
 
-                    GraphSiteCatalog chunk_catalog = build_chunk_catalog_from_indices(
-                        catalog, contig_site_indices_gaf, batch_contig_gaf,
+                    GraphSiteCatalogView chunk_view = build_chunk_catalog_view(
+                        catalog, contig_site_indices_gaf,
                         region.beg - 1, region.end);
 
                     std::vector<GraphReadAllele> chunk_rows;
-                    if (!chunk_catalog.sites.empty()) {
+                    if (!chunk_view.empty()) {
                         chunk_rows = scan_indexed_gaf_chunk(
-                            gaf_file, batch_query_contig_gaf,
+                            gaf_handle, batch_query_contig_gaf,
                             region.beg - 1, region.end,
-                            chunk_catalog, min_mapq);
+                            chunk_view, min_mapq);
                     }
 
                     graph_chunks[offset] = build_graph_chunk(
-                        chunk_catalog,
+                        chunk_view,
                         chunk_rows,
                         batch_contig_gaf,
                         region.beg - 1,
@@ -618,9 +633,12 @@ void run_collect_graph_variation(const Options& opts) {
     GraphSiteCatalog catalog = load_graph_site_catalog_from_vcf(opts.graph_sites_vcf,
                                                                  region_filters,
                                                                  true);
-    if (opts.verbose >= 1) {
-        std::cerr << "Loaded " << catalog.sites.size() << " graph sites from "
-                  << opts.graph_sites_vcf << "\n";
+    {
+        const size_t n_eligible = static_cast<size_t>(std::count_if(
+            catalog.sites.begin(), catalog.sites.end(),
+            [](const GraphSite& s) { return s.eligible; }));
+        std::cerr << "Loaded " << catalog.sites.size() << " graph sites ("
+                  << n_eligible << " eligible) from " << opts.graph_sites_vcf << "\n";
     }
 
     // 4a. Normalize site chrom/ref_contig to match the FAI naming convention.
@@ -739,6 +757,7 @@ void run_collect_graph_variation(const Options& opts) {
     // 10. Process chunks in reg_chunk_i batches (one contig per batch), streaming output.
     //     Mirrors run_collect_bam_variation's batch loop exactly.
     size_t n_variants = 0;
+    size_t n_filtered = 0;
     size_t batch_begin = 0;
     while (batch_begin < chunks.size()) {
         size_t batch_end = batch_begin + 1;
@@ -757,6 +776,9 @@ void run_collect_graph_variation(const Options& opts) {
                       catalog, chunks, batch_begin, batch_end, header.get(),
                       qconfig, ref_sample, fai_full_to_suffix, opts,
                       pgbam_sidecar.get());
+
+        for (const GraphChunkBuildResult& gc : graph_chunks)
+            n_filtered += gc.filtered_sites.size();
 
         CandidateTable variants =
             graph_chunks_to_candidate_table(graph_chunks, site_id_to_site, contig_to_tid, opts);
@@ -784,8 +806,8 @@ void run_collect_graph_variation(const Options& opts) {
 
     std::cerr << "Processed " << chunks.size() << " region chunks with " << opts.threads
               << " worker thread(s)\n";
-    std::cerr << "Collected " << n_variants << " candidate variant sites into "
-              << opts.output_tsv << "\n";
+    std::cerr << "Collected " << n_variants << " candidate variant sites ("
+              << n_filtered << " filtered) into " << opts.output_tsv << "\n";
     if (!opts.output_vcf.empty())
         std::cerr << "Wrote candidate VCF to " << opts.output_vcf << "\n";
     if (!opts.output_phased_vcf.empty())
@@ -825,7 +847,7 @@ static void print_graph_collect_help() {
         << "      --autosome                Process chr1-22 / 1-22 only\n"
         << "      --sample NAME             Reference sample name for GBZ interval queries\n"
         << "                                (auto-derived from FASTA if not provided)\n"
-        << "      --gbz-query-bin FILE      Path to GBZ-base query binary [query]\n"
+
         << "      --hifi                    HiFi read mode [default]\n"
         << "      --ont                     ONT read mode (enables strand-bias filter)\n"
         << "      --strand-bias-pval FLOAT  Max p-value for ONT strand-bias filter [0.01]\n"
@@ -875,7 +897,6 @@ enum GraphCollectOption {
     kGcRegionFile,
     kGcAutosome,
     kGcSample,
-    kGcGbzQueryBin,
     kGcOnt,
     kGcHifi,
     kGcStrandBiasPval,
@@ -930,7 +951,6 @@ int collect_graph_variation(int argc, char* argv[]) {
         {"gbz-db",            required_argument, nullptr, kGcGbzDb},
         {"gaf-db",            required_argument, nullptr, kGcGafDb},
         {"sample",            required_argument, nullptr, kGcSample},
-        {"gbz-query-bin",     required_argument, nullptr, kGcGbzQueryBin},
         {"hifi",              no_argument,       nullptr, kGcHifi},
         {"ont",               no_argument,       nullptr, kGcOnt},
         {"strand-bias-pval",  required_argument, nullptr, kGcStrandBiasPval},
@@ -973,7 +993,6 @@ int collect_graph_variation(int argc, char* argv[]) {
             case kGcGbzDb:        opts.gbz_db = optarg; break;
             case kGcGafDb:        opts.gaf_db = optarg; break;
             case kGcSample:       opts.graph_sample = optarg; break;
-            case kGcGbzQueryBin:  opts.gbz_query_bin = optarg; break;
             case kGcHifi:         opts.read_technology = ReadTechnology::Hifi; break;
             case kGcOnt:          opts.read_technology = ReadTechnology::Ont; break;
             case kGcStrandBiasPval: opts.strand_bias_pval = std::stod(optarg); break;

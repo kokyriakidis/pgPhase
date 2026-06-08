@@ -59,7 +59,7 @@ struct GraphChunkBuildResult {
 // Convert graph-space allele observations into a PhasingChunk for phasing.
 // Applies parent-snarl gating, multi-allelic→biallelic decomposition,
 // and three-phase depth/AF filtering.
-GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalog& catalog,
+GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
                                                const std::vector<GraphReadAllele>& rows,
                                                const std::string& contig,
                                                hts_pos_t beg,

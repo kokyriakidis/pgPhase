@@ -191,11 +191,6 @@ struct Options {
     std::string gaf_db;
     /** Optional precomputed vg deconstruct VCF used as a development/debug graph-site catalog. */
     std::string graph_sites_vcf;
-    /** GBZ-base query binary. */
-#ifndef GBZ_QUERY_DEFAULT
-#define GBZ_QUERY_DEFAULT "query"
-#endif
-    std::string gbz_query_bin = GBZ_QUERY_DEFAULT;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
     /** CLI command string used for PG:CL header field in phased SAM/BAM/CRAM output. */
     std::string command_line;

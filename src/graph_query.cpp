@@ -4,7 +4,6 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
-#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -15,8 +14,6 @@
 #include <htslib/tbx.h>
 
 namespace pgphase_collect {
-
-using GraphReadAlleleThreadEmitter = std::function<void(size_t, GraphReadAllele&&)>;
 
 namespace {
 
@@ -179,18 +176,18 @@ void add_boundary_entry(std::vector<BoundarySiteEntry>& entries,
     entries.push_back({handle, site_index});
 }
 
-// Convert a GraphSiteCatalog into a CompactGraphSiteIndex: flatten allele
+// Convert a GraphSiteCatalogView into a CompactGraphSiteIndex: flatten allele
 // walks into contiguous FlatAllelePacks and build a sorted boundary→site
 // index for O(log n) handle lookup during read scanning.
-bool build_compact_graph_site_index(const GraphSiteCatalog& catalog,
+bool build_compact_graph_site_index(const GraphSiteCatalogView& catalog,
                                     CompactGraphSiteIndex& out) {
     out = {};
-    out.sites.reserve(catalog.sites.size());
+    out.sites.reserve(catalog.size());
     // Pre-allocate boundary entries: ~4 entries per site (left, right, left_rev, right_rev).
-    out.boundary_entries.reserve(catalog.sites.size() * 4);
+    out.boundary_entries.reserve(catalog.size() * 4);
 
-    for (size_t i = 0; i < catalog.sites.size(); ++i) {
-        const GraphSite& site = catalog.sites[i];
+    for (size_t i = 0; i < catalog.size(); ++i) {
+        const GraphSite& site = catalog[i];
         if (!graph_site_is_queryable(site)) continue;
         if (site.allele_walks.empty() || site.allele_walks[0].size() < 2) continue;
 
@@ -376,6 +373,10 @@ int match_compact_site_on_read(
 // Emits a GraphReadAllele for every successful match.  Scratch buffers
 // (read_walk, boundary_positions, candidates, site_marks) are caller-owned
 // to avoid per-line allocation.
+//
+// Templated on the emitter to allow the compiler to inline the callback,
+// avoiding std::function virtual dispatch overhead on the hot path.
+template <typename EmitFn>
 size_t scan_gaf_line_compact(std::string_view line,
                              int first_gaf_column,
                              const CompactGraphSiteIndex& compact_index,
@@ -386,7 +387,7 @@ size_t scan_gaf_line_compact(std::string_view line,
                              std::vector<size_t>& candidates,
                              std::vector<uint32_t>& site_marks,
                              uint32_t& mark_stamp,
-                             const GraphReadAlleleThreadEmitter& emit) {
+                             EmitFn&& emit) {
     if (line.empty() || line[0] == '#') return 0;
 
     GafCoreFields fields;
@@ -449,30 +450,60 @@ static int tbx_seq_tid_with_pangenome_fallback(tbx_t* tbx, const std::string& co
     return tbx_name2id(tbx, contig.substr(h + 1).c_str());
 }
 
-void require_indexed_gaf(const std::string& indexed_gaf_file) {
-    htsFile* fp = hts_open(indexed_gaf_file.c_str(), "r");
-    if (fp == nullptr) {
-        throw std::runtime_error("failed to open indexed GAF: " + indexed_gaf_file);
-    }
-    hts_close(fp);
+// --- IndexedGafHandle RAII implementation ---
 
-    tbx_t* tbx = tbx_index_load(indexed_gaf_file.c_str());
-    if (tbx == nullptr) {
-        throw std::runtime_error(
-            "indexed GAF requires a tabix index (.tbi): " + indexed_gaf_file);
+IndexedGafHandle::IndexedGafHandle(const std::string& path) {
+    fp = hts_open(path.c_str(), "r");
+    if (fp == nullptr) {
+        throw std::runtime_error("failed to open indexed GAF: " + path);
     }
-    tbx_destroy(tbx);
+    tbx = tbx_index_load(path.c_str());
+    if (tbx == nullptr) {
+        hts_close(fp);
+        fp = nullptr;
+        throw std::runtime_error(
+            "indexed GAF requires a tabix index (.tbi): " + path);
+    }
+}
+
+IndexedGafHandle::~IndexedGafHandle() {
+    if (tbx != nullptr) tbx_destroy(tbx);
+    if (fp != nullptr) hts_close(fp);
+}
+
+IndexedGafHandle::IndexedGafHandle(IndexedGafHandle&& o) noexcept
+    : fp(o.fp), tbx(o.tbx) {
+    o.fp  = nullptr;
+    o.tbx = nullptr;
+}
+
+IndexedGafHandle& IndexedGafHandle::operator=(IndexedGafHandle&& o) noexcept {
+    if (this != &o) {
+        if (tbx != nullptr) tbx_destroy(tbx);
+        if (fp != nullptr) hts_close(fp);
+        fp    = o.fp;
+        tbx   = o.tbx;
+        o.fp  = nullptr;
+        o.tbx = nullptr;
+    }
+    return *this;
+}
+
+void require_indexed_gaf(const std::string& indexed_gaf_file) {
+    // Validate by constructing a handle (opens + loads index) then
+    // immediately destroying it.  Throws on failure.
+    IndexedGafHandle handle(indexed_gaf_file);
 }
 
 std::vector<GraphReadAllele>
-scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
+scan_indexed_gaf_chunk(IndexedGafHandle& handle,
                        const std::string& contig,
                        hts_pos_t beg,
                        hts_pos_t end,
-                       const GraphSiteCatalog& catalog,
+                       const GraphSiteCatalogView& catalog,
                        int min_mapq) {
     if (contig.empty() || end <= beg) return {};
-    if (catalog.sites.empty()) return {};
+    if (catalog.empty()) return {};
 
     CompactGraphSiteIndex compact_index;
     if (!build_compact_graph_site_index(catalog, compact_index)) {
@@ -480,29 +511,10 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
             "indexed GAF chunk scan requires queryable graph sites with numeric node IDs");
     }
 
-    htsFile* raw_fp = hts_open(indexed_gaf_file.c_str(), "r");
-    if (raw_fp == nullptr) {
-        throw std::runtime_error("failed to open indexed GAF: " + indexed_gaf_file);
-    }
-    struct HtsFileGuard {
-        htsFile* fp = nullptr;
-        ~HtsFileGuard() { if (fp != nullptr) hts_close(fp); }
-    } fp_guard{raw_fp};
-
-    tbx_t* raw_tbx = tbx_index_load(indexed_gaf_file.c_str());
-    if (raw_tbx == nullptr) {
-        throw std::runtime_error(
-            "indexed GAF requires a tabix index (.tbi): " + indexed_gaf_file);
-    }
-    struct TbxGuard {
-        tbx_t* tbx = nullptr;
-        ~TbxGuard() { if (tbx != nullptr) tbx_destroy(tbx); }
-    } tbx_guard{raw_tbx};
-
-    const int tid = tbx_seq_tid_with_pangenome_fallback(raw_tbx, contig);
+    const int tid = tbx_seq_tid_with_pangenome_fallback(handle.tbx, contig);
     if (tid < 0) return {};
 
-    hts_itr_t* raw_itr = tbx_itr_queryi(raw_tbx, tid, beg, end);
+    hts_itr_t* raw_itr = tbx_itr_queryi(handle.tbx, tid, beg, end);
     if (raw_itr == nullptr) return {};
     struct IterGuard {
         hts_itr_t* itr = nullptr;
@@ -522,7 +534,7 @@ scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
         ~KStringGuard() { if (line != nullptr) ks_free(line); }
     } line_guard{&line};
 
-    while (tbx_itr_next(raw_fp, raw_tbx, raw_itr, &line) >= 0) {
+    while (tbx_itr_next(handle.fp, handle.tbx, raw_itr, &line) >= 0) {
         scan_gaf_line_compact(
             std::string_view(line.s, line.l), 3, compact_index, min_mapq, 0,
             read_walk, boundary_positions, candidates, site_marks, mark_stamp,
@@ -626,7 +638,7 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
                             const std::string& contig,
                             hts_pos_t beg,
                             hts_pos_t end,
-                            const GraphSiteCatalog& catalog,
+                            const GraphSiteCatalogView& catalog,
                             int min_mapq)
 {
     if (!gbz_handle) throw std::runtime_error("null GBZ handle for FFI query");
@@ -635,10 +647,8 @@ query_gbz_interval_gaf_ffi(void* gbz_handle,
         throw std::runtime_error("invalid interval for graph query: " + contig +
                                  ":" + std::to_string(beg) + ".." + std::to_string(end));
 
-    // Build compact numeric site index from catalog walks.
     CompactGraphSiteIndex compact_index;
     if (!build_compact_graph_site_index(catalog, compact_index)) {
-        // Fallback: catalog has no compactable sites.
         return {};
     }
 

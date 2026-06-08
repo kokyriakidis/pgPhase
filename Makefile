@@ -13,12 +13,7 @@ GBZ_QUERY_BIN = $(GBZ_BASE_ROOT)/target/release/query
 GAF2DB_BIN    = $(GBZ_BASE_ROOT)/target/release/gaf2db
 GBZ2DB_BIN    = $(GBZ_BASE_ROOT)/target/release/gbz2db
 
-GBZ_QUERY_DEFAULT ?= $(GBZ_BASE_ROOT)/target/release/query
-GAF2DB_DEFAULT    ?= $(GBZ_BASE_ROOT)/target/release/gaf2db
-
 CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -MMD -MP
-CXXFLAGS += -DGBZ_QUERY_DEFAULT='"$(GBZ_QUERY_DEFAULT)"' \
-            -DGAF2DB_DEFAULT='"$(GAF2DB_DEFAULT)"'
 WFA_CPPFLAGS = -I$(WFA2_ROOT)
 AB_CPPFLAGS = -I$(ABPOA_ROOT)/include
 EDLIB_CPPFLAGS = -I$(EDLIB_ROOT)/include

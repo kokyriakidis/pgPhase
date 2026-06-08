@@ -230,7 +230,7 @@ void classify_graph_candidates(PhasingChunk& chunk, const Options& opts) {
 //   7. Classify surviving candidates (het/hom/low-cov/strand-bias)
 //   8. Phase 3: remap read observations to biallelic pair space, drop pruned
 //   9. Build ReadVariantProfile + cgranges index for k-means
-GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalog& catalog,
+GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
                                                const std::vector<GraphReadAllele>& rows,
                                                const std::string& /*contig*/,
                                                hts_pos_t beg,
@@ -265,8 +265,8 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalog& catalog,
     std::vector<int> parent_candidate;
     std::vector<std::vector<int>> conditional_parent_alleles;
     std::vector<size_t> catalog_site_idx_phase1;
-    for (size_t site_i = 0; site_i < catalog.sites.size(); ++site_i) {
-        const GraphSite& site = catalog.sites[site_i];
+    for (size_t site_i = 0; site_i < catalog.size(); ++site_i) {
+        const GraphSite& site = catalog[site_i];
         const std::string sid = graph_site_key_str(site);
         if (!site.eligible) {
             out.filtered_sites.push_back({sid, 0, 0, 0, 0.0, "precandidate_ineligible"});
@@ -295,8 +295,8 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalog& catalog,
     // Wire parent→child snarl relationships.  A nested snarl's observations
     // are only counted when the read also traverses a qualifying allele of the
     // parent snarl (conditional_parent_alleles, from the VCF PA field).
-    for (size_t site_i = 0; site_i < catalog.sites.size(); ++site_i) {
-        const GraphSite& site = catalog.sites[site_i];
+    for (size_t site_i = 0; site_i < catalog.size(); ++site_i) {
+        const GraphSite& site = catalog[site_i];
         if (site.parent.empty()) continue;
         const std::string key = graph_site_key_str(site);
         auto child_it = site_to_candidate.find(key);
@@ -558,7 +558,7 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalog& catalog,
 
             // Derive variant type from VCF REF/ALT sequence lengths.
             {
-                const GraphSite& site = catalog.sites[catalog_site_idx_phase1[i]];
+                const GraphSite& site = catalog[catalog_site_idx_phase1[i]];
                 const size_t ref_len = site.ref.size();
                 const size_t alt_idx = static_cast<size_t>(orig_alt - 1);
                 const size_t alt_len = alt_idx < site.alts.size() ? site.alts[alt_idx].size() : ref_len;

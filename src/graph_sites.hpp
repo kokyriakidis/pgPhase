@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <iosfwd>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace pgphase_collect {
@@ -38,7 +37,6 @@ struct GraphSite {
     std::string id;              // VCF ID field (snarl identifier)
     std::string ref;
     std::vector<std::string> alts;
-    std::unordered_map<std::string, std::string> info;
     std::vector<std::string> allele_traversals;  // raw AT field entries
     std::vector<GraphWalk> allele_walks;          // parsed walks (one per allele)
     int level = -1;              // snarl nesting level (LV info field)
@@ -54,9 +52,34 @@ struct GraphSite {
     hts_pos_t order_pos() const { return pos; }
 };
 
+struct GraphSiteCatalogView;
+
 struct GraphSiteCatalog {
     std::vector<GraphSite> sites;
+
+    // Return a view covering all sites (no copy).
+    GraphSiteCatalogView view_all() const;
 };
+
+// Lightweight non-owning view into a subset of a GraphSiteCatalog's sites.
+// Avoids deep-copying GraphSite objects when building per-chunk catalogs.
+// The referenced catalog must outlive the view.
+struct GraphSiteCatalogView {
+    const std::vector<GraphSite>* source = nullptr;
+    std::vector<size_t> indices;
+
+    size_t size() const { return indices.size(); }
+    bool empty() const { return indices.empty(); }
+    const GraphSite& operator[](size_t i) const { return (*source)[indices[i]]; }
+};
+
+inline GraphSiteCatalogView GraphSiteCatalog::view_all() const {
+    GraphSiteCatalogView v;
+    v.source = &sites;
+    v.indices.resize(sites.size());
+    for (size_t i = 0; i < sites.size(); ++i) v.indices[i] = i;
+    return v;
+}
 
 // When `filters` is non-empty only sites overlapping at least one filter are loaded.
 // For bgzipped VCFs with a .tbi/.csi index, tabix is used to seek directly to each

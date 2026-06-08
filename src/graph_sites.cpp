@@ -155,24 +155,24 @@ void append_graph_site_from_vcf_data_line(const char* buf,
     site.id = fields[2];
     site.ref = fields[3];
     if (fields[4] != ".") site.alts = split_char(fields[4], ',');
-    site.info = parse_info(fields[7]);
-    site.allele_traversals = parse_allele_traversals(site.info);
+    const auto info = parse_info(fields[7]);
+    site.allele_traversals = parse_allele_traversals(info);
     bool malformed_walk = false;
     site.allele_walks = parse_allele_walks(site.allele_traversals, malformed_walk);
-    site.level = parse_optional_int(site.info, "LV");
-    site.parent = find_first_info_value(site.info, {"PS", "PARENT", "Parent"});
-    site.root = find_first_info_value(site.info, {"RS", "ROOT", "Root"});
-    const std::string rc_value = find_first_info_value(site.info, {"RC", "REF_CONTIG", "RefContig"});
+    site.level = parse_optional_int(info, "LV");
+    site.parent = find_first_info_value(info, {"PS", "PARENT", "Parent"});
+    site.root = find_first_info_value(info, {"RS", "ROOT", "Root"});
+    const std::string rc_value = find_first_info_value(info, {"RC", "REF_CONTIG", "RefContig"});
     if (!rc_value.empty()) {
         const auto hp = rc_value.rfind('#');
         site.ref_contig = (hp != std::string::npos) ? rc_value.substr(hp + 1) : rc_value;
     }
     site.ref_beg = site.pos;
     site.ref_end = site.pos;
-    const std::string end_value = find_first_info_value(site.info, {"END"});
+    const std::string end_value = find_first_info_value(info, {"END"});
     if (!end_value.empty()) site.ref_end = static_cast<hts_pos_t>(std::stoll(end_value));
     site.conditional_parent_alleles =
-        parse_optional_int_list(site.info, {"PA", "PARENT_ALLELE", "PARENT_ALLELES"});
+        parse_optional_int_list(info, {"PA", "PARENT_ALLELE", "PARENT_ALLELES"});
     site.has_spanning_deletion = contains_spanning_deletion(site.alts);
     if (malformed_walk) {
         site.eligible = false;
@@ -181,7 +181,6 @@ void append_graph_site_from_vcf_data_line(const char* buf,
         site.skip_reason = graph_site_validation_skip_reason(site);
         site.eligible = site.skip_reason.empty();
     }
-    std::unordered_map<std::string, std::string>().swap(site.info);
     if (!keep_allele_traversal_strings) {
         std::vector<std::string>().swap(site.allele_traversals);
     }
