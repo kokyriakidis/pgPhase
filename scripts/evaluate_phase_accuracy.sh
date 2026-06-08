@@ -12,6 +12,44 @@
 # Requirements: samtools >= 1.17, minimap2 >= 2.26, diplinator,
 #               python3 (+ matplotlib optional)
 #
+# ── Step 0: Generate inputs (uncomment and adjust paths) ─────────────
+#
+# # BAM pipeline (HiFi reads aligned to linear reference):
+# ./pgphase collect-bam-variation \
+#     --ref GRCh38.fa \
+#     --bam HG002_hifi.bam \
+#     --hifi \
+#     --phased-vcf-out phased.vcf \
+#     --out-bam phased.bam \
+#     -o candidates.tsv \
+#     -t 16
+#
+# # Graph pipeline (HiFi reads aligned to pangenome graph):
+# # 1. Build site catalog from GBZ
+# ./pgphase build-snarl-catalog \
+#     --ref-sample CHM13 \
+#     -o chr20.sites.vcf.gz \
+#     chr20.gbz
+#
+# # 2. Build databases
+# third_party/gbz-base/target/release/gbz2db chr20.gbz chr20.gbz.db
+# third_party/gbz-base/target/release/gaf2db \
+#     -r chr20.gbz -o HG002.gaf.db --overwrite HG002.gaf
+#
+# # 3. Run graph-based phasing
+# ./pgphase collect-graph-variation \
+#     --ref ref.fa \
+#     --sites chr20.sites.vcf.gz \
+#     --gbz-db chr20.gbz.db \
+#     --gaf-db HG002.gaf.db \
+#     --sample CHM13 \
+#     --phased-vcf-out phased.vcf \
+#     --phased-bam-out phased.bam \
+#     -o candidates.tsv \
+#     -t 16
+#
+# ── Then run this script ─────────────────────────────────────────────
+#
 # Usage:
 #   ./evaluate_phase_accuracy.sh \
 #       --phased-bam pgphase_phased.bam \
