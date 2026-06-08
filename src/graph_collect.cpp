@@ -759,7 +759,7 @@ enum GraphCollectOption {
     kGcChunkSize,
     kGcPhasedVcf,
     kGcGbzDb,
-    kGcGafFile,  // removed; kept for error message if user passes it
+
     kGcGafDb,
     kGcRegionFile,
     kGcAutosome,
@@ -814,8 +814,7 @@ int collect_graph_variation(int argc, char* argv[]) {
         {"region",            required_argument, nullptr, 'r'},
         {"region-file",       required_argument, nullptr, kGcRegionFile},
         {"autosome",          no_argument,       nullptr, kGcAutosome},
-        {"gaf",               required_argument, nullptr, kGcGafFile},
-        {"gaf-file",          required_argument, nullptr, kGcGafFile},
+
         {"gbz-db",            required_argument, nullptr, kGcGbzDb},
         {"gaf-db",            required_argument, nullptr, kGcGafDb},
         {"sample",            required_argument, nullptr, kGcSample},
@@ -858,10 +857,7 @@ int collect_graph_variation(int argc, char* argv[]) {
             case 'r': opts.regions.push_back(optarg); break;
             case kGcRegionFile:   opts.region_file = optarg; break;
             case kGcAutosome:     opts.autosome = true; break;
-            case kGcGafFile:
-                std::cerr << "Error: --gaf is no longer supported. "
-                             "Use --gbz-db + --gaf-db instead.\n";
-                return 1;
+
             case kGcGbzDb:        opts.gbz_db = optarg; break;
             case kGcGafDb:        opts.gaf_db = optarg; break;
             case kGcSample:       opts.graph_sample = optarg; break;
