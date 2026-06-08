@@ -2,7 +2,7 @@
 
 Variant calling and haplotype phasing for long reads, with two pipelines:
 
-- **`collect-graph-variation`** — call and phase variants from a pangenome graph (GBZ + GAF).
+- **`collect-graph-variation`** — call and phase variants from pangenome graph alignments (coordinate-indexed GAF).
 - **`collect-bam-variation`** — call and phase SNPs/indels from BAM/CRAM alignments (HiFi, ONT, short reads).
 - **`build-snarl-catalog`** — preprocess a GBZ pangenome graph into a phasing site catalog VCF for `collect-graph-variation`.
 
@@ -11,7 +11,7 @@ Variant calling and haplotype phasing for long reads, with two pipelines:
 - C++17 compiler (GCC ≥ 8 or Clang ≥ 7)
 - [htslib](https://github.com/samtools/htslib) (development headers and library)
 - zlib, pthreads
-- Rust toolchain (for the `gbz-base` graph query tools; install via [rustup](https://rustup.rs/))
+<!-- - Rust toolchain (for the `gbz-base` graph query tools; install via [rustup](https://rustup.rs/)) -->
 - [vg](https://github.com/vgteam/vg) (only needed for `build-snarl-catalog`)
 - [samtools](https://github.com/samtools/samtools) (optional; needed for `--refine-aln` coordinate sorting)
 
@@ -24,8 +24,8 @@ cd pgphase
 # Build third-party libraries (WFA2, abPOA)
 make third-party-libs
 
-# Build the gbz-base Rust tools (query, gaf2db, gbz2db)
-make gbz-base
+# Build the gbz-base Rust tools (query, gaf2db, gbz2db) — optional
+# make gbz-base
 
 # Build pgphase
 make -j$(nproc)
@@ -62,13 +62,30 @@ done
 wait
 ```
 
-2. Run graph-based phasing:
+2. Annotate and index the GAF with [pggaf](https://github.com/kokyriakidis/pggaf):
+
+```bash
+# Add reference coordinate tags (rc/rb/re) to each alignment
+pggaf annotate-gaf \
+    --gaf reads.gaf \
+    --gbz full.gbz \
+    --ref-sample CHM13 \
+    --out-gaf reads.annotated.gaf \
+    --out-sets reads.pgs
+
+# Coordinate-sort and tabix-index for region queries
+pggaf index-gaf \
+    --in reads.annotated.gaf \
+    --out reads.coord.gaf.gz
+```
+
+3. Run graph-based phasing:
 
 ```bash
 pgphase collect-graph-variation \
     --ref ref.fa \
     --sites chr20.sites.vcf.gz \
-    --gaf reads.gaf \
+    --gaf reads.coord.gaf.gz \
     --phased-vcf-out phased.vcf \
     --phased-bam-out phased.bam \
     -t 8
@@ -104,16 +121,17 @@ pgphase collect-bam-variation \
 
 ### `collect-graph-variation`
 
-Collects and phases variants using a pangenome graph site catalog and GAF read alignments.
+Collects and phases variants using a pangenome graph site catalog and coordinate-indexed GAF read alignments.
+
+**Inputs:**
+- A sites VCF from `build-snarl-catalog` (bgzipped + tabix-indexed)
+- A coordinate-indexed GAF from [pggaf](https://github.com/kokyriakidis/pggaf) (bgzipped + tabix-indexed)
 
 | Option | Description | Default |
 |---|---|---|
 | `--ref FILE` | Reference FASTA (indexed) | required |
 | `--sites FILE` | Sites VCF (bgzipped + tabix-indexed) | required |
-| `--gaf FILE` | Coordinate-indexed GAF from [pggaf](https://github.com/kokyriakidis/pggaf) (bgzipped + tabix) | — |
-| `--gbz-db FILE` | GBZ graph database (from `gbz2db`) | — |
-| `--gaf-db FILE` | GAF-base read alignment database (from `gaf2db`) | — |
-| `--sample NAME` | Reference sample name for GBZ queries | auto-detected |
+| `--gaf FILE` | Coordinate-indexed GAF from [pggaf](https://github.com/kokyriakidis/pggaf) (bgzipped + tabix) | required |
 | `--hifi` | HiFi read mode | default |
 | `--ont` | ONT read mode (enables strand-bias filter) | off |
 | `--strand-bias-pval FLOAT` | Max p-value for ONT strand-bias filter | 0.01 |
@@ -122,8 +140,6 @@ Collects and phases variants using a pangenome graph site catalog and GAF read a
 | `--phased-bam-out FILE` | Unaligned BAM with HP/PS tags | — |
 | `-r STR` | Restrict to region (repeatable) | whole genome |
 | `-t INT` | Worker threads | 1 |
-
-Provide either `--gaf` (coordinate-indexed GAF from [pggaf](https://github.com/kokyriakidis/pggaf), supports `--pgbam-file` stitching) or `--gbz-db` + `--gaf-db` (pre-built databases from gbz-base).
 
 ### `collect-bam-variation`
 
