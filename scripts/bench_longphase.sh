@@ -4,17 +4,13 @@
 #                      and produce a haplotagged BAM.
 #
 # Pipeline:
-#   1. DeepVariant (via Docker) — call variants from aligned BAM
-#   2. longphase phase          — phase variants using reads
-#   3. longphase haplotag       — tag each read with HP/PS
+#   1. DeepVariant       — call variants from aligned BAM
+#   2. longphase phase   — phase variants using reads
+#   3. longphase haplotag — tag each read with HP/PS
 #
 # Environment setup (run once):
 #   micromamba create -f envs/longphase.yaml -y
 #   micromamba activate bench-longphase
-#
-# Prerequisites:
-#   - docker (for DeepVariant)
-#   - micromamba environment bench-longphase (longphase, samtools, bgzip, tabix)
 #
 # Usage:
 #   ./scripts/bench_longphase.sh \
@@ -33,7 +29,6 @@ OUTDIR=""
 THREADS=16
 PLATFORM="pb"
 INDELS=true
-DV_VERSION="1.10.0"
 DV_MODEL="PACBIO"
 
 usage() {
@@ -51,7 +46,6 @@ Optional:
   --ont            Use ONT mode instead of PacBio HiFi [default: --pb]
   --threads INT    Threads [16]
   --no-indels      Skip indel co-phasing
-  --dv-version STR DeepVariant Docker tag [1.10.0]
   --dv-model STR   DeepVariant model type [PACBIO]
   -h, --help       Show this help
 EOF
@@ -68,7 +62,6 @@ while [[ $# -gt 0 ]]; do
         --threads)    THREADS="$2";    shift 2 ;;
         --ont)        PLATFORM="ont";  shift ;;
         --no-indels)  INDELS=false;    shift ;;
-        --dv-version) DV_VERSION="$2"; shift 2 ;;
         --dv-model)   DV_MODEL="$2";   shift 2 ;;
         -h|--help)    usage ;;
         *)            echo "Unknown option: $1" >&2; usage ;;
@@ -88,11 +81,6 @@ done
 
 mkdir -p "$OUTDIR"
 
-REF_ABS="$(realpath "$REF")"
-BAM_ABS="$(realpath "$BAM")"
-REF_DIR="$(dirname "$REF_ABS")"
-BAM_DIR="$(dirname "$BAM_ABS")"
-
 DV_VCF="$OUTDIR/deepvariant.vcf.gz"
 PREFIX="$OUTDIR/phased"
 PHASED_VCF="${PREFIX}.vcf"
@@ -108,19 +96,14 @@ if [[ -n "$VCF" ]]; then
     echo "[1/3] Using provided VCF: $VCF"
     DV_VCF="$VCF"
 elif [[ ! -f "$DV_VCF" ]]; then
-    echo "[1/3] Calling variants with DeepVariant ${DV_VERSION} (model: ${DV_MODEL}) ..."
-    command -v docker >/dev/null 2>&1 || { echo "Error: docker not found" >&2; exit 1; }
-    OUTDIR_ABS="$(realpath "$OUTDIR")"
-    { time docker run \
-        -v "${REF_DIR}":"/ref_dir" \
-        -v "${BAM_DIR}":"/bam_dir" \
-        -v "${OUTDIR_ABS}":"/output" \
-        google/deepvariant:"${DV_VERSION}" \
-        /opt/deepvariant/bin/run_deepvariant \
+    echo "[1/3] Calling variants with DeepVariant (model: ${DV_MODEL}) ..."
+    command -v run_deepvariant >/dev/null 2>&1 || \
+        { echo "Error: run_deepvariant not found. Activate bench-longphase env." >&2; exit 1; }
+    { time run_deepvariant \
         --model_type="${DV_MODEL}" \
-        --ref="/ref_dir/$(basename "$REF_ABS")" \
-        --reads="/bam_dir/$(basename "$BAM_ABS")" \
-        --output_vcf="/output/deepvariant.vcf.gz" \
+        --ref="$REF" \
+        --reads="$BAM" \
+        --output_vcf="$DV_VCF" \
         --num_shards="$THREADS" ; } 2> >(tee "$TIMING_LOG" >&2)
 else
     echo "[1/3] DeepVariant VCF exists, skipping."

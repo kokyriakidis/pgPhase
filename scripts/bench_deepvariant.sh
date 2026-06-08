@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 #
-# bench_deepvariant.sh — Call variants with DeepVariant (via Docker).
+# bench_deepvariant.sh — Call variants with DeepVariant.
 #
 # Produces a VCF that can be passed to the phasing benchmark scripts
 # via --vcf, so DeepVariant only needs to run once.
 #
-# Prerequisites:
-#   - docker
+# Environment setup (run once):
+#   micromamba create -f envs/whatshap.yaml -y   # or any env that includes deepvariant
+#   micromamba activate bench-whatshap
 #
 # Usage:
 #   ./scripts/bench_deepvariant.sh \
@@ -26,7 +27,6 @@ REF=""
 BAM=""
 OUTDIR=""
 THREADS=16
-DV_VERSION="1.10.0"
 DV_MODEL="PACBIO"
 REGIONS=""
 
@@ -41,7 +41,6 @@ Required:
 
 Optional:
   --threads INT    Threads / num_shards [16]
-  --dv-version STR DeepVariant Docker tag [1.10.0]
   --dv-model STR   Model type [PACBIO]
                    One of: WGS, WES, PACBIO, ONT_R104, HYBRID_PACBIO_ILLUMINA
   --regions STR    Restrict to region (e.g. chr20)
@@ -56,7 +55,6 @@ while [[ $# -gt 0 ]]; do
         --bam)        BAM="$2";        shift 2 ;;
         --outdir)     OUTDIR="$2";     shift 2 ;;
         --threads)    THREADS="$2";    shift 2 ;;
-        --dv-version) DV_VERSION="$2"; shift 2 ;;
         --dv-model)   DV_MODEL="$2";   shift 2 ;;
         --regions)    REGIONS="$2";    shift 2 ;;
         -h|--help)    usage ;;
@@ -71,15 +69,10 @@ done
 for f in "$REF" "$BAM"; do
     [[ -f "$f" ]] || { echo "Error: file not found: $f" >&2; exit 1; }
 done
-command -v docker >/dev/null 2>&1 || { echo "Error: docker not found in PATH" >&2; exit 1; }
+command -v run_deepvariant >/dev/null 2>&1 || \
+    { echo "Error: run_deepvariant not found. Activate a micromamba env with deepvariant." >&2; exit 1; }
 
 mkdir -p "$OUTDIR"
-
-REF_ABS="$(realpath "$REF")"
-BAM_ABS="$(realpath "$BAM")"
-REF_DIR="$(dirname "$REF_ABS")"
-BAM_DIR="$(dirname "$BAM_ABS")"
-OUTDIR_ABS="$(realpath "$OUTDIR")"
 
 DV_VCF="$OUTDIR/deepvariant.vcf.gz"
 DV_GVCF="$OUTDIR/deepvariant.g.vcf.gz"
@@ -89,21 +82,16 @@ REGION_ARGS=""
 [[ -n "$REGIONS" ]] && REGION_ARGS="--regions=$REGIONS"
 
 if [[ ! -f "$DV_VCF" ]]; then
-    echo "Calling variants with DeepVariant ${DV_VERSION} (model: ${DV_MODEL}) ..."
+    echo "Calling variants with DeepVariant (model: ${DV_MODEL}) ..."
     [[ -n "$REGIONS" ]] && echo "  Region: $REGIONS"
     echo "  Threads: $THREADS"
 
-    { time docker run \
-        -v "${REF_DIR}":"/ref_dir" \
-        -v "${BAM_DIR}":"/bam_dir" \
-        -v "${OUTDIR_ABS}":"/output" \
-        google/deepvariant:"${DV_VERSION}" \
-        /opt/deepvariant/bin/run_deepvariant \
+    { time run_deepvariant \
         --model_type="${DV_MODEL}" \
-        --ref="/ref_dir/$(basename "$REF_ABS")" \
-        --reads="/bam_dir/$(basename "$BAM_ABS")" \
-        --output_vcf="/output/deepvariant.vcf.gz" \
-        --output_gvcf="/output/deepvariant.g.vcf.gz" \
+        --ref="$REF" \
+        --reads="$BAM" \
+        --output_vcf="$DV_VCF" \
+        --output_gvcf="$DV_GVCF" \
         --num_shards="$THREADS" \
         $REGION_ARGS ; } 2> >(tee "$TIMING_LOG" >&2)
 else

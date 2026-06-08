@@ -4,19 +4,12 @@
 #                    and produce a haplotagged BAM.
 #
 # Pipeline:
-#   1. DeepVariant (via Docker) — call variants from aligned BAM
-#   2. hiphase                  — phase + haplotag in a single pass
-#
-# HiPhase jointly phases small variants and SVs from PacBio HiFi data.
-# It performs phasing and haplotagging simultaneously.
+#   1. DeepVariant — call variants from aligned BAM
+#   2. hiphase     — phase + haplotag in a single pass
 #
 # Environment setup (run once):
 #   micromamba create -f envs/hiphase.yaml -y
 #   micromamba activate bench-hiphase
-#
-# Prerequisites:
-#   - docker (for DeepVariant)
-#   - micromamba environment bench-hiphase (hiphase, samtools)
 #
 # Usage:
 #   ./scripts/bench_hiphase.sh \
@@ -33,7 +26,6 @@ VCF=""
 SV_VCF=""
 OUTDIR=""
 THREADS=16
-DV_VERSION="1.10.0"
 DV_MODEL="PACBIO"
 
 usage() {
@@ -49,7 +41,6 @@ Optional:
   --vcf FILE       Pre-called VCF (skip DeepVariant step)
   --sv-vcf FILE    SV VCF for joint phasing (e.g. from pbsv)
   --threads INT    Threads [16]
-  --dv-version STR DeepVariant Docker tag [1.10.0]
   --dv-model STR   DeepVariant model type [PACBIO]
   -h, --help       Show this help
 EOF
@@ -64,7 +55,6 @@ while [[ $# -gt 0 ]]; do
         --sv-vcf)     SV_VCF="$2";     shift 2 ;;
         --outdir)     OUTDIR="$2";     shift 2 ;;
         --threads)    THREADS="$2";    shift 2 ;;
-        --dv-version) DV_VERSION="$2"; shift 2 ;;
         --dv-model)   DV_MODEL="$2";   shift 2 ;;
         -h|--help)    usage ;;
         *)            echo "Unknown option: $1" >&2; usage ;;
@@ -84,11 +74,6 @@ done
 
 mkdir -p "$OUTDIR"
 
-REF_ABS="$(realpath "$REF")"
-BAM_ABS="$(realpath "$BAM")"
-REF_DIR="$(dirname "$REF_ABS")"
-BAM_DIR="$(dirname "$BAM_ABS")"
-
 DV_VCF="$OUTDIR/deepvariant.vcf.gz"
 PHASED_VCF="$OUTDIR/phased.vcf.gz"
 HAPLOTAGGED_BAM="$OUTDIR/haplotagged.bam"
@@ -102,19 +87,14 @@ if [[ -n "$VCF" ]]; then
     echo "[1/2] Using provided VCF: $VCF"
     DV_VCF="$VCF"
 elif [[ ! -f "$DV_VCF" ]]; then
-    echo "[1/2] Calling variants with DeepVariant ${DV_VERSION} (model: ${DV_MODEL}) ..."
-    command -v docker >/dev/null 2>&1 || { echo "Error: docker not found" >&2; exit 1; }
-    OUTDIR_ABS="$(realpath "$OUTDIR")"
-    { time docker run \
-        -v "${REF_DIR}":"/ref_dir" \
-        -v "${BAM_DIR}":"/bam_dir" \
-        -v "${OUTDIR_ABS}":"/output" \
-        google/deepvariant:"${DV_VERSION}" \
-        /opt/deepvariant/bin/run_deepvariant \
+    echo "[1/2] Calling variants with DeepVariant (model: ${DV_MODEL}) ..."
+    command -v run_deepvariant >/dev/null 2>&1 || \
+        { echo "Error: run_deepvariant not found. Activate bench-hiphase env." >&2; exit 1; }
+    { time run_deepvariant \
         --model_type="${DV_MODEL}" \
-        --ref="/ref_dir/$(basename "$REF_ABS")" \
-        --reads="/bam_dir/$(basename "$BAM_ABS")" \
-        --output_vcf="/output/deepvariant.vcf.gz" \
+        --ref="$REF" \
+        --reads="$BAM" \
+        --output_vcf="$DV_VCF" \
         --num_shards="$THREADS" ; } 2> >(tee "$TIMING_LOG" >&2)
 else
     echo "[1/2] DeepVariant VCF exists, skipping."
