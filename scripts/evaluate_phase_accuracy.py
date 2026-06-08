@@ -139,17 +139,27 @@ def count_sites_in_range(chrom, start, end):
 
 # ── load HP/PS per read from phased uBAM ─────────────────────────────
 read_phase = {}
+total_input_reads = 0
+unphased_reads = 0
+ps_all = collections.defaultdict(lambda: {"hp1": 0, "hp2": 0})  # all PS, not just truth-matched
 proc = subprocess.Popen([samtools, "view", phased_bam], stdout=subprocess.PIPE, text=True)
 for line in proc.stdout:
     f = line.rstrip("\n").split("\t")
+    total_input_reads += 1
     hp = ps = 0
     for tag in f[11:]:
         if tag.startswith("HP:i:"): hp = int(tag[5:])
         elif tag.startswith("PS:i:"): ps = int(tag[5:])
     if hp > 0:
         read_phase[f[0]] = (hp, ps)
+        ps_all[ps][f"hp{hp}"] += 1
+    else:
+        unphased_reads += 1
 proc.wait()
-print(f"  Loaded {len(read_phase)} phased reads.", file=sys.stderr)
+fraction_phased = len(read_phase) / total_input_reads if total_input_reads else 0
+print(f"  Loaded {len(read_phase)} phased reads out of {total_input_reads} total "
+      f"({100*fraction_phased:.1f}% phased, {len(ps_all)} phase sets).",
+      file=sys.stderr)
 
 # ── parse truth alignments (diplinator-merged BAM) ───────────────────
 # Haplotype origin is determined from:
@@ -329,6 +339,19 @@ for ps in ps_read_list:
 for r in results:
     r["switches"] = ps_switches.get(r["phase_set"], 0)
 
+# Record switch positions for BED output
+switch_positions = []  # (chrom, pos, ps, from_status, to_status)
+for ps in ps_read_list:
+    reads = sorted(ps_read_list[ps], key=lambda x: x[0])
+    # Need chrom info — get from ps_contig_positions
+    # Use the first chrom for this PS (most PS are single-chrom)
+    ps_chrom = next(iter(ps_contig_positions[ps]), "unknown")
+    for i in range(1, len(reads)):
+        if reads[i][1] != reads[i-1][1]:
+            switch_positions.append((ps_chrom, reads[i][0], ps,
+                                     "conc" if reads[i-1][1] else "disc",
+                                     "conc" if reads[i][1] else "disc"))
+
 # ── per-read output with concordance + category ─────────────────────
 has_annotations = bool(censat_regions or segdup_regions)
 cat_counts = collections.defaultdict(lambda: {"conc": 0, "disc": 0, "total": 0,
@@ -483,15 +506,55 @@ print(f"\n  {n_bad_ps} bad phase sets ({n_bad_rows} regions, "
       f"accuracy < {BAD_ACCURACY_THRESHOLD:.0%}) in {bad_bed_file}",
       file=sys.stderr)
 
-# ── N50 of phase block spans ────────────────────────────────────────
+# ── N50 / NG50 / auN of phase block spans ────────────────────────────
+HUMAN_GENOME_SIZE = 3_088_286_401  # T2T-CHM13v2.0 total assembly size
+
 all_spans = sorted([r["span_bp"] for r in results], reverse=True)
 genome_span = sum(all_spans)
+
+# N50: 50% of total phased span in blocks >= N50
 n50 = 0
 running = 0
 for sp in all_spans:
     running += sp
     if running >= genome_span / 2:
         n50 = sp; break
+
+# NG50: 50% of genome size in blocks >= NG50
+ng50 = 0
+running = 0
+for sp in all_spans:
+    running += sp
+    if running >= HUMAN_GENOME_SIZE / 2:
+        ng50 = sp; break
+
+# auN: area under the Nx curve (weighted mean block span)
+aun = sum(sp * sp for sp in all_spans) / genome_span if genome_span else 0
+
+# Largest block
+largest_block_bp = all_spans[0] if all_spans else 0
+largest_block_chrom = ""
+for r in results:
+    if r["span_bp"] == largest_block_bp:
+        largest_block_chrom = r["chrom"]; break
+
+# Blocks per chromosome
+blocks_per_chrom = collections.Counter()
+for r in results:
+    for ch in r["chrom"].split(","):
+        blocks_per_chrom[ch] += 1
+
+# Genome coverage: sum of phase block spans
+genome_covered_bp = genome_span
+fraction_genome_covered = genome_span / HUMAN_GENOME_SIZE
+
+# Nx curve data (for plotting): list of (x%, span) pairs
+nx_curve = []
+running = 0
+for sp in all_spans:
+    running += sp
+    pct = running / genome_span * 100 if genome_span else 0
+    nx_curve.append((pct, sp))
 
 # ── JSON summary (machine-readable) ─────────────────────────────────
 overall_acc = total_conc / total_reads if total_reads else 0
@@ -519,15 +582,24 @@ phaseable_acc = phaseable_conc / (phaseable_conc + phaseable_disc) if (phaseable
 unphaseable_acc = unphaseable_conc / (unphaseable_conc + unphaseable_disc) if (unphaseable_conc + unphaseable_disc) else 0
 
 summary = {
+    "tool": "pgphase",
+    "sample": "HG002",
     "chroms": chroms_arg if chroms_arg else "all",
     "min_mapq": min_mapq,
     "min_hapq": min_hapq,
     "min_reads_per_ps": min_reads,
+    # Completeness
+    "total_input_reads": total_input_reads,
     "total_phased_reads": len(read_phase),
+    "unphased_reads": unphased_reads,
+    "fraction_phased": round(fraction_phased, 6),
+    "total_phase_sets": len(ps_all),
+    # Truth alignment
     "reads_mapped_to_truth": n_mapped,
     "reads_filtered_mapq": n_low_mapq,
     "reads_filtered_hapq": n_low_hapq,
     "reads_excluded_regions": n_excluded,
+    # Accuracy
     "phase_sets_evaluated": total_ps,
     "phase_sets_perfect": total_perfect,
     "phase_sets_perfect_pct": round(pct_perfect, 2),
@@ -539,9 +611,18 @@ summary = {
     "switch_errors": total_switches,
     "switch_opportunities": total_switch_opportunities,
     "switch_error_rate": round(switch_rate, 6),
+    # Contiguity
     "phase_block_n50_bp": n50,
+    "phase_block_ng50_bp": ng50,
+    "phase_block_aun_bp": round(aun),
     "phase_block_median_span_bp": all_spans[len(all_spans)//2] if all_spans else 0,
-    "phase_block_max_span_bp": all_spans[0] if all_spans else 0,
+    "phase_block_max_span_bp": largest_block_bp,
+    "phase_block_max_span_chrom": largest_block_chrom,
+    "genome_covered_bp": genome_covered_bp,
+    "fraction_genome_covered": round(fraction_genome_covered, 6),
+    "genome_size_bp": HUMAN_GENOME_SIZE,
+    "mean_blocks_per_chrom": round(sum(blocks_per_chrom.values()) / len(blocks_per_chrom), 2) if blocks_per_chrom else 0,
+    "blocks_per_chrom": dict(blocks_per_chrom),
     "per_chrom": {},
 }
 if has_annotations:
@@ -594,9 +675,22 @@ with open(summary_file, "w") as fh:
         f"  Min MAPQ:                 {min_mapq}",
         f"  Min HapQ:                 {min_hapq}",
         f"  Min reads/phase set:      {min_reads}", "",
+        "  ── Completeness ──",
+        f"  Total input reads:        {total_input_reads:,}",
+        f"  Phased reads:             {len(read_phase):,} ({100*fraction_phased:.1f}%)",
+        f"  Unphased reads:           {unphased_reads:,}",
+        f"  Total phase sets:         {len(ps_all):,}", "",
+        "  ── Contiguity ──",
         f"  Phase sets evaluated:     {total_ps}",
         f"  Phase sets perfect:       {total_perfect} ({pct_perfect:.1f}%)",
-        f"  Phase block N50:          {n50:,} bp", "",
+        f"  Phase block N50:          {n50:,} bp",
+        f"  Phase block NG50:         {ng50:,} bp",
+        f"  Phase block auN:          {round(aun):,} bp",
+        f"  Largest block:            {largest_block_bp:,} bp ({largest_block_chrom})",
+        f"  Median block span:        {all_spans[len(all_spans)//2]:,} bp" if all_spans else "",
+        f"  Genome covered:           {genome_covered_bp:,} bp ({100*fraction_genome_covered:.1f}%)",
+        f"  Mean blocks/chrom:        {sum(blocks_per_chrom.values()) / len(blocks_per_chrom):.1f}" if blocks_per_chrom else "", "",
+        "  ── Accuracy ──",
         f"  Total reads evaluated:    {total_reads:,}",
         f"  Concordant:               {total_conc:,}",
         f"  Discordant:               {total_disc:,}",
@@ -762,6 +856,42 @@ with open(block_summary, "w") as fh:
 n_igv = len(block_beds)
 print(f"\n  IGV files for {n_igv} worst blocks in {igv_dir}/", file=sys.stderr)
 
+# ── switch position BED ──────────────────────────────────────────────
+switch_bed_file = os.path.join(outdir, "switch_positions.bed")
+with open(switch_bed_file, "w") as fh:
+    fh.write("#chrom\tstart\tend\tname\tscore\tstrand\n")
+    for chrom, pos, ps, from_s, to_s in sorted(switch_positions):
+        fh.write(f"{chrom}\t{pos-1}\t{pos}\tPS={ps};{from_s}->{to_s}\t0\t.\n")
+
+# ── Nx curve CSV (for plotting) ─────────────────────────────────────
+nx_file = os.path.join(outdir, "nx_curve.csv")
+with open(nx_file, "w") as fh:
+    fh.write("pct,span_bp\n")
+    for pct, sp in nx_curve:
+        fh.write(f"{pct:.2f},{sp}\n")
+
+# ── per-phase-set hamming + switch for scatter plot ─────────────────
+# Add hamming_rate and switch_rate per PS to per_phase_set.tsv
+# (already have concordant/discordant/switches; compute rates)
+for r in results:
+    tot = r["concordant"] + r["discordant"]
+    r["hamming_rate"] = round(r["discordant"] / tot, 6) if tot else 0
+    n_reads_ps = r["n_reads"]
+    pairs = max(n_reads_ps - 1, 0)
+    r["switch_rate"] = round(r["switches"] / pairs, 6) if pairs else 0
+
+# Rewrite per_phase_set.tsv with new columns
+ps_fields_ext = ps_fields + ["hamming_rate", "switch_rate"]
+if sites_vcf and "n_sites" not in ps_fields_ext:
+    pass  # already included via ps_fields
+with open(per_ps_file, "w", newline="") as fh:
+    w = csv.DictWriter(fh, delimiter="\t", fieldnames=ps_fields_ext,
+                       extrasaction="ignore")
+    w.writeheader()
+    for r in results:
+        out = dict(r); out["accuracy"] = f"{r['accuracy']:.4f}"
+        w.writerow(out)
+
 print(f"\n  Outputs: {summary_file}", file=sys.stderr)
 print(f"           {json_file}", file=sys.stderr)
 print(f"           {per_ps_file}", file=sys.stderr)
@@ -769,6 +899,8 @@ print(f"           {per_chrom_file}", file=sys.stderr)
 print(f"           {per_read_file}", file=sys.stderr)
 print(f"           {worst_file}", file=sys.stderr)
 print(f"           {bad_bed_file}", file=sys.stderr)
+print(f"           {switch_bed_file}", file=sys.stderr)
+print(f"           {nx_file}", file=sys.stderr)
 if has_annotations:
     print(f"           {cat_file}", file=sys.stderr)
 print(f"           {igv_dir}/  ({n_igv} blocks)", file=sys.stderr)
