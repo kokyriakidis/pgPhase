@@ -206,6 +206,7 @@ bool build_compact_graph_site_index(const GraphSiteCatalogView& catalog,
         for (const GraphWalk& walk : site.allele_walks) total_handles += walk.size();
         pack.data.reserve(total_handles);
 
+        bool site_ok = true;
         for (size_t ai = 0; ai < site.allele_walks.size(); ++ai) {
             const GraphWalk& walk = site.allele_walks[ai];
             pack.offsets[ai] = static_cast<uint32_t>(pack.data.size());
@@ -217,16 +218,22 @@ bool build_compact_graph_site_index(const GraphSiteCatalogView& catalog,
             const size_t walk_start = pack.data.size();
             for (const GraphWalkStep& step : walk) {
                 uint64_t node = 0;
-                if (!parse_unsigned_node(step.node, node)) return false;
-                if (node > kMaxCompactNodeId) return false;
+                if (!parse_unsigned_node(step.node, node) || node > kMaxCompactNodeId) {
+                    site_ok = false;
+                    break;
+                }
                 pack.data.push_back(encode_handle(node, step.reverse));
             }
+            if (!site_ok) break;
             const size_t walk_len = pack.data.size() - walk_start;
-            if (walk_len == 0) return false;
-            if (walk_len > std::numeric_limits<uint16_t>::max()) return false;
+            if (walk_len == 0 || walk_len > std::numeric_limits<uint16_t>::max()) {
+                site_ok = false;
+                break;
+            }
             pack.lengths[ai] = static_cast<uint16_t>(walk_len);
             compact.max_walk_len = std::max(compact.max_walk_len, walk_len);
         }
+        if (!site_ok) continue; // skip site with non-numeric or oversized node IDs
 
         // Ref walk (allele 0) boundaries.
         compact.left = pack.data[pack.offsets[0]];
@@ -507,8 +514,7 @@ scan_indexed_gaf_chunk(IndexedGafHandle& handle,
 
     CompactGraphSiteIndex compact_index;
     if (!build_compact_graph_site_index(catalog, compact_index)) {
-        throw std::runtime_error(
-            "indexed GAF chunk scan requires queryable graph sites with numeric node IDs");
+        return {};
     }
 
     const int tid = tbx_seq_tid_with_pangenome_fallback(handle.tbx, contig);
