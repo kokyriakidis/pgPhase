@@ -25,8 +25,24 @@ struct GraphQueryConfig {
     int min_mapq = kDefaultMinMapq;
 };
 
+// Per-chunk query for a pggaf index-gaf output. The file must be bgzip-compressed
+// and tabix-indexed, with pggaf's three leading coordinate columns:
+//   rc  rb  re  <original annotated GAF columns...>
+// Coordinates are queried as 0-based half-open intervals, mirroring BAM.
+std::vector<GraphReadAllele>
+scan_indexed_gaf_chunk(const std::string& indexed_gaf_file,
+                       const std::string& contig,
+                       hts_pos_t beg,
+                       hts_pos_t end,
+                       const GraphSiteCatalog& catalog,
+                       int min_mapq);
+
+// Validates that the GAF file is bgzip-compressed and has a .tbi index.
+void require_indexed_gaf(const std::string& indexed_gaf_file);
+
 // FFI-based interval query: uses pre-opened GBZ/GAF handles instead of
-// spawning a subprocess per chunk.
+// spawning a subprocess per chunk. Eliminates process spawn overhead,
+// temp file I/O, and repeated database open/close.
 std::vector<GraphReadAllele>
 query_gbz_interval_gaf_ffi(void* gbz_handle,
                             void* gaf_handle,

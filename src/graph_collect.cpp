@@ -419,11 +419,109 @@ static std::vector<GraphChunkBuildResult> process_graph_chunk_batch(
     return graph_chunks;
 }
 
+// Per-chunk tabix queries on an indexed GAF file.  Each worker seeks directly
+// to the overlapping region — only the relevant reads are decompressed and
+// parsed, making this efficient even for very large (100+ GB) GAF files.
+static std::vector<GraphChunkBuildResult> process_graph_chunk_batch_indexed_gaf(
+    const GraphSiteCatalog& catalog,
+    const std::vector<RegionChunk>& chunks,
+    size_t batch_begin,
+    size_t batch_end,
+    const bam_hdr_t* header,
+    const std::string& gaf_file,
+    int min_mapq,
+    const std::unordered_map<std::string, std::string>& fai_full_to_suffix,
+    const Options& opts,
+    const PgbamSidecarData* pgbam_sidecar)
+{
+    const size_t batch_size = batch_end - batch_begin;
+    std::vector<GraphChunkBuildResult> graph_chunks(batch_size);
+
+    // Pre-filter catalog to the batch contig once (same optimization as FFI path).
+    const std::string batch_contig_gaf = header->target_name[chunks[batch_begin].tid];
+    const std::vector<size_t> contig_site_indices_gaf =
+        filter_catalog_indices_for_contig(catalog, batch_contig_gaf);
+    const std::string batch_query_contig_gaf = [&]() -> std::string {
+        auto it = fai_full_to_suffix.find(batch_contig_gaf);
+        return (it != fai_full_to_suffix.end()) ? it->second : batch_contig_gaf;
+    }();
+
+    const size_t worker_count = std::min<size_t>(static_cast<size_t>(opts.threads), batch_size);
+    std::atomic<size_t> next_offset{0};
+    std::exception_ptr first_error;
+    std::mutex error_mutex;
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+
+    for (size_t w = 0; w < worker_count; ++w) {
+        workers.emplace_back([&]() {
+            try {
+                while (true) {
+                    const size_t offset = next_offset.fetch_add(1);
+                    if (offset >= batch_size) break;
+                    const RegionChunk& region = chunks[batch_begin + offset];
+
+                    GraphSiteCatalog chunk_catalog = build_chunk_catalog_from_indices(
+                        catalog, contig_site_indices_gaf, batch_contig_gaf,
+                        region.beg - 1, region.end);
+
+                    std::vector<GraphReadAllele> chunk_rows;
+                    if (!chunk_catalog.sites.empty()) {
+                        chunk_rows = scan_indexed_gaf_chunk(
+                            gaf_file, batch_query_contig_gaf,
+                            region.beg - 1, region.end,
+                            chunk_catalog, min_mapq);
+                    }
+
+                    graph_chunks[offset] = build_graph_chunk(
+                        chunk_catalog,
+                        chunk_rows,
+                        batch_contig_gaf,
+                        region.beg - 1,
+                        region.end,
+                        region.chunk_id,
+                        opts);
+
+                    assign_hap_based_on_germline_het_vars_kmeans(
+                        graph_chunks[offset].chunk, opts, kCandGermlineClean);
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!first_error) first_error = std::current_exception();
+            }
+        });
+    }
+    for (std::thread& w : workers) w.join();
+    if (first_error) std::rethrow_exception(first_error);
+
+    populate_graph_chunk_overlaps(graph_chunks);
+
+    std::vector<PhasingChunk> phasing_chunks;
+    phasing_chunks.reserve(batch_size);
+    for (GraphChunkBuildResult& gc : graph_chunks)
+        phasing_chunks.push_back(std::move(gc.chunk));
+    stitch_chunk_haps(phasing_chunks, &opts, pgbam_sidecar);
+    for (size_t i = 0; i < batch_size; ++i)
+        graph_chunks[i].chunk = std::move(phasing_chunks[i]);
+
+    return graph_chunks;
+}
+
 void run_collect_graph_variation(const Options& opts) {
-    if (opts.gbz_db.empty())
-        throw std::runtime_error("--gbz-db is required for collect-graph-variation");
-    if (opts.gaf_db.empty())
-        throw std::runtime_error("--gaf-db is required for collect-graph-variation");
+    const bool use_indexed_gaf = !opts.gaf_file.empty();
+    if (!use_indexed_gaf) {
+        if (opts.gbz_db.empty())
+            throw std::runtime_error("--gbz-db is required for collect-graph-variation without --gaf");
+        if (opts.gaf_db.empty())
+            throw std::runtime_error("--gaf-db is required for collect-graph-variation without --gaf");
+    } else {
+        // The --gaf path requires a tabix-indexed, bgzip-compressed GAF with
+        // annotated coordinate columns so per-chunk region queries are efficient.
+        require_indexed_gaf(opts.gaf_file);
+        if (!opts.gbz_db.empty() || !opts.gaf_db.empty()) {
+            std::cerr << "Warning: --gaf provided; ignoring --gbz-db/--gaf-db\n";
+        }
+    }
 
     // Load optional .pgbam sidecar for fallback chunk stitching.
     std::unique_ptr<PgbamSidecarData> pgbam_sidecar;
@@ -588,7 +686,7 @@ void run_collect_graph_variation(const Options& opts) {
                 ref_sample = name.substr(0, h);
         }
     }
-    if (opts.verbose >= 1 && !ref_sample.empty())
+    if (!use_indexed_gaf && opts.verbose >= 1 && !ref_sample.empty())
         std::cerr << "Using reference sample \"" << ref_sample << "\" for GBZ interval queries\n";
 
     // 8. site_id → GraphSite* (for biallelic conversion after phasing).
@@ -650,10 +748,15 @@ void run_collect_graph_variation(const Options& opts) {
         }
 
         std::vector<GraphChunkBuildResult> graph_chunks =
-            process_graph_chunk_batch(
-                catalog, chunks, batch_begin, batch_end, header.get(),
-                qconfig, ref_sample, fai_full_to_suffix, opts,
-                pgbam_sidecar.get());
+            use_indexed_gaf
+                ? process_graph_chunk_batch_indexed_gaf(
+                      catalog, chunks, batch_begin, batch_end, header.get(),
+                      opts.gaf_file, opts.min_mapq, fai_full_to_suffix, opts,
+                      pgbam_sidecar.get())
+                : process_graph_chunk_batch(
+                      catalog, chunks, batch_begin, batch_end, header.get(),
+                      qconfig, ref_sample, fai_full_to_suffix, opts,
+                      pgbam_sidecar.get());
 
         CandidateTable variants =
             graph_chunks_to_candidate_table(graph_chunks, site_id_to_site, contig_to_tid, opts);
@@ -700,8 +803,9 @@ static void print_graph_collect_help() {
         << "      --sites FILE              Sites VCF from build-snarl-catalog (bgzipped + tabix-indexed)\n"
         << "\n"
         << "Read input:\n"
-        << "      --gbz-db FILE             GBZ graph database (from gbz2db)\n"
-        << "      --gaf-db FILE             GAF-base read alignment database (from gaf2db)\n"
+        << "      --gaf FILE                Raw GAF alignments; builds a fast pgphase observation index\n"
+        << "      --gbz-db FILE             GBZ graph database (legacy --gaf-db path)\n"
+        << "      --gaf-db FILE             GAF-base read alignment database (legacy path)\n"
         << "\n"
         << "Options:\n"
         << "  -o, --output FILE             Output TSV [output.tsv]\n"
@@ -744,11 +848,18 @@ static void print_graph_collect_help() {
         << "  pgphase collect-graph-variation \\\n"
         << "      --ref ref.fa \\\n"
         << "      --sites sites.vcf.gz \\\n"
-        << "      --gbz-db graph.gbz.db \\\n"
-        << "      --gaf-db reads.gaf.db \\\n"
+        << "      --gaf reads.gaf \\\n"
         << "      --phased-vcf-out phased.vcf \\\n"
         << "      --phased-bam-out phased.bam \\\n"
-        << "      -t 8\n";
+        << "      -t 8\n"
+        << "\n"
+        << "  pgphase collect-graph-variation \\\n"
+        << "      --ref ref.fa \\\n"
+        << "      --sites sites.vcf.gz \\\n"
+        << "      --gbz-db reads.gaf.db \\\n"
+        << "      --ont \\\n"
+        << "      --phased-vcf-out phased.vcf \\\n"
+        << "      -t 16\n";
 }
 
 enum GraphCollectOption {
@@ -759,7 +870,7 @@ enum GraphCollectOption {
     kGcChunkSize,
     kGcPhasedVcf,
     kGcGbzDb,
-    kGcGafFile,  // removed; kept for error message if user passes it
+    kGcGafFile,
     kGcGafDb,
     kGcRegionFile,
     kGcAutosome,
@@ -858,10 +969,7 @@ int collect_graph_variation(int argc, char* argv[]) {
             case 'r': opts.regions.push_back(optarg); break;
             case kGcRegionFile:   opts.region_file = optarg; break;
             case kGcAutosome:     opts.autosome = true; break;
-            case kGcGafFile:
-                std::cerr << "Error: --gaf is no longer supported. "
-                             "Use --gbz-db + --gaf-db instead.\n";
-                return 1;
+            case kGcGafFile:      opts.gaf_file = optarg; break;
             case kGcGbzDb:        opts.gbz_db = optarg; break;
             case kGcGafDb:        opts.gaf_db = optarg; break;
             case kGcSample:       opts.graph_sample = optarg; break;
@@ -894,8 +1002,8 @@ int collect_graph_variation(int argc, char* argv[]) {
 
     require_graph_site_vcf_tabix_index(opts.graph_sites_vcf);
 
-    if (opts.gbz_db.empty() || opts.gaf_db.empty()) {
-        std::cerr << "Error: --gbz-db and --gaf-db are required\n";
+    if (opts.gaf_file.empty() && (opts.gbz_db.empty() || opts.gaf_db.empty())) {
+        std::cerr << "Error: provide --gaf, or provide --gbz-db and --gaf-db\n";
         print_graph_collect_help();
         return 1;
     }
