@@ -10,10 +10,13 @@
 # HiPhase jointly phases small variants and SVs from PacBio HiFi data.
 # It performs phasing and haplotagging simultaneously.
 #
+# Environment setup (run once):
+#   micromamba create -f envs/hiphase.yaml -y
+#   micromamba activate bench-hiphase
+#
 # Prerequisites:
 #   - docker (for DeepVariant)
-#   - hiphase (https://github.com/PacificBiosciences/HiPhase/releases)
-#   - samtools
+#   - micromamba environment bench-hiphase (hiphase, samtools)
 #
 # Usage:
 #   ./scripts/bench_hiphase.sh \

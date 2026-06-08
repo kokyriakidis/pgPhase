@@ -8,10 +8,13 @@
 #   2. whatshap phase           — phase heterozygous variants using reads
 #   3. whatshap haplotag        — tag each read with HP/PS
 #
+# Environment setup (run once):
+#   micromamba create -f envs/whatshap.yaml -y
+#   micromamba activate bench-whatshap
+#
 # Prerequisites:
 #   - docker (for DeepVariant)
-#   - whatshap (pip install whatshap)
-#   - samtools, bgzip, tabix
+#   - micromamba environment bench-whatshap (whatshap, samtools, bgzip, tabix)
 #
 # Usage:
 #   ./scripts/bench_whatshap.sh \

@@ -8,10 +8,13 @@
 #   2. longphase phase          — phase variants using reads
 #   3. longphase haplotag       — tag each read with HP/PS
 #
+# Environment setup (run once):
+#   micromamba create -f envs/longphase.yaml -y
+#   micromamba activate bench-longphase
+#
 # Prerequisites:
 #   - docker (for DeepVariant)
-#   - longphase (https://github.com/twolinin/longphase/releases)
-#   - samtools, bgzip, tabix
+#   - micromamba environment bench-longphase (longphase, samtools, bgzip, tabix)
 #
 # Usage:
 #   ./scripts/bench_longphase.sh \

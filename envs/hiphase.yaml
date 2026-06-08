@@ -1,0 +1,7 @@
+name: bench-hiphase
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - hiphase=1.6.0
+  - samtools
