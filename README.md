@@ -110,9 +110,9 @@ Collects and phases variants using a pangenome graph site catalog and GAF read a
 |---|---|---|
 | `--ref FILE` | Reference FASTA (indexed) | required |
 | `--sites FILE` | Sites VCF (bgzipped + tabix-indexed) | required |
-| `--gaf FILE` | Raw GAF alignments | — |
-| `--gbz-db FILE` | GBZ graph database | — |
-| `--gaf-db FILE` | GAF-base read alignment database | — |
+| `--gaf FILE` | Coordinate-indexed GAF from [pggaf](https://github.com/kokyriakidis/pggaf) (bgzipped + tabix) | — |
+| `--gbz-db FILE` | GBZ graph database (from `gbz2db`) | — |
+| `--gaf-db FILE` | GAF-base read alignment database (from `gaf2db`) | — |
 | `--sample NAME` | Reference sample name for GBZ queries | auto-detected |
 | `--hifi` | HiFi read mode | default |
 | `--ont` | ONT read mode (enables strand-bias filter) | off |
@@ -123,7 +123,7 @@ Collects and phases variants using a pangenome graph site catalog and GAF read a
 | `-r STR` | Restrict to region (repeatable) | whole genome |
 | `-t INT` | Worker threads | 1 |
 
-Provide either `--gaf` (builds an observation index on the fly) or `--gbz-db` + `--gaf-db`.
+Provide either `--gaf` (coordinate-indexed GAF from [pggaf](https://github.com/kokyriakidis/pggaf), supports `--pgbam-file` stitching) or `--gbz-db` + `--gaf-db` (pre-built databases from gbz-base).
 
 ### `collect-bam-variation`
 

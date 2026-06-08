@@ -803,7 +803,7 @@ static void print_graph_collect_help() {
         << "      --sites FILE              Sites VCF from build-snarl-catalog (bgzipped + tabix-indexed)\n"
         << "\n"
         << "Read input:\n"
-        << "      --gaf FILE                Raw GAF alignments; builds a fast pgphase observation index\n"
+        << "      --gaf FILE                Coordinate-indexed GAF from pggaf (bgzipped + tabix-indexed)\n"
         << "      --gbz-db FILE             GBZ graph database (legacy --gaf-db path)\n"
         << "      --gaf-db FILE             GAF-base read alignment database (legacy path)\n"
         << "\n"
