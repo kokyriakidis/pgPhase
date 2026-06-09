@@ -78,6 +78,21 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
                                                int chunk_id,
                                                const Options& opts);
 
+// Reclassify indel candidates that sit in homopolymer, tandem-repeat, or
+// low-complexity reference contexts as RepeatHetIndel.  Mirrors the BAM
+// pipeline's classify_variant_initial noise gate.
+//
+// @param result  Build result whose chunk.candidates are updated in place.
+// @param ref_seq Reference sequence slice covering the chunk region.
+// @param ref_beg 1-based start of ref_seq on the chromosome.
+// @param ref_end 1-based end of ref_seq (inclusive).
+// @param max_xgaps Maximum indel span to check (opts.noisy_reg_max_xgaps).
+void apply_graph_noise_filter(GraphChunkBuildResult& result,
+                              const std::string& ref_seq,
+                              hts_pos_t ref_beg,
+                              hts_pos_t ref_end,
+                              int max_xgaps);
+
 // Find reads shared between adjacent chunks (by name merge-intersect)
 // and record them in PhasingChunk overlap bookkeeping for stitching.
 void populate_graph_chunk_overlaps(std::vector<GraphChunkBuildResult>& graph_chunks);

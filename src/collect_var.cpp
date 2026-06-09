@@ -7,6 +7,7 @@
 #include "collect_phase.hpp"
 #include "collect_phase_noisy.hpp"
 #include "fisher_exact.hpp"
+#include "noise_filter.hpp"
 
 #include "sdust.h"
 
@@ -1070,18 +1071,8 @@ void populate_low_complexity_intervals(PhasingChunk& chunk) {
 
     const size_t offset = static_cast<size_t>(beg - chunk.ref_beg);
     const int len = static_cast<int>(end - beg + 1);
-    int n = 0;
-    uint64_t* intervals = sdust(nullptr,
-                                reinterpret_cast<const uint8_t*>(chunk.ref_seq.data() + offset),
-                                len, kSdustThreshold, kSdustWindow, &n);
-    for (int i = 0; i < n; ++i) {
-        const hts_pos_t rel_beg = static_cast<hts_pos_t>(intervals[i] >> 32);
-        const hts_pos_t rel_end = static_cast<hts_pos_t>(static_cast<uint32_t>(intervals[i]));
-        if (rel_end <= rel_beg) continue;
-        chunk.low_complexity_regions.push_back(
-            Interval{beg + rel_beg, beg + rel_end - 1, static_cast<int>(rel_end - rel_beg)});
-    }
-    std::free(intervals);
+    const std::string slice = chunk.ref_seq.substr(offset, static_cast<size_t>(len));
+    chunk.low_complexity_regions = find_low_complexity_intervals(slice, beg);
 }
 
 /**

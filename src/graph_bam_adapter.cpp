@@ -2,6 +2,7 @@
 
 #include "collect_phase.hpp"
 #include "fisher_exact.hpp"
+#include "noise_filter.hpp"
 
 #include <algorithm>
 #include <numeric>
@@ -221,6 +222,38 @@ void classify_graph_candidates(PhasingChunk& chunk, const Options& opts) {
 }
 
 } // namespace
+
+void apply_graph_noise_filter(GraphChunkBuildResult& result,
+                              const std::string& ref_seq,
+                              hts_pos_t ref_beg,
+                              hts_pos_t ref_end,
+                              int max_xgaps) {
+    if (ref_seq.empty()) return;
+
+    const std::vector<Interval> lc = find_low_complexity_intervals(ref_seq, ref_beg);
+
+    for (size_t ci = 0; ci < result.chunk.candidates.size(); ++ci) {
+        CandidateVariant& cand = result.chunk.candidates[ci];
+        // Only reclassify surviving het indels.
+        if (cand.counts.category != VariantCategory::CleanHetIndel) continue;
+
+        // Get VCF-style ref/alt from the parallel site_meta vector.
+        if (ci >= result.site_meta.size()) continue;
+        const GraphSiteMeta& meta = result.site_meta[ci];
+        if (meta.alts.empty()) continue;
+
+        // Use the first alt allele (biallelic pairs have exactly one).
+        const std::string& vcf_ref = meta.ref;
+        const std::string& vcf_alt = meta.alts[0];
+
+        if (is_noisy_site(meta.pos, vcf_ref, vcf_alt, ref_seq, ref_beg, ref_end,
+                          lc, max_xgaps)) {
+            cand.counts.category = VariantCategory::RepeatHetIndel;
+            cand.counts.candvarcate_initial = VariantCategory::RepeatHetIndel;
+            cand.lcd_var_i_to_cate = kLongcalldRepHetVar;
+        }
+    }
+}
 
 // Main entry point: convert graph-space allele observations into a PhasingChunk.
 //

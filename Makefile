@@ -33,6 +33,7 @@ SOURCES_CXX = src/main.cpp \
 	src/build_catalog.cpp \
 	src/graph_collect.cpp \
 	src/bam_digar.cpp \
+	src/noise_filter.cpp \
 	src/collect_var.cpp \
 	src/collect_phase.cpp \
 	src/collect_phase_pgbam.cpp \
@@ -106,14 +107,14 @@ $(GBZ_FFI_LIB): $(wildcard $(GBZ_FFI_DIR)/lib.rs $(GBZ_FFI_DIR)/Cargo.toml)
 pgphase: $(OBJS) $(WFA2_LIB) $(ABPOA_LIB) $(GBZ_FFI_LIB)
 	$(CXX) $(CXXFLAGS) -o $@ $(OBJS) $(WFA2_LIB) $(ABPOA_LIB) $(GBZ_FFI_LIB) $(LDFLAGS) $(GBZ_FFI_SYSLIBS)
 
-test_phase_block_stitch: src/test_phase_block_stitch.cpp src/collect_phase.o src/collect_phase_pgbam.o src/collect_phase_noisy.o src/collect_output.o src/collect_var.o src/align.o src/cgranges.o src/kalloc.o src/sdust.o $(EDLIB_OBJ) $(WFA2_LIB) $(ABPOA_LIB)
-	$(CXX) $(CXXFLAGS) -o $@ $< src/collect_phase.o src/collect_phase_pgbam.o src/collect_phase_noisy.o src/collect_output.o src/collect_var.o src/align.o src/cgranges.o src/kalloc.o src/sdust.o $(EDLIB_OBJ) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
+test_phase_block_stitch: src/test_phase_block_stitch.cpp src/collect_phase.o src/collect_phase_pgbam.o src/collect_phase_noisy.o src/collect_output.o src/collect_var.o src/noise_filter.o src/align.o src/cgranges.o src/kalloc.o src/sdust.o $(EDLIB_OBJ) $(WFA2_LIB) $(ABPOA_LIB)
+	$(CXX) $(CXXFLAGS) -o $@ $< src/collect_phase.o src/collect_phase_pgbam.o src/collect_phase_noisy.o src/collect_output.o src/collect_var.o src/noise_filter.o src/align.o src/cgranges.o src/kalloc.o src/sdust.o $(EDLIB_OBJ) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
 
 test_graph_sites: src/test_graph_sites.cpp src/graph_sites.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
-test_graph_bam_adapter: src/test_graph_bam_adapter.cpp src/graph_bam_adapter.o src/graph_sites.o src/graph_query.o src/collect_phase.o src/collect_phase_pgbam.o src/collect_output.o $(GBZ_FFI_LIB)
-	$(CXX) $(CXXFLAGS) -o $@ $^ src/cgranges.o src/kalloc.o $(LDFLAGS) $(GBZ_FFI_SYSLIBS)
+test_graph_bam_adapter: src/test_graph_bam_adapter.cpp src/graph_bam_adapter.o src/noise_filter.o src/graph_sites.o src/graph_query.o src/collect_phase.o src/collect_phase_pgbam.o src/collect_output.o $(GBZ_FFI_LIB)
+	$(CXX) $(CXXFLAGS) -o $@ $^ src/cgranges.o src/kalloc.o src/sdust.o $(LDFLAGS) $(GBZ_FFI_SYSLIBS)
 
 clean:
 	rm -f pgphase test_phase_block_stitch test_graph_sites test_graph_bam_adapter src/*.o src/*.d

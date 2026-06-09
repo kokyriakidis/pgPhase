@@ -103,6 +103,70 @@ pgphase collect-bam-variation \
 
 ---
 
+## Noise Filtering: BAM vs Graph Pipeline
+
+### What we ported
+
+The BAM pipeline's `classify_variant_initial` applies three reference-context checks to
+indel candidates:
+
+1. **Homopolymer context** — indel sits in a run of ≥3 copies of a 1–6 bp repeat unit
+2. **Tandem repeat context** — deleted/inserted motif matches ≥3 tandem copies in flanking reference
+3. **SDUST low-complexity** — variant position falls inside a low-complexity interval
+
+Indels flagged by (1) or (2) become `RepeatHetIndel` and are excluded from k-means phasing
+(`lcd_var_i_to_cate = kLongcalldRepHetVar`, which doesn't match `kCandGermlineClean`).
+
+These three checks were extracted into a shared module (`src/noise_filter.hpp/cpp`) and wired
+into the graph pipeline via `apply_graph_noise_filter` in `graph_bam_adapter.cpp`. Each worker
+thread opens its own `faidx_t`, fetches the chunk's reference slice, and reclassifies
+`CleanHetIndel` → `RepeatHetIndel` for noisy sites. The flag behavior matches the BAM pipeline
+exactly: `RepeatHetIndel` candidates are excluded from k-means.
+
+### What we did NOT port (and why)
+
+The BAM pipeline has additional filtering stages that depend on **per-read CIGAR error
+intervals** — information that doesn't exist in the graph pipeline's GAF input:
+
+| BAM feature | Why it doesn't apply to graph |
+|---|---|
+| Read-level noisy regions (XID clustering from CIGAR) | GAF allele observations are node-level, not base-aligned. No per-read error intervals. |
+| Dense overlap check (`var_pos_cr` n_ov > 1) | Snarl parent-child gating already handles nested/overlapping sites. |
+| Noisy-reads-ratio gate | Requires per-read CIGAR error intervals. |
+| `post_process_noisy_regs` (widen noisy spans) | Depends on read-level noisy regions. |
+| `apply_noisy_containment_filter` (demote contained candidates) | Depends on widened noisy regions. |
+| Noisy-region MSA recall (`collect_noisy_vars_step4`) | Requires BAM reads for MSA realignment. |
+| Second k-means with `kCandGermlineVarCate` | Only useful after MSA recall produces `NoisyCandHet`. |
+
+### SNPs in low-complexity regions
+
+`is_noisy_site` checks `pos_in_low_complexity` for all variant types, including SNPs. However,
+`apply_graph_noise_filter` only reclassifies `CleanHetIndel` candidates — SNPs are not touched.
+This matches the BAM pipeline, where SDUST low-complexity intervals are **never used to directly
+reclassify any variant**. Instead, they serve a structural role:
+
+1. **Extending noisy region boundaries** — adjacent low-complexity intervals are absorbed into
+   read-level noisy spans during `pre_process_noisy_regs_pgphase`.
+2. **Extending repeat-indel spans** — when a `RepeatHetIndel` is added to the noisy region tree,
+   its genomic span is widened to include overlapping low-complexity intervals.
+
+A SNP can end up filtered in the BAM pipeline, but only **indirectly**: if the low-complexity
+region was already part of or adjacent to a noisy region built from read-level error clustering,
+and the widened noisy span fully contains the SNP, then `apply_noisy_containment_filter` demotes
+it to `NonVariant`. A SNP in a low-complexity region with no nearby read-level noise stays
+`CleanHetSnp`.
+
+If we reclassified graph SNPs in low-complexity regions, we'd be **more aggressive** than the
+BAM pipeline — potentially removing legitimate het SNPs that are reliable phasing anchors.
+
+### Future work
+
+If the graph pipeline gains access to base-level alignment information (e.g. via surjected BAM
+or GAF CIGAR strings), the read-level noisy region pipeline could be ported. Until then, the
+reference-context checks are the only applicable noise filter.
+
+---
+
 ## Lessons / Pitfalls
 
 - **pgbam sidecar causes over-stitching:** Running BAM pipeline with `--pgbam-file` merged all 49 initial phase sets into 2 chr20-spanning blocks with near-random accuracy (55%). Do not use the sidecar without understanding its signal quality.

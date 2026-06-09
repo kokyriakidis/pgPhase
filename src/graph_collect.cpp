@@ -10,6 +10,7 @@
 #include "graph_bam_adapter.hpp"
 #include "graph_query.hpp"
 #include "graph_sites.hpp"
+#include "noise_filter.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -309,6 +310,10 @@ static std::vector<GraphChunkBuildResult> process_graph_chunk_batch(
                 // One sites VCF handle per thread.
                 SitesVcfHandle sites_handle(sites_vcf);
 
+                // Per-thread reference index for noise detection.
+                std::unique_ptr<faidx_t, FaiDeleter> thread_fai(
+                    load_reference_index(opts.ref_fasta));
+
                 while (true) {
                     const size_t offset = next_offset.fetch_add(1);
                     if (offset >= batch_size) break;
@@ -353,6 +358,25 @@ static std::vector<GraphChunkBuildResult> process_graph_chunk_batch(
                         region.end,
                         region.chunk_id,
                         opts);
+
+                    // Noise filter: fetch reference slice and reclassify
+                    // indels in homopolymer/repeat/low-complexity contexts.
+                    {
+                        hts_pos_t ref_len = 0;
+                        char* ref_raw = faidx_fetch_seq64(
+                            thread_fai.get(), batch_contig.c_str(),
+                            region.beg - 1, region.end - 1, &ref_len);
+                        if (ref_raw && ref_len > 0) {
+                            std::string ref_slice(ref_raw, ref_raw + ref_len);
+                            std::free(ref_raw);
+                            apply_graph_noise_filter(
+                                graph_chunks[offset], ref_slice,
+                                region.beg, region.beg + ref_len - 1,
+                                opts.noisy_reg_max_xgaps);
+                        } else {
+                            std::free(ref_raw);
+                        }
+                    }
 
                     assign_hap_based_on_germline_het_vars_kmeans(
                         graph_chunks[offset].chunk, opts, kCandGermlineClean);
@@ -417,6 +441,10 @@ static std::vector<GraphChunkBuildResult> process_graph_chunk_batch_indexed_gaf(
                 IndexedGafHandle gaf_handle(gaf_file);
                 SitesVcfHandle sites_handle(sites_vcf);
 
+                // Per-thread reference index for noise detection.
+                std::unique_ptr<faidx_t, FaiDeleter> thread_fai(
+                    load_reference_index(opts.ref_fasta));
+
                 while (true) {
                     const size_t offset = next_offset.fetch_add(1);
                     if (offset >= batch_size) break;
@@ -451,6 +479,25 @@ static std::vector<GraphChunkBuildResult> process_graph_chunk_batch_indexed_gaf(
                         region.end,
                         region.chunk_id,
                         opts);
+
+                    // Noise filter: fetch reference slice and reclassify
+                    // indels in homopolymer/repeat/low-complexity contexts.
+                    {
+                        hts_pos_t ref_len = 0;
+                        char* ref_raw = faidx_fetch_seq64(
+                            thread_fai.get(), batch_contig_gaf.c_str(),
+                            region.beg - 1, region.end - 1, &ref_len);
+                        if (ref_raw && ref_len > 0) {
+                            std::string ref_slice(ref_raw, ref_raw + ref_len);
+                            std::free(ref_raw);
+                            apply_graph_noise_filter(
+                                graph_chunks[offset], ref_slice,
+                                region.beg, region.beg + ref_len - 1,
+                                opts.noisy_reg_max_xgaps);
+                        } else {
+                            std::free(ref_raw);
+                        }
+                    }
 
                     assign_hap_based_on_germline_het_vars_kmeans(
                         graph_chunks[offset].chunk, opts, kCandGermlineClean);
