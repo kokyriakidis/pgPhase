@@ -1,0 +1,6 @@
+name: bench-deepvariant
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - deepvariant=1.10.0

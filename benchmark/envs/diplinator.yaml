@@ -1,0 +1,10 @@
+name: bench-diplinator
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - minimap2
+  - samtools
+  - bedtools
+  - python>=3.9
+  - rust>=1.70

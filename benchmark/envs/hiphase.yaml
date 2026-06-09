@@ -3,10 +3,9 @@ channels:
   - bioconda
   - conda-forge
 dependencies:
-  - deepvariant=1.10.0
   - hiphase=1.6.0
   - pbsv=2.10.0
   - trgt=1.2.0
   - samtools
   - bcftools
-  - htslib       # bgzip, tabix
+  - htslib

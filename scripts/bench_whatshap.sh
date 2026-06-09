@@ -28,6 +28,7 @@ OUTDIR=""
 THREADS=16
 SAMPLE=""
 INDELS=true
+DISTRUST_GENOTYPES=false
 DV_MODEL="PACBIO"
 
 usage() {
@@ -43,10 +44,11 @@ Optional:
   --vcf FILE       Pre-called VCF (skip DeepVariant step)
   --sample NAME    Sample name in VCF [auto-detected]
   --threads INT    Threads [16]
-  --no-indels      Skip indel phasing
-  --dv-model STR   DeepVariant model type [PACBIO]
-                   One of: WGS, WES, PACBIO, ONT_R104, HYBRID_PACBIO_ILLUMINA
-  -h, --help       Show this help
+  --no-indels              Skip indel phasing
+  --distrust-genotypes     Enable --distrust-genotypes (WhatsHap optimized mode)
+  --dv-model STR           DeepVariant model type [PACBIO]
+                           One of: WGS, WES, PACBIO, ONT_R104, HYBRID_PACBIO_ILLUMINA
+  -h, --help               Show this help
 EOF
     exit 1
 }
@@ -60,6 +62,7 @@ while [[ $# -gt 0 ]]; do
         --sample)     SAMPLE="$2";     shift 2 ;;
         --threads)    THREADS="$2";    shift 2 ;;
         --no-indels)  INDELS=false;    shift ;;
+        --distrust-genotypes) DISTRUST_GENOTYPES=true; shift ;;
         --dv-model)   DV_MODEL="$2";   shift 2 ;;
         -h|--help)    usage ;;
         *)            echo "Unknown option: $1" >&2; usage ;;
@@ -91,6 +94,9 @@ SAMPLE_ARGS=""
 INDEL_FLAG=""
 [[ "$INDELS" == true ]] && INDEL_FLAG="--indels"
 
+DISTRUST_FLAG=""
+[[ "$DISTRUST_GENOTYPES" == true ]] && DISTRUST_FLAG="--distrust-genotypes"
+
 # ── Step 1: Call variants with DeepVariant ────────────────────────────
 if [[ -n "$VCF" ]]; then
     echo "[1/4] Using provided VCF: $VCF"
@@ -114,7 +120,9 @@ if [[ ! -f "$PHASED_VCF" ]]; then
     echo "[2/4] Phasing variants with WhatsHap ..."
     { time whatshap phase \
         --reference "$REF" \
+        --ignore-read-groups \
         $INDEL_FLAG \
+        $DISTRUST_FLAG \
         $SAMPLE_ARGS \
         -o "$OUTDIR/phased.vcf" \
         "$DV_VCF" "$BAM" ; } 2>> "$TIMING_LOG"

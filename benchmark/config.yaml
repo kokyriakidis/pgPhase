@@ -1,0 +1,83 @@
+# benchmark/config.yaml — Configuration for the phasing benchmark pipeline.
+#
+# Fill in paths before running:
+#   snakemake --configfile benchmark/config.yaml --use-conda -j16
+#
+# Reference files used in the HiPhase paper (Holt et al. 2024) are listed
+# below with download URLs.
+
+# ── Inputs ────────────────────────────────────────────────────────────
+
+# Reference genome (indexed .fa + .fai).
+# Download: ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz
+ref: /path/to/GRCh38_no_alt_analysis_set.fa
+
+# Aligned HiFi BAM (indexed).
+# HG002 Revio rep1: https://downloads.pacbcloud.com/public/revio/2022Q4/HG002-rep1/
+bam: /path/to/HG002.aligned.bam
+
+# Original reads FASTQ (for diplinator evaluation).
+reads: /path/to/HG002.fastq.gz
+
+# ── Truth data ───────────────────────────────────────────────────────
+
+# Diploid assembly haplotypes (for diplinator read-level evaluation).
+mat_ref: /path/to/HG002.mat.fa
+pat_ref: /path/to/HG002.pat.fa
+
+# GIAB truth phased VCF v4.2.1 (for whatshap compare).
+# HG002: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/AshkenazimTrio/HG002_NA24385_son/NISTv4.2.1/GRCh38/SupplementaryFiles/HG002_GRCh38_1_22_v4.2.1_benchmark_hifiasm_v11_phasetransfer.vcf.gz
+# HG001: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/NA12878_HG001/NISTv4.2.1/GRCh38/SupplementaryFiles/HG001_GRCh38_1_22_v4.2.1_benchmark_hifiasm_v11_phasetransfer.vcf.gz
+# HG005: https://ftp-trace.ncbi.nlm.nih.gov/ReferenceSamples/giab/release/ChineseTrio/HG005_NA24631_son/NISTv4.2.1/GRCh38/SupplementaryFiles/HG005_GRCh38_1_22_v4.2.1_highconf_hifiasm_v11_phasetransfer.vcf.gz
+truth_vcf: /path/to/HG002_GRCh38_1_22_v4.2.1_benchmark_hifiasm_v11_phasetransfer.vcf.gz
+
+# ── Annotation files ─────────────────────────────────────────────────
+
+# RefSeq gene BED for % fully phased genes.
+# Generate with: ./scripts/prepare_refseq_gene_bed.sh refseq_genes.bed
+# Source: NCBI Homo sapiens Annotation Release 110
+# GFF3: https://ftp.ncbi.nlm.nih.gov/genomes/all/annotation_releases/9606/110/GCF_000001405.40_GRCh38.p14/GCF_000001405.40_GRCh38.p14_genomic.gff.gz
+# Kept features: gene, pseudogene
+# Kept sources: BestRefSeq, RefSeq, Gnomon, Curated Genomic, BestRefSeq,Gnomon
+# Kept chromosomes: chr1-22, chrX, chrY, chrM
+gene_bed: /path/to/refseq_genes_grch38_ar110.bed
+
+# Tandem repeat annotation for pbsv discover (improves SV sensitivity).
+# Download: https://github.com/PacificBiosciences/pbsv/raw/master/annotations/human_GRCh38_no_alt_analysis_set.trf.bed
+trf_bed: /path/to/human_GRCh38_no_alt_analysis_set.trf.bed
+
+# TRGT repeat catalog for tandem repeat genotyping (Adotto v1.2).
+# Download: https://zenodo.org/records/8329210
+# File: adotto_TRregions_v1.2_GRCh38.bed.gz (gunzip before use)
+trgt_repeats: /path/to/adotto_TRregions_v1.2_GRCh38.bed
+
+# ── pgphase-specific inputs ──────────────────────────────────────────
+
+# pgphase binary
+pgphase_bin: ./pgphase
+
+# Sites VCF for pgphase graph pipeline (bgzipped + tabix-indexed)
+sites_vcf: ""
+
+# Indexed GAF for pgphase graph pipeline
+indexed_gaf: ""
+
+# pgphase mode: "bam" or "graph"
+pgphase_mode: bam
+
+# ── Tool selection ───────────────────────────────────────────────────
+
+# Which tools to benchmark. Comment out any you don't want to run.
+tools:
+  - whatshap
+  - whatshap_opt
+  - hiphase_nosv
+  - hiphase
+  - longphase
+  - pgphase
+
+# ── Resources ────────────────────────────────────────────────────────
+
+threads: 16
+karyotype: XY   # for TRGT (XX or XY)
+dv_model: PACBIO

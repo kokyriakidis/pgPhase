@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 #
-# bench_compare.sh — Compare phasing accuracy across all benchmarked tools.
+# bench_compare.sh — Compare read-level phasing accuracy across tools.
 #
-# Runs the diplinator-based evaluation on each tool's haplotagged BAM,
-# runs whatshap compare on each competitor's phased VCF (not pgphase),
-# collects timing, and produces a summary table.
+# Primary evaluation: diplinator-based read-level accuracy on each
+# tool's haplotagged BAM (all tools, including pgphase).
+# Optional: whatshap compare on phased VCFs (all tools, requires
+# --truth-vcf), gene phasing completeness (requires --gene-bed).
 #
 # Prerequisites:
 #   - All bench_*.sh scripts have been run and produced output
-#   - diplinator, minimap2, samtools, whatshap, python3
+#   - diplinator, minimap2, samtools, python3
 #   - HG002 diploid assembly (maternal + paternal FASTAs)
 #   - Reads FASTQ (for diplinator alignment)
+#   - whatshap (optional, only for VCF-level comparison)
 #
 # Usage:
 #   ./scripts/bench_compare.sh \
@@ -31,6 +33,7 @@ READS=""
 MAT_REF=""
 PAT_REF=""
 TRUTH_VCF=""
+GENE_BED=""
 OUTDIR=""
 THREADS=16
 CHROMS=""
@@ -57,7 +60,8 @@ Tool result directories (at least one required):
   --longphase-dir DIR  LongPhase output directory (contains haplotagged.bam, phased.vcf.gz)
 
 Optional:
-  --truth-vcf FILE     Truth phased VCF for whatshap compare (competitors only)
+  --truth-vcf FILE     Truth phased VCF for VCF-level comparison (competitors only)
+  --gene-bed FILE      Gene BED (chrom,start,end,name) for % fully phased genes
   --chroms STR         Comma-separated chromosome list [all]
   --threads INT        Threads [16]
   -h, --help           Show this help
@@ -71,6 +75,7 @@ while [[ $# -gt 0 ]]; do
         --mat-ref)       MAT_REF="$2";       shift 2 ;;
         --pat-ref)       PAT_REF="$2";       shift 2 ;;
         --truth-vcf)     TRUTH_VCF="$2";     shift 2 ;;
+        --gene-bed)      GENE_BED="$2";      shift 2 ;;
         --outdir)        OUTDIR="$2";        shift 2 ;;
         --threads)       THREADS="$2";       shift 2 ;;
         --chroms)        CHROMS="$2";        shift 2 ;;
@@ -137,12 +142,12 @@ for tool in pgphase whatshap hiphase longphase; do
     bam=$(find_phased_bam "$dir" "$tool") || true
 
     if [[ -z "$bam" ]]; then
-        echo "  ⚠️  $tool: no phased BAM found in $dir, skipping."
+        echo "  WARNING: $tool: no phased BAM found in $dir, skipping."
         continue
     fi
 
     eval_dir="$OUTDIR/${tool}_eval"
-    if [[ -f "$eval_dir/phase_accuracy.json" ]]; then
+    if [[ -f "$eval_dir/summary.json" ]]; then
         echo "  $tool: evaluation exists, skipping."
         continue
     fi
@@ -162,97 +167,138 @@ for tool in pgphase whatshap hiphase longphase; do
         $CHROMS_ARG
 done
 
-# ── Part 2: whatshap compare on phased VCFs (competitors only) ────────
+# ── Helper: find the phased VCF in a tool's output directory ──────────
+find_phased_vcf() {
+    local dir="$1"
+    for name in phased.vcf.gz phased.vcf; do
+        [[ -f "$dir/$name" ]] && { echo "$dir/$name"; return 0; }
+    done
+    echo ""
+    return 1
+}
+
+# Helper: extract a field from a JSON file
+json_field() {
+    local json="$1" field="$2"
+    python3 -c "import json; d=json.load(open('$json')); print(d.get('$field','N/A'))" 2>/dev/null || echo "N/A"
+}
+
+# ── Part 2: VCF-level metrics ────────────────────────────────────────
+echo ""
+echo "================================================================"
+echo " Part 2: VCF-level metrics"
+echo "================================================================"
+
+# 2a: Phased variant count + gene completeness per tool
+for tool in pgphase whatshap hiphase longphase; do
+    [[ -z "${TOOL_DIRS[$tool]+x}" ]] && continue
+    dir="${TOOL_DIRS[$tool]}"
+    vcf=$(find_phased_vcf "$dir") || true
+
+    if [[ -z "$vcf" ]]; then
+        echo "  WARNING: $tool: no phased VCF found in $dir, skipping VCF metrics."
+        continue
+    fi
+
+    gene_json="$OUTDIR/${tool}_gene_phasing.json"
+    if [[ -n "$GENE_BED" ]] && [[ -f "$GENE_BED" ]] && [[ ! -f "$gene_json" ]]; then
+        echo ""
+        echo "── Gene phasing completeness: $tool ──"
+        python3 "$SCRIPT_DIR/gene_phasing_completeness.py" \
+            "$vcf" "$GENE_BED" > "$gene_json"
+    elif [[ -f "$gene_json" ]]; then
+        echo "  $tool: gene phasing exists, skipping."
+    fi
+done
+
+# 2b: whatshap compare on phased VCFs (requires --truth-vcf)
 if [[ -n "$TRUTH_VCF" ]]; then
     echo ""
-    echo "================================================================"
-    echo " Part 2: VCF-level phasing accuracy (whatshap compare)"
-    echo "================================================================"
+    echo "── VCF-level phasing accuracy (whatshap compare) ──"
 
     [[ -f "$TRUTH_VCF" ]] || { echo "Error: truth VCF not found: $TRUTH_VCF" >&2; exit 1; }
-    command -v whatshap >/dev/null 2>&1 || { echo "Warning: whatshap not found, skipping VCF comparison." >&2; }
+    if ! command -v whatshap >/dev/null 2>&1; then
+        echo "  Warning: whatshap not found, skipping VCF comparison." >&2
+    else
+        for tool in pgphase whatshap hiphase longphase; do
+            [[ -z "${TOOL_DIRS[$tool]+x}" ]] && continue
+            dir="${TOOL_DIRS[$tool]}"
+            vcf=$(find_phased_vcf "$dir") || true
 
-    for tool in whatshap hiphase longphase; do
-        [[ -z "${TOOL_DIRS[$tool]+x}" ]] && continue
-        dir="${TOOL_DIRS[$tool]}"
-        phased_vcf="$dir/phased.vcf.gz"
+            if [[ -z "$vcf" ]]; then
+                echo "  WARNING: $tool: no phased VCF, skipping whatshap compare."
+                continue
+            fi
 
-        if [[ ! -f "$phased_vcf" ]]; then
-            echo "  ⚠️  $tool: no phased VCF found in $dir, skipping."
-            continue
-        fi
+            compare_out="$OUTDIR/${tool}_whatshap_compare.tsv"
+            if [[ -f "$compare_out" ]]; then
+                echo "  $tool: whatshap compare exists, skipping."
+                continue
+            fi
 
-        compare_out="$OUTDIR/${tool}_whatshap_compare.tsv"
-        if [[ -f "$compare_out" ]]; then
-            echo "  $tool: whatshap compare exists, skipping."
-            continue
-        fi
-
-        echo ""
-        echo "── whatshap compare: $tool ──"
-        whatshap compare \
-            --tsv-pairwise "$compare_out" \
-            --names truth,$tool \
-            "$TRUTH_VCF" "$phased_vcf"
-    done
+            echo ""
+            echo "── whatshap compare: $tool ──"
+            whatshap compare \
+                --tsv-pairwise "$compare_out" \
+                --names truth,$tool \
+                "$TRUTH_VCF" "$vcf"
+        done
+    fi
 fi
 
-# ── Part 3: Collect timing ────────────────────────────────────────────
+# ── Part 3: Summary table ────────────────────────────────────────────
 echo ""
 echo "================================================================"
-echo " Part 3: Timing summary"
+echo " Part 3: Summary"
 echo "================================================================"
 
 {
-    printf "tool\twall_clock\n"
+    printf "tool\taccuracy\thamming_err\tswitch_err\tswitches\tflips\tswitchflips\t"
+    printf "phased_reads\tfrac_phased\tng50_bp\t"
+    printf "phased_het_vars\tpct_genes_phased\twall_clock\n"
     for tool in pgphase whatshap hiphase longphase; do
         [[ -z "${TOOL_DIRS[$tool]+x}" ]] && continue
-        dir="${TOOL_DIRS[$tool]}"
-        timing="$dir/timing.log"
-        if [[ -f "$timing" ]]; then
-            # Extract the last "real" line from the timing log.
-            wall=$(grep -oP '(?<=real\s)\S+' "$timing" | tail -1 || echo "N/A")
-            printf "%s\t%s\n" "$tool" "$wall"
-        else
-            printf "%s\tN/A\n" "$tool"
-        fi
-    done
-} | tee "$OUTDIR/timing_summary.tsv"
-
-# ── Part 4: Aggregate summary table ──────────────────────────────────
-echo ""
-echo "================================================================"
-echo " Part 4: Summary"
-echo "================================================================"
-
-{
-    printf "tool\tswitch_rate\thamming_rate\tphased_reads\tphase_block_n50\twall_clock\n"
-    for tool in pgphase whatshap hiphase longphase; do
-        [[ -z "${TOOL_DIRS[$tool]+x}" ]] && continue
-        eval_dir="$OUTDIR/${tool}_eval"
-        json="$eval_dir/phase_accuracy.json"
+        eval_json="$OUTDIR/${tool}_eval/summary.json"
+        gene_json="$OUTDIR/${tool}_gene_phasing.json"
         timing="${TOOL_DIRS[$tool]}/timing.log"
 
-        switch="N/A"; hamming="N/A"; reads="N/A"; n50="N/A"; wall="N/A"
+        acc="N/A"; hamming="N/A"; switch_rate="N/A"
+        switches="N/A"; flips="N/A"; switchflips="N/A"
+        reads="N/A"; frac="N/A"; ng50="N/A"
+        phased_vars="N/A"; pct_genes="N/A"; wall="N/A"
 
-        if [[ -f "$json" ]]; then
-            switch=$(python3 -c "import json; d=json.load(open('$json')); print(d.get('switch_error_rate','N/A'))" 2>/dev/null || echo "N/A")
-            hamming=$(python3 -c "import json; d=json.load(open('$json')); print(d.get('hamming_error_rate','N/A'))" 2>/dev/null || echo "N/A")
-            reads=$(python3 -c "import json; d=json.load(open('$json')); print(d.get('total_phased_reads','N/A'))" 2>/dev/null || echo "N/A")
-            n50=$(python3 -c "import json; d=json.load(open('$json')); print(d.get('phase_block_n50','N/A'))" 2>/dev/null || echo "N/A")
+        if [[ -f "$eval_json" ]]; then
+            acc=$(json_field "$eval_json" overall_accuracy)
+            hamming=$(json_field "$eval_json" hamming_error_rate)
+            switch_rate=$(json_field "$eval_json" switch_error_rate)
+            switches=$(json_field "$eval_json" switch_errors)
+            flips=$(json_field "$eval_json" flip_errors)
+            switchflips=$(json_field "$eval_json" switchflip_errors)
+            reads=$(json_field "$eval_json" total_phased_reads)
+            frac=$(json_field "$eval_json" fraction_phased)
+            ng50=$(json_field "$eval_json" phase_block_ng50_bp)
+        fi
+
+        if [[ -f "$gene_json" ]]; then
+            phased_vars=$(json_field "$gene_json" phased_het_variants)
+            pct_genes=$(json_field "$gene_json" pct_genes_fully_phased)
         fi
 
         if [[ -f "$timing" ]]; then
             wall=$(grep -oP '(?<=real\s)\S+' "$timing" | tail -1 || echo "N/A")
         fi
 
-        printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$tool" "$switch" "$hamming" "$reads" "$n50" "$wall"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$tool" "$acc" "$hamming" "$switch_rate" \
+            "$switches" "$flips" "$switchflips" \
+            "$reads" "$frac" "$ng50" \
+            "$phased_vars" "$pct_genes" "$wall"
     done
 } | tee "$SUMMARY"
 
 echo ""
 echo "Done. Full results in $OUTDIR/"
 echo "  Summary table:    $SUMMARY"
-echo "  Timing:           $OUTDIR/timing_summary.tsv"
 echo "  Per-tool eval:    $OUTDIR/<tool>_eval/"
+[[ -n "$GENE_BED" ]] && echo "  Gene phasing:     $OUTDIR/<tool>_gene_phasing.json"
 [[ -n "$TRUTH_VCF" ]] && echo "  VCF comparisons:  $OUTDIR/<tool>_whatshap_compare.tsv"

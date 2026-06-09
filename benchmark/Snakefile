@@ -1,0 +1,633 @@
+# benchmark/Snakefile — End-to-end phasing benchmark pipeline.
+#
+# Runs variant calling, phasing, and evaluation for multiple tools,
+# replicating the analyses from the HiPhase paper (Holt et al. 2024).
+#
+# Usage:
+#   cd benchmark
+#   snakemake --configfile config.yaml --use-conda -j16
+#
+# Or from the repo root:
+#   snakemake -s benchmark/Snakefile --configfile benchmark/config.yaml --use-conda -j16
+
+import os
+
+SCRIPTS = os.path.join(workflow.basedir, "..", "scripts")
+OUTDIR  = "results"
+
+# ── Config ────────────────────────────────────────────────────────────
+
+REF          = config["ref"]
+BAM          = config["bam"]
+READS        = config["reads"]
+MAT_REF      = config["mat_ref"]
+PAT_REF      = config["pat_ref"]
+TRUTH_VCF    = config.get("truth_vcf", "")
+GENE_BED     = config.get("gene_bed", "")
+TRF_BED      = config.get("trf_bed", "")
+TRGT_REPEATS = config.get("trgt_repeats", "")
+PGPHASE_BIN  = config.get("pgphase_bin", "./pgphase")
+SITES_VCF    = config.get("sites_vcf", "")
+INDEXED_GAF  = config.get("indexed_gaf", "")
+PGPHASE_MODE = config.get("pgphase_mode", "bam")
+THREADS      = config.get("threads", 16)
+KARYOTYPE    = config.get("karyotype", "XY")
+DV_MODEL     = config.get("dv_model", "PACBIO")
+TOOLS        = config.get("tools", [
+    "whatshap", "whatshap_opt", "hiphase_nosv", "hiphase", "longphase", "pgphase"
+])
+
+
+# ── Target rule ───────────────────────────────────────────────────────
+
+rule all:
+    input:
+        f"{OUTDIR}/summary.tsv",
+
+
+# ══════════════════════════════════════════════════════════════════════
+# TOOL BUILDS
+# ══════════════════════════════════════════════════════════════════════
+
+rule build_diplinator:
+    """Clone and build diplinator from source."""
+    output:
+        bin = f"{OUTDIR}/tools/diplinator",
+    conda: "envs/diplinator.yaml"
+    threads: 4
+    shell:
+        """
+        DIPLO_DIR=$(mktemp -d)
+        git clone --depth 1 https://github.com/jheinz27/diplinator.git "$DIPLO_DIR"
+        cd "$DIPLO_DIR" && cargo build --release
+        cp "$DIPLO_DIR/target/release/diplinator" {output.bin}
+        rm -rf "$DIPLO_DIR"
+        """
+
+
+# ══════════════════════════════════════════════════════════════════════
+# VARIANT CALLING (shared upstream steps)
+# ══════════════════════════════════════════════════════════════════════
+
+rule deepvariant:
+    """Call small variants with DeepVariant."""
+    input:
+        ref = REF,
+        bam = BAM,
+    output:
+        vcf = f"{OUTDIR}/deepvariant.vcf.gz",
+    params:
+        model = DV_MODEL,
+    threads: THREADS
+    conda: "envs/deepvariant.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/deepvariant.txt"
+    shell:
+        """
+        run_deepvariant \
+            --model_type={params.model} \
+            --ref={input.ref} \
+            --reads={input.bam} \
+            --output_vcf={output.vcf} \
+            --num_shards={threads}
+        """
+
+
+rule pbsv_discover:
+    """Discover SV signatures from aligned BAM."""
+    input:
+        bam = BAM,
+        trf = TRF_BED,
+    output:
+        svsig = f"{OUTDIR}/pbsv.svsig.gz",
+    conda: "envs/hiphase.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/pbsv_discover.txt"
+    shell:
+        """
+        pbsv discover --tandem-repeats {input.trf} {input.bam} {output.svsig}
+        """
+
+
+rule pbsv_call:
+    """Call structural variants from SV signatures."""
+    input:
+        ref   = REF,
+        svsig = f"{OUTDIR}/pbsv.svsig.gz",
+    output:
+        vcf = f"{OUTDIR}/pbsv.vcf.gz",
+    threads: THREADS
+    conda: "envs/hiphase.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/pbsv_call.txt"
+    shell:
+        """
+        pbsv call --ccs -j {threads} {input.ref} {input.svsig} {OUTDIR}/pbsv.tmp.vcf
+        bgzip -c {OUTDIR}/pbsv.tmp.vcf > {output.vcf}
+        tabix -p vcf {output.vcf}
+        rm -f {OUTDIR}/pbsv.tmp.vcf
+        """
+
+
+rule trgt_genotype:
+    """Genotype tandem repeats with TRGT."""
+    input:
+        ref     = REF,
+        bam     = BAM,
+        repeats = TRGT_REPEATS,
+    output:
+        vcf = f"{OUTDIR}/trgt.vcf.gz",
+    params:
+        prefix    = f"{OUTDIR}/trgt_raw",
+        karyotype = KARYOTYPE,
+    threads: THREADS
+    conda: "envs/hiphase.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/trgt_genotype.txt"
+    shell:
+        """
+        trgt genotype \
+            --genome {input.ref} \
+            --reads {input.bam} \
+            --repeats {input.repeats} \
+            --output-prefix {params.prefix} \
+            --karyotype {params.karyotype} \
+            --threads {threads}
+        bcftools sort -Oz -o {output.vcf} {params.prefix}.vcf.gz
+        tabix -p vcf {output.vcf}
+        """
+
+
+# ══════════════════════════════════════════════════════════════════════
+# PHASING
+# ══════════════════════════════════════════════════════════════════════
+
+rule whatshap_phase:
+    """Phase small variants with WhatsHap (baseline)."""
+    input:
+        ref = REF,
+        bam = BAM,
+        vcf = f"{OUTDIR}/deepvariant.vcf.gz",
+    output:
+        vcf = f"{OUTDIR}/whatshap/phased.vcf.gz",
+    conda: "envs/whatshap.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/whatshap_phase.txt"
+    shell:
+        """
+        whatshap phase \
+            --reference {input.ref} \
+            --ignore-read-groups \
+            --indels \
+            -o {OUTDIR}/whatshap/phased.vcf \
+            {input.vcf} {input.bam}
+        bgzip -c {OUTDIR}/whatshap/phased.vcf > {output.vcf}
+        tabix -p vcf {output.vcf}
+        rm -f {OUTDIR}/whatshap/phased.vcf
+        """
+
+
+rule whatshap_haplotag:
+    """Haplotag reads using WhatsHap phased VCF."""
+    input:
+        ref = REF,
+        bam = BAM,
+        vcf = f"{OUTDIR}/whatshap/phased.vcf.gz",
+    output:
+        bam = f"{OUTDIR}/whatshap/haplotagged.bam",
+    threads: THREADS
+    conda: "envs/whatshap.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/whatshap_haplotag.txt"
+    shell:
+        """
+        whatshap haplotag \
+            --reference {input.ref} \
+            --output-threads {threads} \
+            -o {output.bam} \
+            {input.vcf} {input.bam}
+        samtools index -@ {threads} {output.bam}
+        """
+
+
+rule whatshap_opt_phase:
+    """Phase small variants with WhatsHap (optimized: --distrust-genotypes)."""
+    input:
+        ref = REF,
+        bam = BAM,
+        vcf = f"{OUTDIR}/deepvariant.vcf.gz",
+    output:
+        vcf = f"{OUTDIR}/whatshap_opt/phased.vcf.gz",
+    conda: "envs/whatshap.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/whatshap_opt_phase.txt"
+    shell:
+        """
+        whatshap phase \
+            --reference {input.ref} \
+            --ignore-read-groups \
+            --indels \
+            --distrust-genotypes \
+            -o {OUTDIR}/whatshap_opt/phased.vcf \
+            {input.vcf} {input.bam}
+        bgzip -c {OUTDIR}/whatshap_opt/phased.vcf > {output.vcf}
+        tabix -p vcf {output.vcf}
+        rm -f {OUTDIR}/whatshap_opt/phased.vcf
+        """
+
+
+rule whatshap_opt_haplotag:
+    """Haplotag reads using WhatsHap (optimized) phased VCF."""
+    input:
+        ref = REF,
+        bam = BAM,
+        vcf = f"{OUTDIR}/whatshap_opt/phased.vcf.gz",
+    output:
+        bam = f"{OUTDIR}/whatshap_opt/haplotagged.bam",
+    threads: THREADS
+    conda: "envs/whatshap.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/whatshap_opt_haplotag.txt"
+    shell:
+        """
+        whatshap haplotag \
+            --reference {input.ref} \
+            --output-threads {threads} \
+            -o {output.bam} \
+            {input.vcf} {input.bam}
+        samtools index -@ {threads} {output.bam}
+        """
+
+
+rule hiphase_nosv:
+    """Phase + haplotag with HiPhase (small variants only)."""
+    input:
+        ref = REF,
+        bam = BAM,
+        vcf = f"{OUTDIR}/deepvariant.vcf.gz",
+    output:
+        bam     = f"{OUTDIR}/hiphase_nosv/haplotagged.bam",
+        vcf     = f"{OUTDIR}/hiphase_nosv/phased.vcf.gz",
+        stats   = f"{OUTDIR}/hiphase_nosv/stats.tsv",
+        blocks  = f"{OUTDIR}/hiphase_nosv/blocks.tsv",
+        summary = f"{OUTDIR}/hiphase_nosv/summary.tsv",
+    threads: THREADS
+    conda: "envs/hiphase.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/hiphase_nosv.txt"
+    shell:
+        """
+        hiphase \
+            --reference {input.ref} \
+            --bam {input.bam} \
+            --vcf {input.vcf} \
+            --output-bam {output.bam} \
+            --output-vcf {output.vcf} \
+            --stats-file {output.stats} \
+            --blocks-file {output.blocks} \
+            --summary-file {output.summary} \
+            --threads {threads}
+        samtools index -@ {threads} {output.bam}
+        """
+
+
+rule hiphase:
+    """Phase + haplotag with HiPhase (joint: DV + pbsv + TRGT)."""
+    input:
+        ref      = REF,
+        bam      = BAM,
+        dv_vcf   = f"{OUTDIR}/deepvariant.vcf.gz",
+        sv_vcf   = f"{OUTDIR}/pbsv.vcf.gz",
+        tr_vcf   = f"{OUTDIR}/trgt.vcf.gz",
+    output:
+        bam      = f"{OUTDIR}/hiphase/haplotagged.bam",
+        vcf      = f"{OUTDIR}/hiphase/phased.vcf.gz",
+        sv_vcf   = f"{OUTDIR}/hiphase/phased_sv.vcf.gz",
+        tr_vcf   = f"{OUTDIR}/hiphase/phased_tr.vcf.gz",
+        stats    = f"{OUTDIR}/hiphase/stats.tsv",
+        blocks   = f"{OUTDIR}/hiphase/blocks.tsv",
+        summary  = f"{OUTDIR}/hiphase/summary.tsv",
+    threads: THREADS
+    conda: "envs/hiphase.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/hiphase.txt"
+    shell:
+        """
+        hiphase \
+            --reference {input.ref} \
+            --bam {input.bam} \
+            --vcf {input.dv_vcf} \
+            --vcf {input.sv_vcf} \
+            --vcf {input.tr_vcf} \
+            --global-realignment-cputime 300 \
+            --output-bam {output.bam} \
+            --output-vcf {output.vcf} \
+            --output-vcf {output.sv_vcf} \
+            --output-vcf {output.tr_vcf} \
+            --stats-file {output.stats} \
+            --blocks-file {output.blocks} \
+            --summary-file {output.summary} \
+            --threads {threads}
+        samtools index -@ {threads} {output.bam}
+        """
+
+
+rule longphase_phase:
+    """Phase small variants with LongPhase."""
+    input:
+        ref = REF,
+        bam = BAM,
+        vcf = f"{OUTDIR}/deepvariant.vcf.gz",
+    output:
+        vcf = f"{OUTDIR}/longphase/phased.vcf.gz",
+    params:
+        prefix = f"{OUTDIR}/longphase/phased",
+    threads: THREADS
+    conda: "envs/longphase.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/longphase_phase.txt"
+    shell:
+        """
+        longphase phase \
+            -s {input.vcf} \
+            -b {input.bam} \
+            -r {input.ref} \
+            -t {threads} \
+            --pb \
+            -o {params.prefix}
+        bgzip -c {params.prefix}.vcf > {output.vcf}
+        tabix -p vcf {output.vcf}
+        """
+
+
+rule longphase_haplotag:
+    """Haplotag reads with LongPhase."""
+    input:
+        vcf = f"{OUTDIR}/longphase/phased.vcf.gz",
+        bam = BAM,
+    output:
+        bam = f"{OUTDIR}/longphase/haplotagged.bam",
+    params:
+        prefix = f"{OUTDIR}/longphase/haplotagged",
+    threads: THREADS
+    conda: "envs/longphase.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/longphase_haplotag.txt"
+    shell:
+        """
+        longphase haplotag \
+            -s {input.vcf} \
+            -b {input.bam} \
+            -t {threads} \
+            -o {params.prefix}
+        samtools index -@ {threads} {output.bam}
+        """
+
+
+rule pgphase:
+    """Phase + haplotag with pgphase."""
+    input:
+        ref = REF,
+        bam = BAM,
+    output:
+        bam = f"{OUTDIR}/pgphase/haplotagged.bam",
+        vcf = f"{OUTDIR}/pgphase/phased.vcf",
+    params:
+        pgphase_bin = PGPHASE_BIN,
+        mode        = PGPHASE_MODE,
+        sites_vcf   = SITES_VCF,
+        indexed_gaf = INDEXED_GAF,
+    threads: THREADS
+    benchmark: f"{OUTDIR}/benchmarks/pgphase.txt"
+    shell:
+        """
+        if [ "{params.mode}" = "graph" ]; then
+            {params.pgphase_bin} collect-graph-variation \
+                --ref {input.ref} \
+                --gaf {params.indexed_gaf} \
+                --sites-vcf {params.sites_vcf} \
+                --phased-bam-out {output.bam} \
+                --phased-vcf-out {output.vcf} \
+                --threads {threads}
+        else
+            {params.pgphase_bin} collect-bam-variation \
+                --ref {input.ref} \
+                --bam {input.bam} \
+                --phased-bam-out {output.bam} \
+                --phased-vcf-out {output.vcf} \
+                --threads {threads}
+        fi
+        samtools index -@ {threads} {output.bam}
+        """
+
+
+# ══════════════════════════════════════════════════════════════════════
+# EVALUATION
+# ══════════════════════════════════════════════════════════════════════
+
+def get_haplotagged_bam(tool):
+    return f"{OUTDIR}/{tool}/haplotagged.bam"
+
+def get_phased_vcf(tool):
+    if tool == "pgphase":
+        return f"{OUTDIR}/{tool}/phased.vcf"
+    return f"{OUTDIR}/{tool}/phased.vcf.gz"
+
+
+rule diplinator_eval:
+    """Read-level phasing accuracy via diplinator."""
+    input:
+        bam        = lambda wc: get_haplotagged_bam(wc.tool),
+        reads      = READS,
+        mat_ref    = MAT_REF,
+        pat_ref    = PAT_REF,
+        diplinator = f"{OUTDIR}/tools/diplinator",
+    output:
+        json = f"{OUTDIR}/{{tool}}_eval/summary.json",
+    params:
+        outdir = f"{OUTDIR}/{{tool}}_eval",
+        script = os.path.join(SCRIPTS, "evaluate_phase_accuracy.sh"),
+    threads: THREADS
+    conda: "envs/diplinator.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/{{tool}}_diplinator.txt"
+    shell:
+        """
+        {params.script} \
+            --phased-bam {input.bam} \
+            --reads {input.reads} \
+            --mat-ref {input.mat_ref} \
+            --pat-ref {input.pat_ref} \
+            --diplinator {input.diplinator} \
+            --outdir {params.outdir} \
+            --threads {threads}
+        """
+
+
+rule gene_phasing:
+    """Compute % of genes fully phased from phased VCF."""
+    input:
+        vcf      = lambda wc: get_phased_vcf(wc.tool),
+        gene_bed = GENE_BED,
+    output:
+        json = f"{OUTDIR}/{{tool}}_gene_phasing.json",
+    params:
+        script = os.path.join(SCRIPTS, "gene_phasing_completeness.py"),
+    benchmark: f"{OUTDIR}/benchmarks/{{tool}}_gene_phasing.txt"
+    shell:
+        """
+        python3 {params.script} {input.vcf} {input.gene_bed} > {output.json}
+        """
+
+
+rule whatshap_compare:
+    """VCF-level phasing accuracy via whatshap compare."""
+    input:
+        truth = TRUTH_VCF,
+        vcf   = lambda wc: get_phased_vcf(wc.tool),
+    output:
+        tsv       = f"{OUTDIR}/{{tool}}_whatshap_compare.tsv",
+        error_bed = f"{OUTDIR}/{{tool}}_switch_errors.bed",
+    params:
+        tool = "{tool}",
+    conda: "envs/whatshap_compare.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/{{tool}}_whatshap_compare.txt"
+    shell:
+        """
+        whatshap compare \
+            --tsv-pairwise {output.tsv} \
+            --switch-error-bed {output.error_bed} \
+            --names truth,{params.tool} \
+            {input.truth} {input.vcf}
+        """
+
+
+rule whatshap_stats:
+    """Gather phase block statistics from phased VCF."""
+    input:
+        vcf = lambda wc: get_phased_vcf(wc.tool),
+    output:
+        tsv    = f"{OUTDIR}/{{tool}}_whatshap_stats.tsv",
+        blocks = f"{OUTDIR}/{{tool}}_phase_blocks.tsv",
+    conda: "envs/whatshap_compare.yaml"
+    benchmark: f"{OUTDIR}/benchmarks/{{tool}}_whatshap_stats.txt"
+    shell:
+        """
+        whatshap stats \
+            --tsv {output.tsv} \
+            --block-list {output.blocks} \
+            {input.vcf}
+        """
+
+
+rule ngc50:
+    """Compute NGC50 (corrected NG50) by subtracting switch error regions."""
+    input:
+        blocks    = f"{OUTDIR}/{{tool}}_phase_blocks.tsv",
+        error_bed = f"{OUTDIR}/{{tool}}_switch_errors.bed",
+    output:
+        json = f"{OUTDIR}/{{tool}}_ngc50.json",
+    params:
+        script = os.path.join(SCRIPTS, "compute_ngc50.py"),
+    conda: "envs/diplinator.yaml"
+    shell:
+        """
+        python3 {params.script} {input.blocks} {input.error_bed} {output.json}
+        """
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SUMMARY
+# ══════════════════════════════════════════════════════════════════════
+
+def summary_inputs(wildcards):
+    """Collect all evaluation outputs for requested tools."""
+    inputs = {}
+    for tool in TOOLS:
+        inputs[f"{tool}_eval"] = f"{OUTDIR}/{tool}_eval/summary.json"
+        if GENE_BED:
+            inputs[f"{tool}_gene"] = f"{OUTDIR}/{tool}_gene_phasing.json"
+        if TRUTH_VCF:
+            inputs[f"{tool}_compare"] = f"{OUTDIR}/{tool}_whatshap_compare.tsv"
+            inputs[f"{tool}_stats"]   = f"{OUTDIR}/{tool}_whatshap_stats.tsv"
+            inputs[f"{tool}_ngc50"]   = f"{OUTDIR}/{tool}_ngc50.json"
+    return inputs
+
+
+rule summary:
+    """Aggregate all evaluation results into a single TSV."""
+    input:
+        unpack(summary_inputs),
+    output:
+        tsv = f"{OUTDIR}/summary.tsv",
+    params:
+        tools     = TOOLS,
+        outdir    = OUTDIR,
+        gene_bed  = GENE_BED,
+        truth_vcf = TRUTH_VCF,
+    run:
+        import json, csv
+
+        def jf(path, field):
+            try:
+                with open(path) as f:
+                    return json.load(f).get(field, "N/A")
+            except Exception:
+                return "N/A"
+
+        def whatshap_stats_field(path, field):
+            """Read a field from whatshap stats TSV (one row per chromosome + ALL)."""
+            try:
+                with open(path) as f:
+                    reader = csv.DictReader(f, delimiter="\t")
+                    for row in reader:
+                        if row.get("sample", row.get("#sample", "")) == "ALL" or \
+                           row.get("chromosome", "") == "ALL":
+                            return row.get(field, "N/A")
+                    # If no ALL row, return N/A
+                    return "N/A"
+            except Exception:
+                return "N/A"
+
+        header = [
+            "tool",
+            # Read-level metrics (diplinator)
+            "accuracy", "hamming_err", "switch_err",
+            "switches", "flips", "switchflips",
+            "phased_reads", "frac_phased", "ng50_bp",
+        ]
+        if params.truth_vcf:
+            # VCF-level metrics (whatshap compare/stats)
+            header += [
+                "vcf_switch_err", "vcf_switchflips",
+                "vcf_phased_vars", "vcf_ng50_bp", "ngc50_bp",
+            ]
+        if params.gene_bed:
+            header += ["phased_het_vars", "pct_genes_phased"]
+
+        with open(output.tsv, "w") as out:
+            out.write("\t".join(header) + "\n")
+            for tool in params.tools:
+                ej  = f"{params.outdir}/{tool}_eval/summary.json"
+                gj  = f"{params.outdir}/{tool}_gene_phasing.json"
+                wst = f"{params.outdir}/{tool}_whatshap_stats.tsv"
+                nj  = f"{params.outdir}/{tool}_ngc50.json"
+
+                row = [
+                    tool,
+                    str(jf(ej, "overall_accuracy")),
+                    str(jf(ej, "hamming_error_rate")),
+                    str(jf(ej, "switch_error_rate")),
+                    str(jf(ej, "switch_errors")),
+                    str(jf(ej, "flip_errors")),
+                    str(jf(ej, "switchflip_errors")),
+                    str(jf(ej, "total_phased_reads")),
+                    str(jf(ej, "fraction_phased")),
+                    str(jf(ej, "phase_block_ng50_bp")),
+                ]
+                if params.truth_vcf:
+                    row += [
+                        whatshap_stats_field(wst, "switch_error_rate"),
+                        whatshap_stats_field(wst, "switch_flips"),
+                        whatshap_stats_field(wst, "phased"),
+                        whatshap_stats_field(wst, "NG50"),
+                        str(jf(nj, "ngc50_bp")),
+                    ]
+                if params.gene_bed:
+                    row += [
+                        str(jf(gj, "phased_het_variants")),
+                        str(jf(gj, "pct_genes_fully_phased")),
+                    ]
+
+                out.write("\t".join(row) + "\n")
+
+        # Print to stdout too
+        with open(output.tsv) as f:
+            print(f.read())

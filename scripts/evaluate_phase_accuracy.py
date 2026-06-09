@@ -142,7 +142,7 @@ read_phase = {}
 total_input_reads = 0
 unphased_reads = 0
 ps_all = collections.defaultdict(lambda: {"hp1": 0, "hp2": 0})  # all PS, not just truth-matched
-proc = subprocess.Popen([samtools, "view", phased_bam], stdout=subprocess.PIPE, text=True)
+proc = subprocess.Popen([samtools, "view", "-F", "0x900", phased_bam], stdout=subprocess.PIPE, text=True)
 for line in proc.stdout:
     f = line.rstrip("\n").split("\t")
     total_input_reads += 1
@@ -307,11 +307,18 @@ def is_concordant(hp, truth_hap, orientation):
     else:  # HP1=PAT,HP2=MAT
         return (hp == 1 and truth_hap == "PAT") or (hp == 2 and truth_hap == "MAT")
 
-# ── compute switch errors per phase set ──────────────────────────────
-# A switch error is a transition between concordant and discordant
-# in consecutive reads sorted by truth position within a phase set.
-# This counts actual phase switches, not individual discordant reads.
+# ── compute switch and flip errors per phase set ─────────────────────
+# A raw transition is a change between concordant and discordant in
+# consecutive reads sorted by truth position.  Following the whatshap
+# compare convention, we decompose raw transitions into switches and
+# flips:
+#   - A flip is an isolated single-read error: two consecutive
+#     transitions at adjacent positions (conc→disc→conc or vice versa).
+#     It counts as 1 flip, consuming 2 raw transitions.
+#   - A switch is a persistent phase change (1 raw transition).
+#   - switchflips = switches + flips (the HiPhase paper metric).
 ps_switches = {}
+ps_flips = {}
 ps_read_list = collections.defaultdict(list)  # ps -> [(pos, is_concordant)]
 
 for qname in read_truth:
@@ -324,20 +331,38 @@ for qname in read_truth:
     ps_read_list[ps].append((t.pos, conc))
 
 total_switches = 0
+total_flips = 0
 total_switch_opportunities = 0
 for ps in ps_read_list:
     reads = sorted(ps_read_list[ps], key=lambda x: x[0])
-    switches = 0
+    # Collect indices where transitions occur
+    transition_indices = []
     for i in range(1, len(reads)):
         if reads[i][1] != reads[i-1][1]:
+            transition_indices.append(i)
+    # Decompose into switches and flips: consecutive transitions at
+    # adjacent positions (i, i+1) form a flip.
+    switches = 0
+    flips = 0
+    i = 0
+    while i < len(transition_indices):
+        if (i + 1 < len(transition_indices) and
+                transition_indices[i+1] == transition_indices[i] + 1):
+            flips += 1
+            i += 2  # consume both transitions
+        else:
             switches += 1
+            i += 1
     ps_switches[ps] = switches
+    ps_flips[ps] = flips
     total_switches += switches
+    total_flips += flips
     total_switch_opportunities += max(len(reads) - 1, 0)
 
-# Attach switch count to results
+# Attach switch/flip counts to results
 for r in results:
     r["switches"] = ps_switches.get(r["phase_set"], 0)
+    r["flips"] = ps_flips.get(r["phase_set"], 0)
 
 # Record switch positions for BED output
 switch_positions = []  # (chrom, pos, ps, from_status, to_status)
@@ -355,7 +380,7 @@ for ps in ps_read_list:
 # ── per-read output with concordance + category ─────────────────────
 has_annotations = bool(censat_regions or segdup_regions)
 cat_counts = collections.defaultdict(lambda: {"conc": 0, "disc": 0, "total": 0,
-                                               "switches": 0, "pairs": 0})
+                                               "switches": 0, "flips": 0, "pairs": 0})
 
 def full_contig_name(chrom, hap):
     """Reconstruct full contig name (e.g. chr20_MATERNAL) for annotation lookup."""
@@ -398,7 +423,7 @@ with gzip.open(per_read_file, "wt") as fh:
             line += f"\t{cat}"
         fh.write(line + "\n")
 
-# Compute per-category switch errors
+# Compute per-category switch/flip errors
 if has_annotations:
     cat_read_list = collections.defaultdict(lambda: collections.defaultdict(list))
     for qname in read_truth:
@@ -415,15 +440,25 @@ if has_annotations:
     for cat in cat_read_list:
         for ps_reads in cat_read_list[cat].values():
             reads = sorted(ps_reads, key=lambda x: x[0])
+            transition_indices = []
             for i in range(1, len(reads)):
                 cat_counts[cat]["pairs"] += 1
                 if reads[i][1] != reads[i-1][1]:
+                    transition_indices.append(i)
+            j = 0
+            while j < len(transition_indices):
+                if (j + 1 < len(transition_indices) and
+                        transition_indices[j+1] == transition_indices[j] + 1):
+                    cat_counts[cat]["flips"] += 1
+                    j += 2
+                else:
                     cat_counts[cat]["switches"] += 1
+                    j += 1
 
 # ── per-phase-set TSV ────────────────────────────────────────────────
 ps_fields = ["chrom","phase_set","n_reads","span_bp",
              "hp1_mat","hp1_pat","hp2_mat","hp2_pat",
-             "concordant","discordant","accuracy","switches","orientation"]
+             "concordant","discordant","accuracy","switches","flips","orientation"]
 if sites_vcf:
     ps_fields.extend(["n_sites", "site_density"])
 per_ps_file = os.path.join(outdir, "per_phase_set.tsv")
@@ -461,15 +496,16 @@ if has_annotations:
     cat_file = os.path.join(outdir, "per_category.tsv")
     with open(cat_file, "w") as fh:
         fh.write("category\treads\tconcordant\tdiscordant\taccuracy\t"
-                 "hamming_error\tswitches\tpairs\tswitch_error\n")
+                 "hamming_error\tswitches\tflips\tswitchflips\tpairs\tswitch_error\n")
         for cat in sorted(cat_counts):
             c = cat_counts[cat]
             acc = c["conc"] / c["total"] if c["total"] else 0
             herr = c["disc"] / c["total"] if c["total"] else 0
-            serr = c["switches"] / c["pairs"] if c["pairs"] else 0
+            sf = c["switches"] + c["flips"]
+            serr = sf / c["pairs"] if c["pairs"] else 0
             fh.write(f"{cat}\t{c['total']}\t{c['conc']}\t{c['disc']}\t"
-                     f"{acc:.4f}\t{herr:.4f}\t{c['switches']}\t{c['pairs']}\t"
-                     f"{serr:.4f}\n")
+                     f"{acc:.4f}\t{herr:.4f}\t{c['switches']}\t{c['flips']}\t"
+                     f"{sf}\t{c['pairs']}\t{serr:.4f}\n")
 
 # ── worst phase sets ────────────────────────────────────────────────
 worst_file = os.path.join(outdir, "worst_phase_sets.tsv")
@@ -560,6 +596,7 @@ for sp in all_spans:
 overall_acc = total_conc / total_reads if total_reads else 0
 hamming_rate = total_disc / total_reads if total_reads else 0
 switch_rate = total_switches / total_switch_opportunities if total_switch_opportunities else 0
+switchflip_rate = (total_switches + total_flips) / total_switch_opportunities if total_switch_opportunities else 0
 pct_perfect = 100 * total_perfect / total_ps if total_ps else 0
 
 # Accuracy split by het site availability
@@ -609,8 +646,11 @@ summary = {
     "overall_accuracy": round(overall_acc, 6),
     "hamming_error_rate": round(hamming_rate, 6),
     "switch_errors": total_switches,
+    "flip_errors": total_flips,
+    "switchflip_errors": total_switches + total_flips,
     "switch_opportunities": total_switch_opportunities,
     "switch_error_rate": round(switch_rate, 6),
+    "switchflip_error_rate": round(switchflip_rate, 6),
     # Contiguity
     "phase_block_n50_bp": n50,
     "phase_block_ng50_bp": ng50,
@@ -629,13 +669,16 @@ if has_annotations:
     summary["per_category"] = {}
     for cat in sorted(cat_counts):
         c = cat_counts[cat]
+        sf = c["switches"] + c["flips"]
         summary["per_category"][cat] = {
             "reads": c["total"],
             "concordant": c["conc"],
             "discordant": c["disc"],
             "accuracy": round(c["conc"] / c["total"], 6) if c["total"] else 0,
             "switches": c["switches"],
-            "switch_error_rate": round(c["switches"] / c["pairs"], 6) if c["pairs"] else 0,
+            "flips": c["flips"],
+            "switchflips": sf,
+            "switch_error_rate": round(sf / c["pairs"], 6) if c["pairs"] else 0,
         }
 
 summary["phaseable"] = {
@@ -701,7 +744,9 @@ with open(summary_file, "w") as fh:
         f"  Hamming error rate:       {100*hamming_rate:.2f}%  "
         f"({total_disc:,} discordant reads / {total_reads:,})",
         f"  Switch error rate:        {100*switch_rate:.2f}%  "
-        f"({total_switches:,} switches / {total_switch_opportunities:,} pairs)",
+        f"({total_switches:,} switches + {total_flips:,} flips = "
+        f"{total_switches+total_flips:,} switchflips / "
+        f"{total_switch_opportunities:,} pairs)",
     ]
     lines += [
         "",
@@ -713,15 +758,16 @@ with open(summary_file, "w") as fh:
     if has_annotations:
         lines += ["", "  Per-category:"]
         lines.append(f"    {'Category':<20s} {'Reads':>8s} {'Accuracy':>9s} "
-                     f"{'Hamming':>8s} {'Switch':>8s}")
-        lines.append("    " + "-" * 58)
+                     f"{'Hamming':>8s} {'Sw':>5s} {'Fl':>5s} {'SwFl':>6s}")
+        lines.append("    " + "-" * 64)
         for cat in sorted(cat_counts):
             c = cat_counts[cat]
             acc = c["conc"] / c["total"] if c["total"] else 0
             herr = c["disc"] / c["total"] if c["total"] else 0
-            serr = c["switches"] / c["pairs"] if c["pairs"] else 0
+            sf = c["switches"] + c["flips"]
             lines.append(f"    {cat:<20s} {c['total']:>8,d} {100*acc:>8.2f}% "
-                         f"{100*herr:>7.2f}% {100*serr:>7.2f}%")
+                         f"{100*herr:>7.2f}% {c['switches']:>5d} "
+                         f"{c['flips']:>5d} {sf:>6d}")
     lines += [
         "",
         "  Per-chromosome:",

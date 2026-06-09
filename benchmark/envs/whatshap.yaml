@@ -1,0 +1,8 @@
+name: bench-whatshap
+channels:
+  - bioconda
+  - conda-forge
+dependencies:
+  - whatshap=2.8
+  - samtools
+  - htslib
