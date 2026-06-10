@@ -662,6 +662,261 @@ void run_collect_bam_variation(const Options& opts) {
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// Hybrid BAM+graph pipeline
+// ════════════════════════════════════════════════════════════════════════════
+
+} // namespace pgphase_collect
+
+#include "hybrid_inject.hpp"
+#include "graph_sites.hpp"
+#include "graph_query.hpp"
+
+namespace pgphase_collect {
+
+/// Hybrid per-chunk processing: BAM classification → graph site injection →
+/// BAM profile build → graph read injection → unified k-means.
+static PhasingChunk process_chunk_hybrid(
+        const RegionChunk& region,
+        const Options& opts,
+        WorkerContext& context,
+        SitesVcfHandle& sites_handle,
+        IndexedGafHandle& gaf_handle,
+        const std::string& graph_query_contig,
+        const std::unordered_map<std::string, std::string>& chrom_remap) {
+    PhasingChunk chunk;
+    chunk.region = region;
+    load_and_prepare_chunk(chunk, opts, context);
+
+    // Steps 1-2: BAM candidate discovery + classification.
+    collect_var_classify(chunk, opts, context.primary_header());
+
+    // Load graph sites and GAF reads for this region.
+    GraphSiteCatalog chunk_catalog = load_sites_for_region(
+        sites_handle, graph_query_contig, region.beg - 1, region.end);
+    for (GraphSite& s : chunk_catalog.sites) {
+        auto it = chrom_remap.find(s.chrom);
+        if (it != chrom_remap.end()) s.chrom = it->second;
+        if (!s.ref_contig.empty()) {
+            auto it2 = chrom_remap.find(s.ref_contig);
+            if (it2 != chrom_remap.end()) s.ref_contig = it2->second;
+        }
+    }
+    GraphSiteCatalogView chunk_view = chunk_catalog.view_all();
+
+    std::vector<GraphReadAllele> chunk_rows;
+    if (!chunk_view.empty()) {
+        chunk_rows = scan_indexed_gaf_chunk(
+            gaf_handle, graph_query_contig,
+            region.beg - 1, region.end,
+            chunk_view, opts.min_mapq);
+    }
+
+    // Phase A: add graph-only sites to candidate table.
+    SiteToCandidateMap site_map;
+    std::unordered_set<int> graph_only_cands;
+    int bridged = 0, added = 0;
+    if (!chunk_view.empty()) {
+        site_map = inject_graph_sites(
+            chunk, chunk_view, chrom_remap, opts, &bridged, &added,
+            &graph_only_cands);
+    }
+
+    // Noise filter on graph-only candidates.
+    if (!graph_only_cands.empty() && !chunk.ref_seq.empty()) {
+        apply_hybrid_noise_filter(
+            chunk, chunk.ref_seq, chunk.ref_beg, chunk.ref_end,
+            graph_only_cands, opts.noisy_reg_max_xgaps);
+    }
+
+    // Step 3.1: build BAM read profiles against augmented candidate table.
+    collect_var_build_profiles(chunk, opts);
+
+    // Backfill allele counts on graph-only candidates from BAM profiles.
+    // The BAM profile builder records alleles but doesn't update candidate
+    // counts; this pass accumulates the missing ref/alt/total coverage.
+    backfill_graph_candidate_counts(chunk, graph_only_cands);
+
+    // Phase B: inject graph-only reads and extend doubly-mapped profiles.
+    int reads_injected = 0;
+    int reads_extended = 0;
+    if (!chunk_rows.empty() && !site_map.empty()) {
+        reads_injected = inject_graph_reads(
+            chunk, chunk_rows, site_map, graph_only_cands, opts,
+            &reads_extended);
+    }
+
+    if (opts.verbose >= 1 && (added > 0 || reads_injected > 0 || reads_extended > 0)) {
+        std::fprintf(stderr,
+            "hybrid chunk %d: bridged=%d added=%d reads_injected=%d reads_extended=%d\n",
+            region.chunk_id, bridged, added, reads_injected, reads_extended);
+    }
+
+    // Steps 3.2-4: k-means + noisy-region MSA.
+    collect_var_run_phasing(chunk, opts);
+
+    mid_free_chunk(chunk, opts);
+    return chunk;
+}
+
+/// Parallel batch for hybrid pipeline.
+static ChunkBatchResult collect_hybrid_chunk_batch_parallel(
+        const Options& opts,
+        const std::vector<RegionChunk>& chunks,
+        size_t batch_begin,
+        size_t batch_end,
+        const std::string& graph_query_contig,
+        const std::unordered_map<std::string, std::string>& chrom_remap) {
+    const size_t batch_size = batch_end - batch_begin;
+    ChunkBatchResult result;
+    result.chunks.resize(batch_size);
+
+    const size_t worker_count = std::min<size_t>(
+        static_cast<size_t>(opts.threads), batch_size);
+    std::atomic<size_t> next_offset{0};
+    std::exception_ptr first_error;
+    std::mutex error_mutex;
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+
+    for (size_t worker_i = 0; worker_i < worker_count; ++worker_i) {
+        workers.emplace_back([&, worker_i]() {
+            (void)worker_i;
+            try {
+                WorkerContext context(opts);
+                SitesVcfHandle sites_handle(opts.graph_sites_vcf);
+                IndexedGafHandle gaf_handle(opts.gaf_file);
+
+                while (true) {
+                    const size_t offset = next_offset.fetch_add(1);
+                    if (offset >= batch_size) break;
+                    result.chunks[offset] = process_chunk_hybrid(
+                        chunks[batch_begin + offset], opts, context,
+                        sites_handle, gaf_handle,
+                        graph_query_contig, chrom_remap);
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!first_error) first_error = std::current_exception();
+            }
+        });
+    }
+    for (std::thread& w : workers) w.join();
+    if (first_error) std::rethrow_exception(first_error);
+    return result;
+}
+
+void run_collect_hybrid_variation(const Options& opts) {
+    if (opts.graph_sites_vcf.empty())
+        throw std::runtime_error("--graph-sites required for hybrid mode");
+    if (opts.gaf_file.empty())
+        throw std::runtime_error("--gaf required for hybrid mode");
+
+    std::unique_ptr<PgbamSidecarData> pgbam_sidecar;
+    if (!opts.pgbam_file.empty())
+        pgbam_sidecar = std::make_unique<PgbamSidecarData>(
+            load_pgbam_sidecar(opts.pgbam_file));
+
+    std::unique_ptr<faidx_t, FaiDeleter> fai(load_reference_index(opts.ref_fasta));
+
+    const std::vector<RegionChunk> chunks = load_region_chunks(opts);
+    SamFile bam(opts.primary_bam_file(), 1, opts.ref_fasta);
+    std::unique_ptr<bam_hdr_t, HeaderDeleter> header(sam_hdr_read(bam.get()));
+    if (!header) throw std::runtime_error("failed to read BAM header");
+    ReferenceCache ref(fai.get());
+
+    // Contig name resolution between BAM (e.g. "chr20") and pangenome paths
+    // (e.g. "GRCh38#0#chr20") is handled by suffix matching in the tabix
+    // query layers (append_graph_sites_tabix_filtered for VCF,
+    // tbx_seq_tid_with_pangenome_fallback for GAF).  The VCF parser also
+    // extracts ref_contig as the suffix after '#', so site coordinates use
+    // BAM-compatible contig names.  No explicit remap table is needed.
+    std::unordered_map<std::string, std::string> chrom_remap;
+
+    // Open output files (same as BAM pipeline).
+    std::ofstream variant_out(opts.output_tsv);
+    if (!variant_out)
+        throw std::runtime_error("failed to open output: " + opts.output_tsv);
+    write_variants_tsv_header(variant_out);
+
+    std::ofstream vcf_out;
+    if (!opts.output_vcf.empty()) {
+        vcf_out.open(opts.output_vcf);
+        if (!vcf_out)
+            throw std::runtime_error("failed to open VCF output: " + opts.output_vcf);
+        write_variants_vcf_header(vcf_out, opts, header.get());
+    }
+    std::ofstream phased_vcf_out;
+    if (!opts.output_phased_vcf.empty()) {
+        phased_vcf_out.open(opts.output_phased_vcf);
+        if (!phased_vcf_out)
+            throw std::runtime_error("failed to open phased VCF: " + opts.output_phased_vcf);
+        write_phased_variants_vcf_header(phased_vcf_out, opts, header.get());
+    }
+
+    std::unique_ptr<PhasedAlignmentWriter> phased_aln_writer;
+    if (!opts.output_aln.empty())
+        phased_aln_writer = std::make_unique<PhasedAlignmentWriter>(opts, header.get());
+
+    size_t n_variants = 0;
+    size_t n_out_aln_reads = 0;
+    size_t batch_begin = 0;
+    while (batch_begin < chunks.size()) {
+        size_t batch_end = batch_begin + 1;
+        while (batch_end < chunks.size() &&
+               chunks[batch_end].reg_chunk_i == chunks[batch_begin].reg_chunk_i) {
+            ++batch_end;
+        }
+
+        // Determine the graph query contig for this batch.
+        const std::string batch_contig =
+            header->target_name[chunks[batch_begin].tid];
+        // Suffix matching in the tabix query layers resolves BAM contig
+        // names (e.g. "chr20") against pangenome paths in the VCF/GAF index.
+        const std::string& graph_query_contig = batch_contig;
+
+        ChunkBatchResult batch = collect_hybrid_chunk_batch_parallel(
+            opts, chunks, batch_begin, batch_end,
+            graph_query_contig, chrom_remap);
+        stitch_chunk_haps(batch.chunks, &opts, pgbam_sidecar.get());
+        CandidateTable variants = merge_chunk_candidates(batch.chunks);
+        n_variants += variants.size();
+        write_variants_tsv_records(variant_out, header.get(), ref, variants);
+        if (!opts.output_vcf.empty())
+            write_variants_vcf_records(vcf_out, opts, header.get(), ref, variants);
+        if (!opts.output_phased_vcf.empty())
+            write_phased_variants_vcf_records(
+                phased_vcf_out, opts, header.get(), ref, variants);
+        if (phased_aln_writer)
+            n_out_aln_reads += static_cast<size_t>(
+                phased_aln_writer->write_chunks(batch.chunks));
+
+        batch_begin = batch_end;
+    }
+
+    std::cerr << "Hybrid: processed " << chunks.size() << " region chunks with "
+              << opts.threads << " worker thread(s)\n";
+    std::cerr << "Collected " << n_variants << " candidate variant sites into "
+              << opts.output_tsv << "\n";
+    if (!opts.output_vcf.empty())
+        std::cerr << "Wrote candidate VCF to " << opts.output_vcf << "\n";
+    if (!opts.output_phased_vcf.empty())
+        std::cerr << "Wrote phased candidate VCF to " << opts.output_phased_vcf << "\n";
+    if (!opts.output_aln.empty()) {
+        phased_aln_writer.reset();
+        std::cerr << "Output " << n_out_aln_reads << " reads to phased alignment\n";
+        if (opts.refine_aln)
+            coordinate_sort_refined_alignment_file_or_throw(opts);
+        if (opts.output_aln_format == OutputAlignmentFormat::Bam ||
+            opts.output_aln_format == OutputAlignmentFormat::Cram) {
+            if (sam_index_build(opts.output_aln.c_str(), 0) != 0)
+                throw std::runtime_error(
+                    "failed to index output alignment: " + opts.output_aln);
+        }
+    }
+}
+
 } // namespace pgphase_collect
 
 // ════════════════════════════════════════════════════════════════════════════

@@ -109,10 +109,28 @@ void populate_chunk_read_indexes(PhasingChunk& chunk);
 // noisy-region adjustments and AF→LowCov rewrites.
 void classify_chunk_candidates(PhasingChunk& chunk, const Options& opts, const bam_hdr_t* header);
 
-// Per-chunk candidate collection pipeline: collect sites from digars, count
-// alleles, pre-process noisy spans, classify candidates, post-process noisy
-// spans, and apply final containment filtering.
-//
+// Steps 1-2: candidate discovery + classification.  Collects sites from
+// digars, counts alleles, classifies candidates, and prunes NON_VAR.
+// After this call, chunk.candidates is sorted and classified but no
+// read profiles or k-means phasing has been done.
+void collect_var_classify(PhasingChunk& chunk,
+                          const Options& opts,
+                          const bam_hdr_t* header);
+
+// Step 3.1: build per-read variant profiles from digars.
+// Populates chunk.read_var_profile and chunk.read_var_cr.
+void collect_var_build_profiles(PhasingChunk& chunk, const Options& opts);
+
+// Steps 3.2-4: k-means phasing and noisy-region MSA recall.
+// Expects read profiles to be populated (by collect_var_build_profiles
+// and/or manual injection for hybrid reads).
+void collect_var_run_phasing(PhasingChunk& chunk, const Options& opts);
+
+// Steps 3-4 combined: build profiles + run phasing.
+void collect_var_phase(PhasingChunk& chunk,
+                       const Options& opts);
+
+// Full pipeline: collect_var_classify + collect_var_phase.
 // Expects chunk.reads, chunk.ref_seq, read indexes, low-complexity intervals,
 // and initial noisy regions to already be populated by the BAM/FASTA layer.
 void collect_var_main(PhasingChunk& chunk,

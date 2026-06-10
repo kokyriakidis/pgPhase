@@ -452,9 +452,28 @@ size_t scan_gaf_line_compact(std::string_view line,
 static int tbx_seq_tid_with_pangenome_fallback(tbx_t* tbx, const std::string& contig) {
     int tid = tbx_name2id(tbx, contig.c_str());
     if (tid >= 0) return tid;
+    // Try stripping pangenome prefix from query: "GRCh38#0#chr20" → "chr20".
     const size_t h = contig.rfind('#');
-    if (h == std::string::npos) return -1;
-    return tbx_name2id(tbx, contig.substr(h + 1).c_str());
+    if (h != std::string::npos) {
+        tid = tbx_name2id(tbx, contig.substr(h + 1).c_str());
+        if (tid >= 0) return tid;
+    }
+    // Reverse: query is a bare name like "chr20" but the index uses pangenome
+    // paths like "GRCh38#0#chr20".  Scan index sequences for a suffix match.
+    int n_seqs = 0;
+    const char** seqs = tbx_seqnames(tbx, &n_seqs);
+    if (seqs == nullptr) return -1;
+    int found = -1;
+    for (int i = 0; i < n_seqs; ++i) {
+        const std::string idx_name(seqs[i]);
+        const size_t ih = idx_name.rfind('#');
+        if (ih != std::string::npos && idx_name.substr(ih + 1) == contig) {
+            found = tbx_name2id(tbx, seqs[i]);
+            break;
+        }
+    }
+    free(seqs);
+    return found;
 }
 
 // --- IndexedGafHandle RAII implementation ---

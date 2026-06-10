@@ -64,6 +64,15 @@ std::vector<RegionChunk> load_region_chunks(const Options& opts);
  */
 void run_collect_bam_variation(const Options& opts);
 
+/**
+ * @brief Hybrid BAM+graph driver: BAM variant calling augmented with graph
+ *        snarl site observations before k-means phasing.
+ *
+ * Requires opts.graph_sites_vcf and opts.gaf_file (or gbz_db+gaf_db) in
+ * addition to the standard BAM pipeline inputs.
+ */
+void run_collect_hybrid_variation(const Options& opts);
+
 } // namespace pgphase_collect
 
 /**

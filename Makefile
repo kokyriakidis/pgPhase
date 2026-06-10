@@ -32,6 +32,8 @@ SOURCES_CXX = src/main.cpp \
 	src/collect_pipeline.cpp \
 	src/build_catalog.cpp \
 	src/graph_collect.cpp \
+	src/hybrid_collect.cpp \
+	src/hybrid_inject.cpp \
 	src/bam_digar.cpp \
 	src/noise_filter.cpp \
 	src/collect_var.cpp \

@@ -1974,9 +1974,9 @@ static bool active_region_contains(hts_pos_t active_reg_beg,
     return !(vcf_pos < active_reg_beg || vcf_pos > active_reg_end);
 }
 
-void collect_var_main(PhasingChunk& chunk,
-                      const Options& opts,
-                      const bam_hdr_t* header) {
+void collect_var_classify(PhasingChunk& chunk,
+                          const Options& opts,
+                          const bam_hdr_t* header) {
     // 1.1. collect X/I/D candidate sites from parsed read digars.
     collect_candidate_sites_from_records(
         chunk.region, chunk.reads, chunk.candidates, opts.min_sv_len);
@@ -2015,19 +2015,22 @@ void collect_var_main(PhasingChunk& chunk,
     prune_not_candidate_variants(chunk);
 
     dump_all_noisy_regions(chunk, opts, header);
-    // Early return only when no candidates and no noisy intervals; otherwise run
-    // noisy-region MSA (step 4) — `collect_noisy_vars_step4` — even with zero candidates.
+}
+
+void collect_var_build_profiles(PhasingChunk& chunk, const Options& opts) {
+    if (chunk.candidates.empty()) return;
+    collect_read_var_profile(opts, chunk);
+}
+
+void collect_var_run_phasing(PhasingChunk& chunk, const Options& opts) {
     if (chunk.candidates.empty() && chunk.noisy_regions.empty()) return;
 
     if (!chunk.candidates.empty()) {
-        // 3.1. collect clean-region read-wise variant profiles.
-        collect_read_var_profile(opts, chunk);
-
-        // 3.2. co-phasing using clean-region SNPs + indels + clean hom.
+        // co-phasing using clean-region SNPs + indels + clean hom.
         assign_hap_based_on_germline_het_vars_kmeans(chunk, opts, kCandGermlineClean);
     }
 
-    // 4. iteratively call variants in noisy regions via MSA and re-run k-means.
+    // iteratively call variants in noisy regions via MSA and re-run k-means.
     collect_noisy_vars_step4(chunk, opts);
 
     const hts_pos_t active_reg_beg = chunk.region.beg;
@@ -2036,6 +2039,19 @@ void collect_var_main(PhasingChunk& chunk,
         cand.lcd_make_variants_region_pass =
             active_region_contains(active_reg_beg, active_reg_end, cand.key);
     }
+}
+
+void collect_var_phase(PhasingChunk& chunk,
+                       const Options& opts) {
+    collect_var_build_profiles(chunk, opts);
+    collect_var_run_phasing(chunk, opts);
+}
+
+void collect_var_main(PhasingChunk& chunk,
+                      const Options& opts,
+                      const bam_hdr_t* header) {
+    collect_var_classify(chunk, opts, header);
+    collect_var_phase(chunk, opts);
 }
 
 } // namespace pgphase_collect
