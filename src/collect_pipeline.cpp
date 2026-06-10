@@ -738,12 +738,20 @@ static PhasingChunk process_chunk_hybrid(
     backfill_graph_candidate_counts(chunk, graph_only_cands);
 
     // Phase B: inject graph-only reads and extend doubly-mapped profiles.
+    const size_t n_bam_reads = chunk.reads.size();
     int reads_injected = 0;
     int reads_extended = 0;
     if (!chunk_rows.empty() && !site_map.empty()) {
         reads_injected = inject_graph_reads(
             chunk, chunk_rows, site_map, graph_only_cands, opts,
             &reads_extended);
+    }
+
+    // Append graph-only reads to ordered_read_ids so k-means Phase 2
+    // and update_read_phase_set visit them (they use ordered_read_ids).
+    if (reads_injected > 0 && !chunk.ordered_read_ids.empty()) {
+        for (size_t i = n_bam_reads; i < chunk.reads.size(); ++i)
+            chunk.ordered_read_ids.push_back(static_cast<int>(i));
     }
 
     if (opts.verbose >= 1 && (added > 0 || reads_injected > 0 || reads_extended > 0)) {
