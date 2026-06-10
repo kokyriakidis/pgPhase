@@ -201,6 +201,50 @@ phase blocks.
 
 ---
 
+## Merge Feasibility: BAM + Graph Phased BAMs
+
+Measured with `scripts/merge_feasibility.py` on chr20 data.
+
+### Read category breakdown
+
+| Category | Reads | % of total |
+|----------|-------|-----------|
+| A) Phased by both | 208,092 | 76.5% |
+| B) BAM-only phased | 12,285 | 4.5% |
+| C) Graph-only (rescue candidates) | 8,038 | 3.0% |
+| D) Neither phased | 43,601 | 16.0% |
+
+### Haplotype agreement (category A — doubly-phased reads)
+
+| Metric | Value |
+|--------|-------|
+| Doubly-phased reads | 208,092 |
+| Same HP label | 128,104 (61.6%) |
+| Different HP label | 79,988 (38.4%) |
+| Overlapping block pairs | 639 |
+| Concordant pairs (≥90% same, ≥2 reads) | 249 — 118,177 reads |
+| Flipped pairs (≥90% opposite, ≥2 reads) | 169 — 67,159 reads |
+| Discordant pairs (<90% majority) | 197 — 22,732 reads |
+
+### Rescue potential
+
+| Metric | Value |
+|--------|-------|
+| BAM phased reads | 220,377 (81.0%) |
+| After graph rescue (potential) | 228,415 (84.0%) |
+| Reads rescued | +8,038 (+3.0 pp) |
+| Remaining unphased | 43,601 (16.0%) |
+| Graph-only in BAM (unphased) | 8,038 |
+| Graph-only not in BAM at all | 0 |
+
+### Assessment
+
+**RISKY** — 197 / 615 block pairs (32%) are discordant (neither clearly same nor flipped orientation). A simple polarity-based merge would inject errors at those block boundaries. The 43,601 D-category reads (16%) are absent from both pipelines and represent the hard ceiling for any hybrid approach.
+
+The concordant+flipped pairs do cover the majority of doubly-phased reads (185,336 reads, 89%), suggesting that orientation *is* resolvable for most large blocks — the discordant pairs are likely small blocks with insufficient read overlap. A read-count-weighted merge may still be feasible.
+
+---
+
 ## VCF-Level Metrics (chr20, no whatshap/hiphase needed)
 
 Phase block stats extracted directly from phased VCFs; NC50 computed via `bedtools subtract`
