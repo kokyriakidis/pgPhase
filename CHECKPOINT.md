@@ -67,6 +67,11 @@ pgphase collect-graph-variation \
 | Overall accuracy | 92.77% |
 | Hamming error rate | 7.23% |
 | Switch error rate | 1.04% |
+| Switchflip error rate | 2.51% |
+| Switch errors | 2,251 |
+| Flip errors | 3,167 |
+| Switchflip errors | 5,418 |
+| Switch opportunities | 215,693 |
 | Perfect phase sets | 96 / 419 (22.9%) |
 | Phaseable PS (>60%) | 327 PS, 202,396 reads, 95.36% |
 | Unphaseable PS (≤60%) | 92 PS, 13,716 reads |
@@ -100,7 +105,12 @@ pgphase collect-bam-variation \
 | Largest block | 53.2 Mbp |
 | Overall accuracy | 97.02% |
 | Hamming error rate | 2.98% |
-| Switch error rate | 2.28% |
+| Switch error rate | 0.62% |
+| Switchflip error rate | 1.45% |
+| Switch errors | 1,356 |
+| Flip errors | 1,826 |
+| Switchflip errors | 3,182 |
+| Switch opportunities | 219,946 |
 | Perfect phase sets | 133 / 430 (30.9%) |
 | Phaseable PS (>60%) | 366 PS, 214,808 reads, 98.14% |
 | Unphaseable PS (≤60%) | 64 PS, 5,568 reads |
@@ -114,16 +124,23 @@ pgphase collect-bam-variation \
 | Phased reads | 98.0% | 93.4% | 81.0% |
 | Phase sets | 421 | 425 | 431 |
 | N50 | 912 Kbp | 898 Kbp | **937 Kbp** |
+| auN | — | 981 Kbp | **9,828 Kbp** |
 | Accuracy | 89.73% | 92.77% | **97.02%** |
-| Switch error | 6.14% | **1.04%** | 2.28% |
+| Hamming error rate | 10.27% | 7.23% | **2.98%** |
+| Switch error rate | 6.14% | 1.04% | **0.62%** |
+| Switchflip error rate | — | 2.51% | **1.45%** |
+| Switch errors | — | 2,251 | **1,356** |
+| Flip errors | — | 3,167 | **1,826** |
+| Switchflip errors | — | 5,418 | **3,182** |
+| Switch opportunities | — | 215,693 | 219,946 |
 | Perfect PS | 19.0% | 22.9% | **30.9%** |
 
 **Key observations:**
 - Noise filter improves graph accuracy +3 pp (89.7% → 92.8%) and cuts switch error 6× (6.14% → 1.04%)
 - Noise filter costs ~4.6% phased reads (noisy indels excluded from k-means)
-- BAM pipeline still leads on accuracy (97%) and perfect phase sets (30.9%)
-- Graph pipeline with noise filter has the lowest switch error rate of all three
-- Graph pipeline phases significantly more reads than BAM (93% vs 81%) even after filtering
+- BAM pipeline leads on all accuracy metrics: Hamming (2.98%), switch (0.62%), switchflip (1.45%)
+- BAM auN (9.8 Mbp) far exceeds graph (981 Kbp), driven by the large 53 Mbp block
+- Graph pipeline phases more reads (93% vs 81%), compensating for lower per-block accuracy
 
 ---
 
