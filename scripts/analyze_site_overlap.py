@@ -73,7 +73,7 @@ def parse_bam_vcf(path, contig_filter=None):
             if line.startswith("#"):
                 continue
             fields = line.rstrip("\n").split("\t")
-            chrom = fields[0]
+            chrom = normalize_chrom(fields[0])
             if contig_filter and chrom != contig_filter:
                 continue
             pos = int(fields[1])
@@ -109,7 +109,7 @@ def parse_bam_tsv(path, contig_filter=None):
         col = {name: i for i, name in enumerate(header)}
         for line in f:
             fields = line.rstrip("\n").split("\t")
-            chrom = fields[col["CHROM"]]
+            chrom = normalize_chrom(fields[col["CHROM"]])
             if contig_filter and chrom != contig_filter:
                 continue
             pos = int(fields[col["POS"]])
