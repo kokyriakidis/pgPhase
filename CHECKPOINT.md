@@ -338,3 +338,55 @@ reference-context checks are the only applicable noise filter.
 - **Use chr20-only truth refs:** Full-genome maternal/paternal assemblies cause a small fraction of reads to leak to chr1/6/16 during truth alignment. Use `HG002_1.1_MATERNAL.chr20.fasta` / `HG002_1.1_PATERNAL.chr20.fasta` for clean results.
 - **Per-chunk site loading:** Graph pipeline uses tabix-indexed per-chunk site queries (commit `5878aad`) — loading all 977K sites upfront was the prior bottleneck.
 - **Non-numeric node IDs:** `build_compact_graph_site_index` now skips sites with non-numeric node IDs instead of aborting (commit `5c01954`).
+
+---
+
+## BAM Pipeline Parity: `propagate_overlap_read_phase_to_output_owner`
+
+### Observation
+
+Side-by-side evaluation of pgphase BAM pipeline vs longcallD on the same input showed pgphase
+phasing ~1,300 more reads (220,377 vs 219,090) and producing 2 extra phase sets (431 vs 429).
+All other metrics (N50, auN, largest block, accuracy, switch/hamming error) were near-identical.
+
+### Root cause
+
+`propagate_overlap_read_phase_to_output_owner` (commit `f094cea`) is a pgphase-only addition
+in `stitch_chunk_haps`. After chunk-boundary stitching, it copies HP/PS from the downstream
+chunk to overlap reads that are unphased (hap=0) in the upstream (owning) chunk. LongcallD
+does not have this function.
+
+### Why longcallD omits it
+
+Overlap reads exist in both adjacent chunks as independent copies. Each chunk phases its copy
+using its own candidates and phasing context. The BAM writer emits each read from its owning
+(upstream) chunk. `apply_chunk_flip_and_merge` only rewrites the **downstream** chunk's PS
+values — it never touches the upstream chunk's reads.
+
+When `flip_chunk_hap` merges two chunks (flip_hap_score != 0), the downstream copy's PS is
+rewritten to `max_pre_ps` (the upstream PS) and hap labels are flipped if needed. In this case,
+propagation would be correct: the downstream copy's HP/PS is now consistent with the upstream
+chunk's phasing. The upstream copy just happens to be unphased because its variant profile in
+the owning chunk had no informative candidates.
+
+However, when `flip_hap_score == 0` (equal agree/disagree votes), the chunks are **not merged**
+and their relative phase is unknown. `propagate_overlap_read_phase_to_output_owner` does not
+distinguish between merged and unmerged pairs — it propagates unconditionally. This is
+incorrect for unmerged pairs:
+
+1. **Wrong haplotype.** The downstream hap=1 may correspond to the upstream hap=2. Propagating
+   without adjusting for the unknown relative phase can assign the read to the wrong haplotype.
+
+2. **Orphan phase sets.** The propagated PS value comes from the downstream chunk's unmerged
+   phase block. This PS doesn't correspond to any candidate in the upstream chunk, creating
+   phase sets that inflate the count without improving phasing.
+
+### Decision
+
+Remove the `propagate_overlap_read_phase_to_output_owner` call from `stitch_chunk_haps` to
+restore longcallD parity. The function body is retained under `#if 0` for reference.
+
+A future improvement could conditionally propagate only for successfully merged chunk pairs
+(where `flip_chunk_hap` returned true). In that case the downstream PS has been rewritten to
+match the upstream PS, so propagation is safe. This would recover the ~1,300 reads without
+the wrong-haplotype risk.

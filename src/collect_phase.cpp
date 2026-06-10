@@ -726,8 +726,11 @@ static bool flip_chunk_hap(PhasingChunk& pre, PhasingChunk& cur, const Options* 
     return true;
 }
 
-// The phased-alignment writer emits upstream-overlap reads from the previous chunk.
-// Copy only already-decided downstream HP/PS onto an unphased upstream owner.
+// Disabled: propagate_overlap_read_phase_to_output_owner.
+// See CHECKPOINT.md "BAM Pipeline Parity" for rationale.
+// Retained as dead code for reference; can be revived with proper
+// relative-phase adjustment if a future pipeline needs it.
+#if 0
 static void propagate_overlap_read_phase_to_output_owner(PhasingChunk& pre, const PhasingChunk& cur) {
     if (pre.region.tid != cur.region.tid) return;
     const size_t n_bams = std::min(pre.down_ovlp_read_i.size(), cur.up_ovlp_read_i.size());
@@ -757,6 +760,7 @@ static void propagate_overlap_read_phase_to_output_owner(PhasingChunk& pre, cons
         }
     }
 }
+#endif
 
 void stitch_chunk_haps(std::vector<PhasingChunk>& chunks,
                        const Options* opts,
@@ -792,9 +796,10 @@ void stitch_chunk_haps(std::vector<PhasingChunk>& chunks,
                                       opts->pgbam_relaxed_cleanup_min_winning_threads,
                                       opts->pgbam_relaxed_cleanup_polarity_margin);
     }
-    for (size_t ii = chunks.size(); ii > 1; --ii) {
-        propagate_overlap_read_phase_to_output_owner(chunks[ii - 2], chunks[ii - 1]);
-    }
+    // NOTE: propagate_overlap_read_phase_to_output_owner is intentionally
+    // not called here.  See CHECKPOINT.md "BAM Pipeline Parity" for rationale:
+    // propagating HP/PS across unmerged chunk boundaries can assign reads to
+    // the wrong haplotype when the relative phase is unknown.
 }
 
 } // namespace pgphase_collect
