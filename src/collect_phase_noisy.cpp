@@ -770,6 +770,7 @@ std::vector<int> collect_noisy_reg_reads(const PhasingChunk& chunk,
         if (ri < 0 || static_cast<size_t>(ri) >= chunk.reads.size()) return;
         const ReadRecord& r = chunk.reads[static_cast<size_t>(ri)];
         if (r.is_skipped) return;
+        if (r.digars.empty()) return;  // graph-only reads have no sequences
         if (r.beg > end || r.end <= beg) return;
         result.push_back(ri);
     };
