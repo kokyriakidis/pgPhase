@@ -26,13 +26,20 @@
 **Command:**
 ```
 pgphase collect-graph-variation \
+    --ref test_data/chm13v2.0.chr20.renamed.fa \
+    --sites test_data/chr20.sites.striped.vcf.gz \
     --gaf test_data/HG002.chr20.annotated.coord.gaf.gz \
-    --sites-vcf test_data/chr20.sites.striped.vcf.gz \
-    --out-bam test_data/chr20.phase_graph.bam \
+    --phased-bam-out test_data/chr20.phase_graph.bam \
+    -o test_data/phase_graph_smoke/reads.tsv \
+    --phased-vcf-out test_data/phase_graph_smoke/phased.vcf \
     -t 16
 ```
 
+> Note: `--sites-vcf` → `--sites`, `--out-bam` → `--phased-bam-out`, `--ref` now required (commit `e751d83`).
+
 **Eval dir:** `test_data/diplinator_eval_chr20/`
+
+### v1 — before noise filter
 
 | Metric | Value |
 |--------|-------|
@@ -47,6 +54,22 @@ pgphase collect-graph-variation \
 | Perfect phase sets | 78 / 411 (19.0%) |
 | Phaseable PS (>60%) | 308 PS, 207,571 reads, 93.00% |
 | Unphaseable PS (≤60%) | 103 PS, 19,232 reads |
+
+### v2 — with reference-based noise filter (commit `e751d83`)
+
+| Metric | Value |
+|--------|-------|
+| Total reads | 231,382 |
+| Phased reads | 216,130 (93.4%) |
+| Phase sets | 425 |
+| Phase block N50 | 898 Kbp |
+| Largest block | 2.1 Mbp |
+| Overall accuracy | 92.77% |
+| Hamming error rate | 7.23% |
+| Switch error rate | 1.04% |
+| Perfect phase sets | 96 / 419 (22.9%) |
+| Phaseable PS (>60%) | 327 PS, 202,396 reads, 95.36% |
+| Unphaseable PS (≤60%) | 92 PS, 13,716 reads |
 
 ---
 
@@ -86,20 +109,21 @@ pgphase collect-bam-variation \
 
 ## Head-to-Head Comparison
 
-| Metric | Graph (indexed GAF) | BAM (no sidecar) |
-|--------|--------------------|--------------------|
-| Phased reads | **98.0%** | 81.0% |
-| Phase sets | 421 | 431 |
-| N50 | 912 Kbp | **937 Kbp** |
-| Accuracy | 89.73% | **97.02%** |
-| Switch error | 6.14% | **2.28%** |
-| Perfect PS | 19.0% | **30.9%** |
+| Metric | Graph v1 (no filter) | Graph v2 (noise filter) | BAM (no sidecar) |
+|--------|---------------------|------------------------|-----------------|
+| Phased reads | 98.0% | 93.4% | 81.0% |
+| Phase sets | 421 | 425 | 431 |
+| N50 | 912 Kbp | 898 Kbp | **937 Kbp** |
+| Accuracy | 89.73% | 92.77% | **97.02%** |
+| Switch error | 6.14% | **1.04%** | 2.28% |
+| Perfect PS | 19.0% | 22.9% | **30.9%** |
 
 **Key observations:**
-- BAM pipeline has significantly better accuracy (97% vs 90%) and lower switch error rate
-- Graph pipeline phases more reads (98% vs 81%)
-- Both produce a similar number of phase sets and comparable N50
-- The graph pipeline's accuracy gap is the primary open question
+- Noise filter improves graph accuracy +3 pp (89.7% → 92.8%) and cuts switch error 6× (6.14% → 1.04%)
+- Noise filter costs ~4.6% phased reads (noisy indels excluded from k-means)
+- BAM pipeline still leads on accuracy (97%) and perfect phase sets (30.9%)
+- Graph pipeline with noise filter has the lowest switch error rate of all three
+- Graph pipeline phases significantly more reads than BAM (93% vs 81%) even after filtering
 
 ---
 
