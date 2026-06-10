@@ -144,6 +144,63 @@ pgphase collect-bam-variation \
 
 ---
 
+## Site Overlap Analysis: Graph Sites vs BAM Het Variants
+
+Measured with `scripts/analyze_site_overlap.py` on chr20 data.
+
+| Metric | Value |
+|--------|-------|
+| Graph sites (total positions) | ~977K |
+| BAM het variants | 83,013 |
+| Shared positions | 62,600 (75.5% of BAM het) |
+| Exact allele match | 56,590 (90.4% of shared) |
+| Position-only match (diff alleles) | 6,010 (9.6% of shared) |
+| BAM-only (no graph site) | 20,413 (24.5% of BAM het) |
+
+### Interpretation
+
+75.5% of BAM het sites have a graph snarl site at the same GRCh38 position, and 90.4% of
+those are exact allele matches. This means graph reads traversing those snarls carry the
+same allele information that the BAM pipeline uses for phasing — they just come from
+pangenome-aligned reads that may not map to GRCh38.
+
+The 24.5% BAM-only sites are likely private variants or rare alleles not represented in the
+pangenome reference panel. These sites can only be phased using BAM-mapped reads.
+
+### Hybrid bridging approach
+
+**Goal:** Combine BAM pipeline's variant calling (83k het sites, 97% accuracy) with graph
+pipeline's read mapping (98% reads aligned, including reads unmappable on GRCh38).
+
+**Approach:** Run BAM pipeline as primary caller. For the ~19% unphased reads, use their
+graph allele observations at the ~56k bridgeable sites to assign haplotypes and extend
+phase blocks.
+
+**Implementation phases:**
+
+1. **Read haplotype assignment** — For each GAF read not in the BAM phased output, find its
+   graph allele observations at bridgeable snarl sites. Look up the BAM haplotype consensus
+   at those sites. Assign the read to the most consistent haplotype.
+
+2. **Enhanced chunk stitching** — Use newly-phased reads as connectors between BAM phase
+   blocks. Two blocks that couldn't be stitched (no shared GRCh38-mapped reads) might now
+   be connected through pangenome-located reads that span both regions. The pangenome gives
+   read locality information that GRCh38 can't — two reads unmapped on GRCh38 might be
+   clearly co-located in the pangenome (traversing the same snarls in the same region).
+
+**Expected gains:**
+- Phase the missing ~19% of reads (currently unphased by BAM pipeline)
+- Improve N50 by connecting fragmented BAM phase blocks through pangenome-bridged reads
+- Maintain BAM pipeline's 97% accuracy (graph reads are assigned to existing haplotypes,
+  not used to re-phase)
+
+**Risks:**
+- Allele matching imprecision at the 9.6% position-only sites could inject noise
+- Reads unmapped on GRCh38 may have ambiguous pangenome positions (multi-mapping)
+- Phase set merging logic needs to handle cross-pipeline block boundaries
+
+---
+
 ## VCF-Level Metrics (chr20, no whatshap/hiphase needed)
 
 Phase block stats extracted directly from phased VCFs; NC50 computed via `bedtools subtract`
