@@ -127,6 +127,28 @@ pgphase collect-bam-variation \
 
 ---
 
+## VCF-Level Metrics (chr20, no whatshap/hiphase needed)
+
+Phase block stats extracted directly from phased VCFs; NC50 computed via `bedtools subtract`
+of `switch_positions.bed` from phase block spans.
+
+| Metric | Graph v2 (noise filter) | BAM (no sidecar) |
+|--------|------------------------|-----------------|
+| Het variants in VCF | 60,304 | 83,013 |
+| Phased het variants | 60,304 (100%) | 83,013 (100%) |
+| Phase blocks (VCF) | 427 | 431 |
+| VCF N50 | 426 Kbp | 416 Kbp |
+| NC50 (switch-corrected N50) | 167 Kbp | **214 Kbp** |
+| Corrected phase blocks | 5,660 | **3,688** |
+| Total corrected span | 50.6 Mbp | **55.2 Mbp** |
+
+**Notes:**
+- NC50 = N50 of phase blocks after subtracting switch-error positions (analogous to HiPhase paper NGC50 but at chr20 scale)
+- Graph calls fewer het variants (60K vs 83K) because the graph pipeline uses graph snarls as sites, not de-novo variant calling from alignments
+- BAM's lower corrected block count (3,688 vs 5,660) confirms fewer switch errors chopping up its blocks
+
+---
+
 ## Noise Filtering: BAM vs Graph Pipeline
 
 ### What we ported

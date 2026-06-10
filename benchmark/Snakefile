@@ -393,17 +393,18 @@ rule pgphase:
             {params.pgphase_bin} collect-graph-variation \
                 --ref {input.ref} \
                 --gaf {params.indexed_gaf} \
-                --sites-vcf {params.sites_vcf} \
+                --sites {params.sites_vcf} \
                 --phased-bam-out {output.bam} \
                 --phased-vcf-out {output.vcf} \
-                --threads {threads}
+                -t {threads}
         else
             {params.pgphase_bin} collect-bam-variation \
+                --hifi \
                 --ref {input.ref} \
                 --bam {input.bam} \
-                --phased-bam-out {output.bam} \
+                -b {output.bam} \
                 --phased-vcf-out {output.vcf} \
-                --threads {threads}
+                -t {threads}
         fi
         samtools index -@ {threads} {output.bam}
         """
