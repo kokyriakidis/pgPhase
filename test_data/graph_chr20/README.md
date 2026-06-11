@@ -3,7 +3,21 @@
 Small chr20 test case for `collect-graph-variation` using a 500 kb slice of
 the CHM13 chr20 locus (HG002 HiFi reads aligned to the HPRC pangenome).
 
-## Running the graph pipeline
+## Running the pipelines
+
+### BAM pipeline
+
+```bash
+./pgphase collect-bam-variation \
+  --ref test_data/graph_chr20/ref.fa.gz \
+  --bam test_data/graph_chr20/HG002_chr20_25M.bam \
+  --hifi \
+  -o output.tsv
+```
+
+Expected output: **1,108 candidate variant sites** from 2,048 reads (51 chunks).
+
+### Graph pipeline
 
 ```bash
 ./pgphase collect-graph-variation \
@@ -14,7 +28,19 @@ the CHM13 chr20 locus (HG002 HiFi reads aligned to the HPRC pangenome).
   -o output.tsv
 ```
 
-Expected output: **509 candidate variant sites** from 2,048 reads.
+Expected output: **509 candidate variant sites** from 2,048 reads (51 chunks).
+
+### Hybrid pipeline
+
+```bash
+./pgphase collect-hybrid-variation \
+  --ref   test_data/graph_chr20/ref.fa.gz \
+  --bam   test_data/graph_chr20/HG002_chr20_25M.bam \
+  --sites test_data/graph_chr20/chr20_25M.sites.vcf.gz \
+  --gaf   test_data/graph_chr20/HG002_chr20_25M.coord.gaf.gz \
+  --hifi \
+  -o output.tsv
+```
 
 ## Files
 
@@ -23,6 +49,8 @@ Expected output: **509 candidate variant sites** from 2,048 reads.
 | `ref.fa.gz` | 261 KB | bgzipped reference FASTA; chr20 N-padded to genome coords |
 | `ref.fa.gz.fai` | 23 B | FASTA index |
 | `ref.fa.gz.gzi` | 6.2 KB | bgzip index |
+| `HG002_chr20_25M.bam` | 12 MB | HiFi reads aligned to chr20 (contig = `chr20`, LN=25,500,000) |
+| `HG002_chr20_25M.bam.bai` | — | BAM index |
 | `chr20_25M.sites.vcf.gz` | 213 KB | Graph snarl sites VCF (tabix-indexed) |
 | `chr20_25M.sites.vcf.gz.tbi` | 488 B | Tabix index |
 | `HG002_chr20_25M.coord.gaf.gz` | 5.6 MB | Coordinate-sorted GAF, HG002 HiFi (tabix-indexed) |
@@ -45,6 +73,15 @@ The format has reference contig/start/end in columns 1–3.
 ## Regenerating
 
 ```bash
+# BAM (subset from full chr20 BAM, rename contig, fix header length)
+(samtools view -H full_chr20.bam \
+     | awk '!/^@SQ/ || /SN:CHM13#0#chr20/' \
+     | sed 's/CHM13#0#chr20/chr20/g; s/LN:66210255/LN:25500000/g'
+ samtools view full_chr20.bam "CHM13#0#chr20:25000001-25500000" \
+     | sed 's/\tCHM13#0#chr20\t/\tchr20\t/g') \
+    | samtools sort -O bam -o HG002_chr20_25M.bam
+samtools index HG002_chr20_25M.bam
+
 # Reference
 samtools faidx ref_full.fa "CHM13#0#chr20:25000001-25500000" \
     | grep -v "^>" | tr -d '\n' > seq.txt
