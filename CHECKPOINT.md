@@ -383,10 +383,12 @@ incorrect for unmerged pairs:
 
 ### Decision
 
-Remove the `propagate_overlap_read_phase_to_output_owner` call from `stitch_chunk_haps` to
-restore longcallD parity. The function body is retained under `#if 0` for reference.
+Conditional propagation: `stitch_chunk_haps` now tracks which adjacent pairs were successfully
+merged by `flip_chunk_hap` (via a `pair_stitched` vector) and only calls
+`propagate_overlap_read_phase_to_output_owner` for those pairs. For merged pairs the downstream
+PS has been rewritten to `max_pre_ps` and hap labels flipped if needed, so propagation is safe.
+Unmerged pairs (flip_hap_score == 0) are skipped — no propagation, no wrong-haplotype risk.
 
-A future improvement could conditionally propagate only for successfully merged chunk pairs
-(where `flip_chunk_hap` returned true). In that case the downstream PS has been rewritten to
-match the upstream PS, so propagation is safe. This would recover the ~1,300 reads without
-the wrong-haplotype risk.
+This recovers the ~1,300 overlap reads that longcallD leaves unphased at chunk boundaries,
+without introducing orphan phase sets or haplotype errors. Expected effect vs longcallD:
+slightly more phased reads, same phase set count, same or better accuracy.
