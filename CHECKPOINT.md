@@ -888,29 +888,35 @@ binary after all fixes above.
 | Metric | BAM | Graph | Hybrid |
 |---|---|---|---|
 | Input reads | 272,016 | 231,382 | 272,016 |
-| Phased reads | 219,925 (80.9%) | 216,130 (93.4%) | **223,065 (82.0%)** |
-| Phase sets | 429 | 425 | **389** |
-| Phase block N50 | 937,648 bp | 898,076 bp | **974,740 bp** |
-| Phase block auN | 9,834,195 bp | 981,035 bp | **13,568,441 bp** |
-| Largest block | 53,165,843 bp | 2,141,283 bp | **62,704,189 bp** |
-| **Overall accuracy** | **97.03%** | 92.77% | 95.59% |
-| Hamming error rate | 2.97% | 7.23% | 4.41% |
-| Switch error rate | 0.61% | 1.04% | 0.78% |
-| Phaseable accuracy | 98.15% | 95.36% | 96.97% |
-| Unphaseable accuracy | 53.63% | 54.48% | 54.61% |
+| Phased reads | 219,925 (80.9%) | 216,130 (93.4%) | **220,952 (81.2%)** |
+| Phase sets | 429 | 425 | **408** |
+| Phase block N50 | 937,648 bp | 898,076 bp | **954,036 bp** |
+| Phase block auN | 9,834,195 bp | 981,035 bp | **12,086,393 bp** |
+| Largest block | 53,165,843 bp | 2,141,283 bp | **59,316,535 bp** |
+| **Overall accuracy** | 97.03% | 92.77% | **97.07%** |
+| Hamming error rate | 2.97% | 7.23% | **2.93%** |
+| Switch error rate | 0.61% | 1.04% | 0.63% |
+| Flip error rate | 0.83% | 1.47% | 0.86% |
+| Switchflip error rate | 1.43% | 2.51% | 1.49% |
+| Switch errors | 1,337 | 2,251 | 1,396 |
+| Flip errors | 1,812 | 3,167 | 1,896 |
+| Switchflip errors | 3,149 | 5,418 | 3,292 |
+| Switch opportunities | 219,496 | 215,693 | 220,530 |
+| Phaseable accuracy | 98.15% | 95.36% | **98.11%** |
+| Unphaseable accuracy | 53.63% | 54.48% | 53.75% |
+| Perfect phase sets | 136 / 429 (31.7%) | 96 / 419 (22.9%) | 99 / 401 (24.7%) |
 
 ### Observations
 
-- **Hybrid contiguity exceeds BAM significantly**: auN +38% (13.6M vs 9.8M), largest
-  block +18% (62.7M vs 53.2M), 40 fewer phase sets. The graph injection is aggressively
-  stitching BAM blocks.
-- **Hybrid phases more reads**: 223,065 (82.0%) vs 219,925 (80.9%) for BAM — +3,140 reads.
-- **Accuracy trade-off**: hybrid accuracy 95.59% vs BAM 97.03% (-1.44 pp), switch error
-  0.78% vs 0.61%. The aggressive stitching merges some blocks that should stay split.
-  This trade-off is resolved by the graph het-indel AF gate documented below.
+- **Hybrid accuracy matches BAM**: 97.07% vs 97.03% — the AF gate on graph het-indels
+  eliminates the accuracy regression while retaining the contiguity gains.
+- **Hybrid contiguity exceeds BAM**: auN +23% (12.1M vs 9.8M), largest block +12%
+  (59.3M vs 53.2M), 21 fewer phase sets.
+- **Hybrid phases more reads**: 220,952 (81.2%) vs 219,925 (80.9%) for BAM — +1,027 reads.
+- **Switch/flip rates near-identical to BAM**: switch 0.63% vs 0.61%, flip 0.86% vs 0.83%.
 - **Graph**: highest read phasing rate (93.4%) but substantially lower accuracy (92.77%)
-  and fragmented blocks (auN 981k). The graph pipeline sees fewer input reads (231k vs 272k)
-  because the GAF covers only pangenome-aligned reads.
+  and fragmented blocks (auN 981k). Sees fewer input reads (231k vs 272k) because the
+  GAF covers only pangenome-aligned reads.
 
 ---
 
