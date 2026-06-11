@@ -464,20 +464,17 @@ void apply_hybrid_noise_filter(
     for (int ci : graph_only_candidates) {
         if (ci < 0 || static_cast<size_t>(ci) >= chunk.candidates.size()) continue;
         CandidateVariant& cand = chunk.candidates[static_cast<size_t>(ci)];
-        // Het SNPs and het indels are the only categories that enter k-means;
-        // both must be screened for reference-based noise.
-        if (cand.counts.category != VariantCategory::CleanHetIndel &&
-            cand.counts.category != VariantCategory::CleanHetSnp) continue;
+        if (cand.counts.category != VariantCategory::CleanHetIndel) continue;
 
         // Build VCF-style ref/alt from VariantKey.
         const VariantKey& k = cand.key;
         std::string vcf_ref, vcf_alt;
         if (k.type == VariantType::Snp) {
-            // SNP: single ref base at pos, single alt base. For SNPs is_noisy_site
-            // only consults the low-complexity (SDUST) intervals.
-            if (k.pos < ref_beg || k.pos > ref_end) continue;
-            vcf_ref = std::string(1, ref_seq[static_cast<size_t>(k.pos - ref_beg)]);
-            vcf_alt = k.alt;
+            // SNPs in low-complexity regions are NOT demoted: both the BAM
+            // pipeline (recalls them as NOISY_CAND_HET via noisy-region MSA)
+            // and the standalone graph pipeline (CLEAN_HET_SNP) keep these as
+            // real het calls, so the hybrid pipeline must keep them too.
+            continue;
         } else if (k.type == VariantType::Insertion) {
             // Anchor base at pos-1.
             const hts_pos_t anchor = k.pos - 1;
@@ -499,18 +496,9 @@ void apply_hybrid_noise_filter(
 
         if (is_noisy_site(k.pos, vcf_ref, vcf_alt, ref_seq, ref_beg, ref_end,
                           lc, max_xgaps)) {
-            if (k.type == VariantType::Snp) {
-                // Noisy SNP (low-complexity region): demote to non-variant so it
-                // drops out of the germline-clean k-means mask, mirroring how the
-                // BAM pipeline removes density-noisy SNPs.
-                cand.counts.category = VariantCategory::NonVariant;
-                cand.counts.candvarcate_initial = VariantCategory::NonVariant;
-                cand.lcd_var_i_to_cate = kLongcalldNonVar;
-            } else {
-                cand.counts.category = VariantCategory::RepeatHetIndel;
-                cand.counts.candvarcate_initial = VariantCategory::RepeatHetIndel;
-                cand.lcd_var_i_to_cate = kLongcalldRepHetVar;
-            }
+            cand.counts.category = VariantCategory::RepeatHetIndel;
+            cand.counts.candvarcate_initial = VariantCategory::RepeatHetIndel;
+            cand.lcd_var_i_to_cate = kLongcalldRepHetVar;
         }
     }
 }
@@ -569,9 +557,14 @@ int classify_graph_only_candidates(
         // assigns the matching bitmask.  Only CleanHet{Snp,Indel} land in the
         // het k-means mask, so LowCoverage/LowAlleleFraction/RepeatHetIndel
         // sites are kept out of het phasing (CleanHom follows BAM behavior).
-        const VariantCategory cat = classify_variant_initial(
+        VariantCategory cat = classify_variant_initial(
             cand.key, cand.counts, chunk.ref_seq, chunk.ref_beg,
             chunk.ref_end, opts);
+        // Fold LowAlleleFraction into LowCoverage so it is pruned from output,
+        // matching the BAM pipeline's classify_chunk_candidates pass 2 (which
+        // rewrites LOW_AF to LOW_COV before prune_not_candidate_variants).
+        if (cat == VariantCategory::LowAlleleFraction)
+            cat = VariantCategory::LowCoverage;
         cand.counts.category = cat;
         cand.counts.candvarcate_initial = cat;
         cand.lcd_var_i_to_cate = category_to_flag(cat);

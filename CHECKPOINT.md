@@ -560,45 +560,81 @@ third-party `-Wunused-function` warning is unrelated).
 
 ---
 
-## Hybrid Model — graph SNP low-complexity gap
+## Hybrid Model — graph SNP low-complexity "gap" (REVERTED — was a bug)
 
-The hybrid noise filter `apply_hybrid_noise_filter` previously skipped SNPs
-entirely (`if (k.type == Snp) continue;`), so a graph-only SNP that fell inside
-an SDUST low-complexity interval could enter het k-means as a clean anchor.
+An earlier change made `apply_hybrid_noise_filter` demote graph-only het SNPs in
+SDUST low-complexity regions to `NonVariant`, on the premise that "this is what
+the BAM pipeline does to density-noisy SNPs." **That premise was wrong, and the
+change has been reverted.**
 
-### Why this differs from the standalone graph pipeline
+### Why it was wrong
 
-`apply_graph_noise_filter` (standalone graph pipeline) deliberately leaves SNPs
-alone — see "SNPs in low-complexity regions" above. That conservatism is correct
-for the graph pipeline, where graph sites are the *only* evidence and the BAM
-pipeline's indirect read-level mechanism that would demote such a SNP does not
-exist.
+Direct measurement on chr20 25M at the 10 demoted positions showed both source
+pipelines *keep* these as real het calls:
 
-The hybrid filter only acts on **graph-only** candidates — sites the BAM caller
-missed. These have no BAM read-level support, so a graph-only het SNP sitting in
-a low-complexity region is exactly the case the BAM pipeline would demote to
-`NonVariant` (via widened noisy spans + `apply_noisy_containment_filter`). Here
-the demotion is applied directly because the read-level machinery is unavailable
-in the GAF input. This closes the gap without affecting the BAM or standalone
-graph pipelines.
+- **BAM pipeline**: recalls them as `NOISY_CAND_HET` via noisy-region MSA (step 4)
+  — AF 0.40–0.60, depth 46–78. The BAM pipeline does **not** discard them.
+- **Standalone graph pipeline**: emits them as `CLEAN_HET_SNP` and phases them.
 
-### Change
+So the demotion dropped 10 genuine het SNPs that both pipelines call. The
+`NOISY_CAND_HET` recall happens during phasing (after the bridge step), so these
+sites are not in the BAM candidate table at graph-injection time and therefore
+appear as graph-only — but they are still real variants, not noise.
 
-- `apply_hybrid_noise_filter` now also screens `CleanHetSnp` graph-only
-  candidates. For a SNP it builds the single-base ref/alt (for SNPs
-  `is_noisy_site` only consults the low-complexity intervals) and, if noisy,
-  demotes to `NonVariant` (`lcd_var_i_to_cate = kLongcalldNonVar`), dropping it
-  from the `kCandGermlineClean` k-means mask. Indels keep their existing
-  `RepeatHetIndel` demotion.
+### Resolution
+
+`apply_hybrid_noise_filter` again leaves SNPs untouched (matching the standalone
+graph pipeline's `apply_graph_noise_filter`); only indels are screened for
+homopolymer / repeat / low-complexity noise.
+
+---
+
+## Hybrid Model — candidate-leak bug (graph-only non-calls not pruned)
+
+While verifying the SNP revert, hybrid emitted **7141** candidates on chr20 25M
+versus 1108 (BAM) and 509 (graph).
+
+### Root cause
+
+The BAM pipeline drops non-call candidates (`LowCoverage` / `NonVariant` /
+`StrandBias`) via `prune_not_candidate_variants` at the end of
+`collect_var_classify`, and folds `LowAlleleFraction` → `LowCoverage` in
+classification pass 2 so those are pruned too. The hybrid pipeline appends
+graph-only candidates *after* `collect_var_classify` has already run, and
+`classify_graph_only_candidates` only runs pass-1 (`classify_variant_initial`).
+So graph-only sites that failed the gate kept `LOW_COV` / `LOW_AF` / `NON_VAR`
+categories and flowed straight to output — `merge_chunk_candidates` does not
+filter by category. The standalone graph pipeline avoids this because its output
+builder (`graph_chunks_to_candidate_table`) only emits clean/noisy categories.
+
+The 7141 breakdown: 1234 real calls + 5875 `LOW_COV` + 32 `LOW_AF` + 11
+`NON_VAR`.
+
+### Fix
+
+- `classify_graph_only_candidates` folds `LowAlleleFraction` → `LowCoverage`,
+  matching the BAM pipeline's pass-2 rewrite.
+- `process_chunk_hybrid` calls `prune_not_candidate_variants(chunk)` after
+  k-means phasing. Pruning after phasing is safe: per-candidate read profiles
+  (`read_var_profile`, `read_var_cr`) are consumed entirely during phasing and
+  not used afterward; stitching, merge, and TSV/VCF/phased-BAM output use
+  read-level state, not candidate indices. No post-phasing step (k-means or
+  step-4 MSA) ever assigns a prunable category, so pruning after rather than
+  before phasing removes exactly the same candidates the BAM ordering would.
+- Exposed `prune_not_candidate_variants` (was file-static).
 
 ### chr20 25M result
 
-- 11 graph-only SNPs in low-complexity regions reclassified
-  `CLEAN_HET_SNP` → `NON_VAR`, removing them from het k-means. Remaining diff
-  lines are ±1 per-read depth shifts at nearby indels (category unchanged), a
-  downstream consequence of the smaller k-means input.
-- BAM-only (1108) and graph-only (509) outputs unchanged — change is confined to
-  the hybrid graph-only path. `make unit-tests` all green.
+- Hybrid: **7141 → 1234**. Categories are now only real calls
+  (CLEAN_HOM / CLEAN_HET_SNP / NOISY_CAND_HET / REP_HET_INDEL / NOISY_CAND_HOM /
+  CLEAN_HET_INDEL); no LOW_COV / LOW_AF / NON_VAR leak.
+- BAM-only (1108) and graph-only (509) outputs byte-identical (MD5 verified).
+- BAM↔hybrid site parity: of 1108 BAM sites, only 2 differ — both DEL
+  allele-encoding differences (`AA>.` vs `AA>A`, same position, both homozygous),
+  not real losses.
+- Phased VCF / candidate VCF / phased BAM (HP+PS tags) all emit correctly.
+- `make unit-tests` all green; added a `prune_not_candidate_variants` test and
+  updated the noise-filter test to assert SNPs are kept.
 
 ---
 

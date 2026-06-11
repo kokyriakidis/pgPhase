@@ -122,6 +122,13 @@ VariantCategory classify_variant_initial(const VariantKey& key,
                                          hts_pos_t ref_end,
                                          const Options& opts);
 
+// Drop candidates whose category is not a real call (NonVariant,
+// LowCoverage, StrandBias).  The BAM pipeline calls this at the end of
+// collect_var_classify; exposed so the hybrid pipeline can re-prune after
+// appending and gating graph-only candidates (which happens after
+// collect_var_classify has already run).
+void prune_not_candidate_variants(PhasingChunk& chunk);
+
 // Steps 1-2: candidate discovery + classification.  Collects sites from
 // digars, counts alleles, classifies candidates, and prunes NON_VAR.
 // After this call, chunk.candidates is sorted and classified but no

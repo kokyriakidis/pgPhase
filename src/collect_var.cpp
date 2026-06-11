@@ -1047,7 +1047,7 @@ static bool is_not_candidate_category(VariantCategory c) {
            c == VariantCategory::StrandBias;
 }
 
-static void prune_not_candidate_variants(PhasingChunk& chunk) {
+void prune_not_candidate_variants(PhasingChunk& chunk) {
     CandidateTable kept;
     kept.reserve(chunk.candidates.size());
     for (CandidateVariant& cv : chunk.candidates) {

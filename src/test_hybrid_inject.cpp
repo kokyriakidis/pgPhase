@@ -4,6 +4,7 @@
 #include "hybrid_inject.hpp"
 
 #include "collect_phase.hpp"
+#include "collect_var.hpp"
 #include "phasing_types.hpp"
 
 #include <iostream>
@@ -54,7 +55,9 @@ int main() {
     // 2: low total depth — 2 ref / 1 alt  (depth 3)  -> LowCoverage
     // 3: low alt depth   — 9 ref / 1 alt  (alt 1)    -> LowCoverage
     // 4: low AF          — 9 ref / 1 alt? use depth ok but AF<0.20:
-    //                       17 ref / 3 alt (AF 0.15) -> LowAlleleFraction
+    //                       17 ref / 3 alt (AF 0.15) -> LowCoverage
+    //                       (LowAlleleFraction is folded to LowCoverage so it
+    //                        is pruned from output, matching the BAM pipeline)
     chunk.candidates.push_back(make_graph_snp(10, 5, 5));
     chunk.candidates.push_back(make_graph_snp(20, 0, 10));
     chunk.candidates.push_back(make_graph_snp(30, 2, 1));
@@ -87,8 +90,8 @@ int main() {
     ok &= check((chunk.candidates[3].lcd_var_i_to_cate & kCandCleanHetSnp) == 0,
                 "low alt depth excluded from het mask");
 
-    ok &= check(chunk.candidates[4].counts.category == VariantCategory::LowAlleleFraction,
-                "low AF classified LowAlleleFraction");
+    ok &= check(chunk.candidates[4].counts.category == VariantCategory::LowCoverage,
+                "low AF folded to LowCoverage (so it is pruned from output)");
     ok &= check((chunk.candidates[4].lcd_var_i_to_cate & kCandCleanHetSnp) == 0,
                 "low AF excluded from het mask");
 
@@ -97,10 +100,13 @@ int main() {
     ok &= check(classify_graph_only_candidates(chunk, empty_set, opts) == 0,
                 "empty candidate set promotes nothing");
 
-    // ── apply_hybrid_noise_filter: low-complexity screening ──────────────────
+    // ── apply_hybrid_noise_filter: indel low-complexity screening ────────────
     // Reference with a 40 bp homopolymer A-run (1-based 121..160) flanked by
-    // mixed sequence.  SDUST flags the run and a few short repeats; positions
-    // 20/40/60/180/200/220 are NOT low-complexity, positions ~130/150 ARE.
+    // mixed sequence.  SDUST flags the run; positions ~150 ARE low-complexity.
+    // SNPs are intentionally NOT demoted: both the BAM pipeline (NOISY_CAND_HET
+    // recall) and the standalone graph pipeline (CLEAN_HET_SNP) keep low-
+    // complexity het SNPs as real calls, so the hybrid pipeline must too.  Only
+    // indels are screened (homopolymer / repeat / low-complexity).
     const std::string mixed =
         "ACGTTGCAGATCCTGAGTACGTCAGTTGACCATGGATCAGTACTGGCATGACTTAGCATGC"
         "TGACAGTCATGCATGACTGCATGCTAGCATCGATCGATTGCATGCATGCTAGCTGATCAGT";
@@ -109,18 +115,12 @@ int main() {
     nchunk.ref_end = static_cast<hts_pos_t>(mixed.size() * 2 + 40);
     nchunk.ref_seq = mixed + std::string(40, 'A') + mixed;
 
-    // 0: het SNP in low-complexity run (pos 130)  -> demoted to NonVariant
-    // 1: het SNP in mixed region    (pos 40)      -> untouched (CleanHetSnp)
-    // 2: het indel in low-complexity run (pos 150)-> RepeatHetIndel
-    CandidateVariant snp_noisy = make_graph_snp(130, 5, 5);
-    snp_noisy.counts.category = VariantCategory::CleanHetSnp;
-    snp_noisy.counts.candvarcate_initial = VariantCategory::CleanHetSnp;
-    snp_noisy.lcd_var_i_to_cate = kCandCleanHetSnp;
-
-    CandidateVariant snp_clean = make_graph_snp(40, 5, 5);
-    snp_clean.counts.category = VariantCategory::CleanHetSnp;
-    snp_clean.counts.candvarcate_initial = VariantCategory::CleanHetSnp;
-    snp_clean.lcd_var_i_to_cate = kCandCleanHetSnp;
+    // 0: het SNP in low-complexity run (pos 130)  -> kept (SNPs not demoted)
+    // 1: het indel in low-complexity run (pos 150)-> demoted to RepeatHetIndel
+    CandidateVariant snp_in_lc = make_graph_snp(130, 5, 5);
+    snp_in_lc.counts.category = VariantCategory::CleanHetSnp;
+    snp_in_lc.counts.candvarcate_initial = VariantCategory::CleanHetSnp;
+    snp_in_lc.lcd_var_i_to_cate = kCandCleanHetSnp;
 
     CandidateVariant ins_noisy = make_graph_snp(150, 5, 5);
     ins_noisy.key.type = VariantType::Insertion;
@@ -130,46 +130,54 @@ int main() {
     ins_noisy.counts.candvarcate_initial = VariantCategory::CleanHetIndel;
     ins_noisy.lcd_var_i_to_cate = kCandCleanHetIndel;
 
-    nchunk.candidates.push_back(snp_noisy);
-    nchunk.candidates.push_back(snp_clean);
+    nchunk.candidates.push_back(snp_in_lc);
     nchunk.candidates.push_back(ins_noisy);
 
-    std::unordered_set<int> noise_set = {0, 1, 2};
+    std::unordered_set<int> noise_set = {0, 1};
     apply_hybrid_noise_filter(nchunk, nchunk.ref_seq, nchunk.ref_beg,
                               nchunk.ref_end, noise_set, opts.noisy_reg_max_xgaps);
 
-    ok &= check(nchunk.candidates[0].counts.category == VariantCategory::NonVariant,
-                "noisy SNP demoted to NonVariant");
-    ok &= check(nchunk.candidates[0].lcd_var_i_to_cate == kLongcalldNonVar,
-                "noisy SNP gets NonVar flag (dropped from germline-clean mask)");
-    ok &= check((nchunk.candidates[0].lcd_var_i_to_cate & kCandCleanHetSnp) == 0,
-                "noisy SNP excluded from het SNP mask");
+    ok &= check(nchunk.candidates[0].counts.category == VariantCategory::CleanHetSnp,
+                "het SNP in low-complexity kept (not demoted)");
+    ok &= check(nchunk.candidates[0].lcd_var_i_to_cate == kCandCleanHetSnp,
+                "het SNP in low-complexity keeps CleanHetSnp flag");
 
-    ok &= check(nchunk.candidates[1].counts.category == VariantCategory::CleanHetSnp,
-                "clean SNP in mixed region untouched");
-    ok &= check(nchunk.candidates[1].lcd_var_i_to_cate == kCandCleanHetSnp,
-                "clean SNP keeps CleanHetSnp flag");
-
-    ok &= check(nchunk.candidates[2].counts.category == VariantCategory::RepeatHetIndel,
+    ok &= check(nchunk.candidates[1].counts.category == VariantCategory::RepeatHetIndel,
                 "noisy indel demoted to RepeatHetIndel");
-    ok &= check(nchunk.candidates[2].lcd_var_i_to_cate == kLongcalldRepHetVar,
+    ok &= check(nchunk.candidates[1].lcd_var_i_to_cate == kLongcalldRepHetVar,
                 "noisy indel gets RepHetVar flag");
 
-    // Candidates outside the graph-only set are never touched.
-    PhasingChunk gchunk;
-    gchunk.ref_beg = 1;
-    gchunk.ref_end = static_cast<hts_pos_t>(nchunk.ref_seq.size());
-    gchunk.ref_seq = nchunk.ref_seq;
-    CandidateVariant snp_excluded = make_graph_snp(130, 5, 5);
-    snp_excluded.counts.category = VariantCategory::CleanHetSnp;
-    snp_excluded.counts.candvarcate_initial = VariantCategory::CleanHetSnp;
-    snp_excluded.lcd_var_i_to_cate = kCandCleanHetSnp;
-    gchunk.candidates.push_back(snp_excluded);
-    std::unordered_set<int> none_set;  // index 0 NOT in the graph-only set
-    apply_hybrid_noise_filter(gchunk, gchunk.ref_seq, gchunk.ref_beg,
-                              gchunk.ref_end, none_set, opts.noisy_reg_max_xgaps);
-    ok &= check(gchunk.candidates[0].counts.category == VariantCategory::CleanHetSnp,
-                "non-graph-only SNP in low-complexity left untouched");
+    // ── prune_not_candidate_variants: drop non-call categories ───────────────
+    // Mirrors the BAM pipeline's end-of-classification prune.  The hybrid
+    // pipeline re-runs this after appending graph-only candidates so failed
+    // gates (LowCoverage / NonVariant / StrandBias) do not leak into output.
+    PhasingChunk pchunk;
+    CandidateVariant keep_snp = make_graph_snp(10, 5, 5);
+    keep_snp.counts.category = VariantCategory::CleanHetSnp;
+    CandidateVariant drop_lowcov = make_graph_snp(20, 1, 1);
+    drop_lowcov.counts.category = VariantCategory::LowCoverage;
+    CandidateVariant drop_nonvar = make_graph_snp(30, 5, 5);
+    drop_nonvar.counts.category = VariantCategory::NonVariant;
+    CandidateVariant keep_hom = make_graph_snp(40, 0, 10);
+    keep_hom.counts.category = VariantCategory::CleanHom;
+    pchunk.candidates.push_back(keep_snp);
+    pchunk.candidates.push_back(drop_lowcov);
+    pchunk.candidates.push_back(drop_nonvar);
+    pchunk.candidates.push_back(keep_hom);
+
+    prune_not_candidate_variants(pchunk);
+
+    ok &= check(pchunk.candidates.size() == 2,
+                "prune keeps only the two real-call candidates");
+    bool has_lowcov_or_nonvar = false;
+    for (const CandidateVariant& c : pchunk.candidates) {
+        if (c.counts.category == VariantCategory::LowCoverage ||
+            c.counts.category == VariantCategory::NonVariant ||
+            c.counts.category == VariantCategory::StrandBias)
+            has_lowcov_or_nonvar = true;
+    }
+    ok &= check(!has_lowcov_or_nonvar,
+                "prune removes LowCoverage / NonVariant / StrandBias");
 
     if (ok) {
         std::cout << "ALL PASS\n";

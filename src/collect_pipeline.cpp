@@ -774,6 +774,15 @@ static PhasingChunk process_chunk_hybrid(
     // Steps 3.2-4: k-means + noisy-region MSA.
     collect_var_run_phasing(chunk, opts);
 
+    // Drop graph-only candidates that failed the gate (LowCoverage /
+    // LowAlleleFraction-folded / NonVariant / StrandBias).  The BAM pipeline
+    // prunes these inside collect_var_classify, but graph-only sites are
+    // appended afterwards, so without this re-prune they would leak into
+    // output.  k-means already ran, so removing them here does not affect
+    // phasing; stitching and output use read-level state, not candidate
+    // indices.  BAM candidates are already real calls and so are unaffected.
+    prune_not_candidate_variants(chunk);
+
     mid_free_chunk(chunk, opts);
     return chunk;
 }
