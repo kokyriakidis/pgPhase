@@ -34,13 +34,15 @@ Expected output: **509 candidate variant sites** from 2,048 reads (51 chunks).
 
 ```bash
 ./pgphase collect-hybrid-variation \
-  --ref   test_data/graph_chr20/ref.fa.gz \
-  --bam   test_data/graph_chr20/HG002_chr20_25M.bam \
-  --sites test_data/graph_chr20/chr20_25M.sites.vcf.gz \
-  --gaf   test_data/graph_chr20/HG002_chr20_25M.coord.gaf.gz \
+  --ref         test_data/graph_chr20/ref.fa.gz \
+  --bam         test_data/graph_chr20/HG002_chr20_25M.bam \
+  --graph-sites test_data/graph_chr20/chr20_25M.sites.vcf.gz \
+  --gaf         test_data/graph_chr20/HG002_chr20_25M.coord.gaf.gz \
   --hifi \
   -o output.tsv
 ```
+
+Expected output: **7,141 candidate variant sites** from 2,048 reads (51 chunks).
 
 ## Files
 
