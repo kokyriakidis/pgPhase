@@ -7,15 +7,13 @@ haplotype sampling test data from
 
 ## Running the graph pipeline
 
-Minimal run (no `--region` needed — the FFI clamps queries to the GBZ path range):
+### Tabix-indexed GAF (current API)
 
 ```bash
 ./pgphase collect-graph-variation \
   --ref test_data/graph/ref.fa.gz \
   --sites test_data/graph/micb-kir3dl1.sites.vcf.gz \
-  --gbz-db test_data/graph/micb-kir3dl1.gbz.db \
-  --gaf-db test_data/graph/micb-kir3dl1_HG003.gaf.db \
-  --sample CHM13 \
+  --gaf test_data/graph/micb-kir3dl1_HG003.coord.gaf.gz \
   -o output.tsv
 ```
 
@@ -27,9 +25,7 @@ To restrict to a single locus:
 ./pgphase collect-graph-variation \
   --ref test_data/graph/ref.fa.gz \
   --sites test_data/graph/micb-kir3dl1.sites.vcf.gz \
-  --gbz-db test_data/graph/micb-kir3dl1.gbz.db \
-  --gaf-db test_data/graph/micb-kir3dl1_HG003.gaf.db \
-  --sample CHM13 \
+  --gaf test_data/graph/micb-kir3dl1_HG003.coord.gaf.gz \
   --region "CHM13#0#chr6:31350873-31363898" \
   -o output.tsv
 ```
@@ -47,13 +43,15 @@ To restrict to a single locus:
 
 | File | Description |
 |------|-------------|
-| `micb-kir3dl1.gbz.db` | GBZ database (built by `gbz2db`) |
-| `micb-kir3dl1_HG003.gaf.db` | GAF database (built by `gaf2db`) |
 | `micb-kir3dl1.sites.vcf.gz` | Sites VCF from `build-snarl-catalog` (917 snarl sites) |
 | `micb-kir3dl1.sites.vcf.gz.tbi` | Tabix index for sites VCF |
+| `micb-kir3dl1_HG003.coord.gaf.gz` | Coordinate-sorted GAF (bgzipped) |
+| `micb-kir3dl1_HG003.coord.gaf.gz.tbi` | Tabix index for GAF |
 | `ref.fa.gz` | Reference FASTA (bgzipped, N-padded to genome coordinates) |
 | `ref.fa.gz.fai` | FASTA index |
 | `ref.fa.gz.gzi` | bgzip index |
+| `micb-kir3dl1.gbz.db` | GBZ database (built by `gbz2db`, legacy API) |
+| `micb-kir3dl1_HG003.gaf.db` | GAF database (built by `gaf2db`, legacy API) |
 
 ### Notes on the reference FASTA
 
