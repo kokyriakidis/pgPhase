@@ -767,3 +767,39 @@ been flipped if needed. Unmerged pairs are skipped.
 
 The merged-only propagation recovers 835 reads (+0.4%) over longcallD with identical phase
 set count, block structure, accuracy, and switch error rate.
+
+---
+
+## Three-Pipeline Comparison — HG002 HiFi chr20 (current)
+
+Full chr20 evaluation using HG002 HiFi reads aligned to CHM13 chr20, evaluated
+against HG002 T2T diploid assembly (diplinator). All numbers reflect the current
+binary after all fixes above.
+
+| Metric | BAM | Graph | Hybrid |
+|---|---|---|---|
+| Input reads | 272,016 | 231,382 | 272,016 |
+| Phased reads | 219,925 (80.9%) | 216,130 (93.4%) | 220,741 (81.2%) |
+| Phase sets | 429 | 425 | 417 |
+| Phase block N50 | 937,648 bp | 898,076 bp | 935,571 bp |
+| Phase block auN | 9,834,195 bp | 981,035 bp | 8,933,683 bp |
+| Largest block | 53,165,843 bp | 2,141,283 bp | 50,153,162 bp |
+| **Overall accuracy** | **97.03%** | 92.77% | 96.86% |
+| Hamming error rate | 2.97% | 7.23% | 3.14% |
+| Switch error rate | 0.61% | 1.04% | 0.61% |
+| Phaseable accuracy | 98.15% | 95.36% | 97.89% |
+| Unphaseable accuracy | 53.63% | 54.48% | 53.79% |
+
+### Observations
+
+- **Hybrid vs BAM**: +816 phased reads (+0.3%), 12 fewer phase sets (more merging),
+  similar switch error (0.61%). Accuracy is 0.17% lower (96.86% vs 97.03%),
+  phaseable accuracy 0.26% lower (97.89% vs 98.15%). The graph injection stitches
+  more blocks but introduces modest noise from graph-only candidates.
+- **Graph**: highest read phasing rate (93.4%) but substantially lower accuracy
+  (92.77%) and fragmented blocks (auN 981k vs ~9-10M for BAM/hybrid). The graph
+  pipeline sees fewer input reads (231k vs 272k) because the GAF covers only
+  pangenome-aligned reads.
+- **Hybrid auN below BAM**: the hybrid's auN (8.9M) is slightly lower than BAM
+  (9.8M) in this run, suggesting some stitching decisions are introducing a large
+  block split. Under active investigation.
