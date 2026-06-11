@@ -57,6 +57,15 @@ constexpr int kDefaultNoisyRegMaxXgaps = 5;
 // supported boundaries to avoid over-merging discordant blocks.
 constexpr int kDefaultStitchMinMargin = 0;
 
+// Graph-only het-indel anchor gating (hybrid pipeline only).  Graph het indels
+// added to k-means as CleanHetIndel can mis-orient reads when the genotype is
+// unreliable.  Keep an indel anchor only when its allele fraction sits within
+// kDefaultGraphIndelAfMargin of 0.5 and it has at least
+// kDefaultGraphIndelMinAlt supporting alt reads.  Defaults reproduce prior
+// behavior (AF window 0.2-0.8, no extra alt floor beyond min_alt_depth).
+constexpr double kDefaultGraphIndelAfMargin = 0.11;
+constexpr int kDefaultGraphIndelMinAlt = 0;
+
 // ════════════════════════════════════════════════════════════════════════════
 // Enumerations
 // ════════════════════════════════════════════════════════════════════════════
@@ -141,6 +150,9 @@ struct Options {
     // Chunk-stitch abstain margin (see kDefaultStitchMinMargin).  Adjacent
     // chunks merge only when |flip_hap_score| > stitch_min_margin.
     int stitch_min_margin = kDefaultStitchMinMargin;
+    // Graph-only het-indel anchor gates (hybrid pipeline).  See constants above.
+    double graph_indel_af_margin = kDefaultGraphIndelAfMargin;
+    int graph_indel_min_alt = kDefaultGraphIndelMinAlt;
     // Step 4: noisy-region MSA options.
     int max_noisy_reg_len = 50000; // skip regions longer than this bp
     int max_noisy_reg_cov = 1000;  // skip regions with more overlapping reads

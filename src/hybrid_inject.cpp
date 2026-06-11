@@ -1,6 +1,7 @@
 /// @file hybrid_inject.cpp
 /// @brief Augment BAM-derived PhasingChunk with graph snarl observations.
 
+#include <cmath>
 #include "hybrid_inject.hpp"
 
 #include "collect_phase.hpp"
@@ -655,8 +656,13 @@ int classify_graph_only_candidates(
             cat = VariantCategory::CleanHom;
         } else if (cand.key.type == VariantType::Snp) {
             cat = VariantCategory::CleanHetSnp;
-        } else {
+        } else if (std::abs(c.allele_fraction - 0.5) <= opts.graph_indel_af_margin &&
+                   c.alt_cov >= opts.graph_indel_min_alt) {
             cat = VariantCategory::CleanHetIndel;
+        } else {
+            // Graph het indel with unreliable genotype (AF off-center or thin
+            // alt support): keep out of k-means to avoid mis-orienting reads.
+            cat = VariantCategory::LowCoverage;
         }
 
         c.category = cat;

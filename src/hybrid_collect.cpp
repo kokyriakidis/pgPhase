@@ -50,6 +50,8 @@ static void print_hybrid_help() {
         << "  -b, --out-bam FILE            Phased BAM output\n"
         << "      --pgbam-file FILE         Optional .pgbam sidecar for stitching\n"
         << "      --stitch-min-margin INT   Min flip-vote margin to merge blocks [0]\n"
+        << "      --graph-indel-af-margin F Max |AF-0.5| for graph het-indel anchor [0.11]\n"
+        << "      --graph-indel-min-alt INT Min alt support for graph het-indel anchor [0]\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
         << "\n"
         << "Examples:\n"
@@ -86,6 +88,8 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         kNoisyMaxXgapsOption,
         kRefineAlnOption,
         kStitchMinMarginOption,
+        kGraphIndelAfMarginOption,
+        kGraphIndelMinAltOption,
     };
 
     static struct option long_options[] = {
@@ -113,6 +117,8 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         {"pgbam-file",      required_argument, nullptr, kPgbamFileOption},
         {"noisy-max-xgaps", required_argument, nullptr, kNoisyMaxXgapsOption},
         {"stitch-min-margin", required_argument, nullptr, kStitchMinMarginOption},
+        {"graph-indel-af-margin", required_argument, nullptr, kGraphIndelAfMarginOption},
+        {"graph-indel-min-alt", required_argument, nullptr, kGraphIndelMinAltOption},
         {"refine-aln",      no_argument,       nullptr, kRefineAlnOption},
         {"verbose",         required_argument, nullptr, 'V'},
         {"help",            no_argument,       nullptr, 'h'},
@@ -154,6 +160,8 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
             case kPgbamFileOption:    opts.pgbam_file = optarg; break;
             case kNoisyMaxXgapsOption: opts.noisy_reg_max_xgaps = std::atoi(optarg); break;
             case kStitchMinMarginOption: opts.stitch_min_margin = std::atoi(optarg); break;
+            case kGraphIndelAfMarginOption: opts.graph_indel_af_margin = std::atof(optarg); break;
+            case kGraphIndelMinAltOption: opts.graph_indel_min_alt = std::atoi(optarg); break;
             case kRefineAlnOption:    opts.refine_aln = true; break;
             case 'V':                 opts.verbose = std::atoi(optarg); break;
             case 'h':

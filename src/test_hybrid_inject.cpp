@@ -156,6 +156,76 @@ int main() {
     ok &= check(classify_graph_only_candidates(chunk, empty_set, opts) == 0,
                 "empty candidate set promotes nothing");
 
+    // ── graph het-indel AF-window gate ───────────────────────────────────────
+    // Graph het indels become CleanHetIndel anchors only when their allele
+    // fraction sits within opts.graph_indel_af_margin of 0.5.  Off-center AF
+    // indels (mis-genotyped / repeat) are demoted to LowCoverage so they do not
+    // mis-orient reads in k-means.  SNPs are unaffected by this gate.
+    {
+        PhasingChunk ichunk;
+        ichunk.ref_beg = 1;
+        ichunk.ref_end = 200;
+        ichunk.ref_seq = std::string(200, 'C');
+
+        // Helper: a graph indel candidate (insertion) at pos with ref/alt cov.
+        auto make_graph_indel = [](hts_pos_t pos, int ref_cov, int alt_cov) {
+            CandidateVariant cand;
+            cand.key.tid = 0;
+            cand.key.pos = pos;
+            cand.key.type = VariantType::Insertion;
+            cand.key.ref_len = 0;
+            cand.key.alt = "A";
+            cand.counts.n_uniq_alles = 2;
+            cand.counts.ref_cov = ref_cov;
+            cand.counts.alt_cov = alt_cov;
+            cand.counts.total_cov = ref_cov + alt_cov;
+            cand.counts.category = VariantCategory::LowCoverage;
+            cand.counts.candvarcate_initial = VariantCategory::LowCoverage;
+            cand.lcd_var_i_to_cate = 0;
+            cand.lcd_make_variants_region_pass = true;
+            return cand;
+        };
+
+        Options iopts;                       // defaults: graph_indel_af_margin = 0.3
+        iopts.graph_indel_af_margin = 0.10;  // keep AF in [0.40, 0.60]
+
+        // 0: AF 0.50 (15/15) -> in window  -> CleanHetIndel
+        // 1: AF 0.70 (9/21)  -> off-center  -> LowCoverage
+        // 2: AF 0.30 (21/9)  -> off-center  -> LowCoverage
+        // 3: AF 0.45 (22/18) -> in window  -> CleanHetIndel
+        ichunk.candidates.push_back(make_graph_indel(60, 15, 15));
+        ichunk.candidates.push_back(make_graph_indel(70, 9, 21));
+        ichunk.candidates.push_back(make_graph_indel(80, 21, 9));
+        ichunk.candidates.push_back(make_graph_indel(90, 22, 18));
+        std::unordered_set<int> iset = {0, 1, 2, 3};
+
+        const int ipromoted = classify_graph_only_candidates(ichunk, iset, iopts);
+        ok &= check(ipromoted == 2,
+                    "only in-window AF graph het indels promoted (af_margin 0.10)");
+        ok &= check(ichunk.candidates[0].counts.category == VariantCategory::CleanHetIndel,
+                    "AF 0.50 indel kept as CleanHetIndel");
+        ok &= check(ichunk.candidates[1].counts.category == VariantCategory::LowCoverage,
+                    "AF 0.70 indel demoted to LowCoverage");
+        ok &= check(ichunk.candidates[2].counts.category == VariantCategory::LowCoverage,
+                    "AF 0.30 indel demoted to LowCoverage");
+        ok &= check(ichunk.candidates[3].counts.category == VariantCategory::CleanHetIndel,
+                    "AF 0.45 indel kept as CleanHetIndel");
+
+        // The default margin (kDefaultGraphIndelAfMargin = 0.11) keeps the two
+        // near-0.5 indels (AF 0.50, 0.45) and demotes the two off-center ones
+        // (AF 0.70, 0.30), matching the gate applied at the chosen default.
+        PhasingChunk dchunk;
+        dchunk.ref_beg = 1; dchunk.ref_end = 200; dchunk.ref_seq = std::string(200, 'C');
+        dchunk.candidates.push_back(make_graph_indel(60, 15, 15));  // AF 0.50 keep
+        dchunk.candidates.push_back(make_graph_indel(70, 9, 21));   // AF 0.70 drop
+        dchunk.candidates.push_back(make_graph_indel(80, 21, 9));   // AF 0.30 drop
+        dchunk.candidates.push_back(make_graph_indel(90, 22, 18));  // AF 0.45 keep
+        Options dopts;  // default graph_indel_af_margin = kDefaultGraphIndelAfMargin (0.11)
+        const int dpromoted = classify_graph_only_candidates(dchunk, iset, dopts);
+        ok &= check(dpromoted == 2,
+                    "default af_margin (0.11) keeps only near-0.5 graph het indels");
+    }
+
     // ── apply_hybrid_noise_filter: indel low-complexity screening ────────────
     // Reference with a 40 bp homopolymer A-run (1-based 121..160) flanked by
     // mixed sequence.  SDUST flags the run; positions ~150 ARE low-complexity.

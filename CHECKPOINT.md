@@ -19,6 +19,43 @@
 | `test_data/chr20.phase_graph.bam` | Phased BAM from graph pipeline |
 | `test_data/bam_eval_chr20/phased.bam` | Phased BAM from BAM pipeline |
 
+### Data provenance (full chr20 evaluation inputs)
+
+The full-chr20 evaluation inputs are **not committed** (5.1 GB; gitignored under
+`/test_data/chr20_eval/`). Re-download from the shared Google Drive folder:
+
+```
+https://drive.google.com/drive/folders/1DxDcuJ7uIugkQX_ZIbEMI5NdDg_lYT-5
+```
+
+Fetch with `gdown` (in a venv to satisfy PEP 668):
+
+```bash
+python3 -m venv /tmp/gdrive-venv
+/tmp/gdrive-venv/bin/pip install -q gdown
+/tmp/gdrive-venv/bin/gdown --folder \
+  "https://drive.google.com/drive/folders/1DxDcuJ7uIugkQX_ZIbEMI5NdDg_lYT-5" \
+  -O test_data/chr20_eval
+```
+
+| File (in `test_data/chr20_eval/`) | Role | Used by |
+|------|------|---------|
+| `chm13v2.0.chr20.renamed.fa` (+`.fai`) | CHM13 chr20 reference (`CHM13#0#chr20`) | BAM, graph, hybrid |
+| `HG002_chr20_hifi_mapped_to_CHM13_chr20_annotated.bam` (+`.bai`) | HiFi reads aligned to CHM13 chr20 (272,016 reads) — graph `hs/hb/he` tags, **no** diplinator truth tags | BAM, hybrid |
+| `chr20.sites.striped.vcf.gz` (+`.tbi`) | snarl sites | graph, hybrid |
+| `HG002.chr20.annotated.coord.gaf.gz` (+`.tbi`) | graph alignments (GAF) | graph, hybrid |
+| `HG002.chr20.fq.gz` | HiFi reads (FASTQ) | diplinator truth-BAM generation only |
+| `HG002_1.1_MATERNAL.chr20.fasta` (+`.fai`) | truth maternal assembly | diplinator evaluation only |
+| `HG002_1.1_PATERNAL.chr20.fasta` (+`.fai`) | truth paternal assembly | diplinator evaluation only |
+
+Notes:
+- The aligned BAM is "annotated" with graph `hs/hb/he` tags, **not** diplinator
+  `HO:Z:`/`hq:i:` truth tags. The truth BAM that `evaluate_phase_accuracy.py`
+  scores against must still be generated (align FASTQ to MAT/PAT assemblies →
+  diplinator).
+- The Drive folder ships **inputs only** — no pre-phased pipeline outputs. Both
+  the BAM and hybrid phased BAMs must be produced by running the pipelines here.
+
 ---
 
 ## Results — Graph Pipeline (indexed GAF)
@@ -870,6 +907,68 @@ binary after all fixes above.
 - **Hybrid phases more reads**: 223,065 (82.0%) vs 219,925 (80.9%) for BAM — +3,140 reads.
 - **Accuracy trade-off**: hybrid accuracy 95.59% vs BAM 97.03% (-1.44 pp), switch error
   0.78% vs 0.61%. The aggressive stitching merges some blocks that should stay split.
+  This trade-off is resolved by the graph het-indel AF gate documented below.
 - **Graph**: highest read phasing rate (93.4%) but substantially lower accuracy (92.77%)
   and fragmented blocks (auN 981k). The graph pipeline sees fewer input reads (231k vs 272k)
   because the GAF covers only pangenome-aligned reads.
+
+---
+
+## Graph Het-Indel AF Gate (resolves hybrid accuracy/contiguity regression)
+
+### Problem
+
+Commit `af6b089` ("Stop over-demoting graph het indels") promoted graph-only het
+indels to `CleanHetIndel` so they enter k-means as phasing anchors. On a full
+chr20 truth evaluation this **raised** hybrid Hamming error to 4.52% (vs BAM
+3.09%) while raising auN to 13.6M. The commit message itself flagged that the
+accuracy recovery was never confirmed on a full chromosome — it was not realized.
+
+### Investigation
+
+Truth-based read-level analysis (HG002 diplinator tags) localized the damage:
+
+- **STABLE phase-block interiors are untouched** (+27 discordant on 140,861
+  shared reads). The joint k-means does *not* corrupt confident BAM regions.
+- **All regression lives at block-merge seams.** ~2,701 reads are *wholesale
+  orientation flips*: a BAM-clean sub-block inverted en masse after a graph
+  anchor mis-oriented the merge.
+- A `--stitch-min-margin` sweep (0→8) barely moved Hamming (4.52→4.37%): the
+  wrong merges are **confident, not thin-margin**. The defect is upstream anchor
+  selection, not the stitch decision.
+- Reverting `af6b089` dropped Hamming to 3.27% but collapsed auN to 8.93M (below
+  BAM). The graph het indels are a **mixture**: near-0.5-AF indels are reliable
+  bridges (the auN gain); off-center-AF indels (mis-genotyped / repeat) are the
+  wrong-orientation anchors. All-or-nothing loses on one axis.
+
+### Fix
+
+`classify_graph_only_candidates` (hybrid path only) now admits a graph het indel
+as a `CleanHetIndel` anchor only when its allele fraction sits within
+`graph_indel_af_margin` of 0.5; off-center indels are demoted to `LowCoverage`
+(kept out of k-means, pruned from output). Two tunable gates added, defaults
+reproduce nothing-changed for SNPs:
+
+- `--graph-indel-af-margin` (default `kDefaultGraphIndelAfMargin = 0.11`)
+- `--graph-indel-min-alt` (default 0 — swept, no additional effect over the
+  existing `min_alt_depth` floor)
+
+The BAM pipeline (`classify_variant_initial`) and graph-only pipeline
+(`classify_graph_candidates`) are not touched; BAM candidate output verified
+byte-for-byte identical.
+
+### Result (chr20, full-chromosome truth eval)
+
+AF-margin sweep, best at **0.11** (keep graph het indels with AF ∈ [0.39, 0.61]):
+
+| Config | Hamming | auN | Largest block | Phased reads |
+|---|---|---|---|---|
+| BAM baseline | 3.091% | 9.83M | 53.2M | 219,925 |
+| Hybrid af6b089 (margin 0.30) | 4.520% | 13.57M | 62.7M | 223,065 |
+| Hybrid revert af6b089 | 3.265% | 8.93M | 50.2M | 220,741 |
+| **Hybrid + af-gate 0.11** | **3.053%** | **12.09M** | **59.3M** | **220,952** |
+
+The 0.11 gate **Pareto-beats BAM on every axis**: lower Hamming (−0.038pp,
+~830 reads), +23% auN, +11% largest block, +1,027 phased reads. Sweep was
+non-monotone with a clear optimum at 0.11 (0.12 already crosses back above BAM
+accuracy), confirming a genuine edge rather than a tuning endpoint.
