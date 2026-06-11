@@ -464,14 +464,20 @@ void apply_hybrid_noise_filter(
     for (int ci : graph_only_candidates) {
         if (ci < 0 || static_cast<size_t>(ci) >= chunk.candidates.size()) continue;
         CandidateVariant& cand = chunk.candidates[static_cast<size_t>(ci)];
-        if (cand.counts.category != VariantCategory::CleanHetIndel) continue;
+        // Het SNPs and het indels are the only categories that enter k-means;
+        // both must be screened for reference-based noise.
+        if (cand.counts.category != VariantCategory::CleanHetIndel &&
+            cand.counts.category != VariantCategory::CleanHetSnp) continue;
 
         // Build VCF-style ref/alt from VariantKey.
         const VariantKey& k = cand.key;
         std::string vcf_ref, vcf_alt;
         if (k.type == VariantType::Snp) {
-            // ref_nt4 not easily available; skip SNPs (only indels need this).
-            continue;
+            // SNP: single ref base at pos, single alt base. For SNPs is_noisy_site
+            // only consults the low-complexity (SDUST) intervals.
+            if (k.pos < ref_beg || k.pos > ref_end) continue;
+            vcf_ref = std::string(1, ref_seq[static_cast<size_t>(k.pos - ref_beg)]);
+            vcf_alt = k.alt;
         } else if (k.type == VariantType::Insertion) {
             // Anchor base at pos-1.
             const hts_pos_t anchor = k.pos - 1;
@@ -493,9 +499,18 @@ void apply_hybrid_noise_filter(
 
         if (is_noisy_site(k.pos, vcf_ref, vcf_alt, ref_seq, ref_beg, ref_end,
                           lc, max_xgaps)) {
-            cand.counts.category = VariantCategory::RepeatHetIndel;
-            cand.counts.candvarcate_initial = VariantCategory::RepeatHetIndel;
-            cand.lcd_var_i_to_cate = kLongcalldRepHetVar;
+            if (k.type == VariantType::Snp) {
+                // Noisy SNP (low-complexity region): demote to non-variant so it
+                // drops out of the germline-clean k-means mask, mirroring how the
+                // BAM pipeline removes density-noisy SNPs.
+                cand.counts.category = VariantCategory::NonVariant;
+                cand.counts.candvarcate_initial = VariantCategory::NonVariant;
+                cand.lcd_var_i_to_cate = kLongcalldNonVar;
+            } else {
+                cand.counts.category = VariantCategory::RepeatHetIndel;
+                cand.counts.candvarcate_initial = VariantCategory::RepeatHetIndel;
+                cand.lcd_var_i_to_cate = kLongcalldRepHetVar;
+            }
         }
     }
 }

@@ -97,6 +97,80 @@ int main() {
     ok &= check(classify_graph_only_candidates(chunk, empty_set, opts) == 0,
                 "empty candidate set promotes nothing");
 
+    // ── apply_hybrid_noise_filter: low-complexity screening ──────────────────
+    // Reference with a 40 bp homopolymer A-run (1-based 121..160) flanked by
+    // mixed sequence.  SDUST flags the run and a few short repeats; positions
+    // 20/40/60/180/200/220 are NOT low-complexity, positions ~130/150 ARE.
+    const std::string mixed =
+        "ACGTTGCAGATCCTGAGTACGTCAGTTGACCATGGATCAGTACTGGCATGACTTAGCATGC"
+        "TGACAGTCATGCATGACTGCATGCTAGCATCGATCGATTGCATGCATGCTAGCTGATCAGT";
+    PhasingChunk nchunk;
+    nchunk.ref_beg = 1;
+    nchunk.ref_end = static_cast<hts_pos_t>(mixed.size() * 2 + 40);
+    nchunk.ref_seq = mixed + std::string(40, 'A') + mixed;
+
+    // 0: het SNP in low-complexity run (pos 130)  -> demoted to NonVariant
+    // 1: het SNP in mixed region    (pos 40)      -> untouched (CleanHetSnp)
+    // 2: het indel in low-complexity run (pos 150)-> RepeatHetIndel
+    CandidateVariant snp_noisy = make_graph_snp(130, 5, 5);
+    snp_noisy.counts.category = VariantCategory::CleanHetSnp;
+    snp_noisy.counts.candvarcate_initial = VariantCategory::CleanHetSnp;
+    snp_noisy.lcd_var_i_to_cate = kCandCleanHetSnp;
+
+    CandidateVariant snp_clean = make_graph_snp(40, 5, 5);
+    snp_clean.counts.category = VariantCategory::CleanHetSnp;
+    snp_clean.counts.candvarcate_initial = VariantCategory::CleanHetSnp;
+    snp_clean.lcd_var_i_to_cate = kCandCleanHetSnp;
+
+    CandidateVariant ins_noisy = make_graph_snp(150, 5, 5);
+    ins_noisy.key.type = VariantType::Insertion;
+    ins_noisy.key.ref_len = 0;
+    ins_noisy.key.alt = "A";
+    ins_noisy.counts.category = VariantCategory::CleanHetIndel;
+    ins_noisy.counts.candvarcate_initial = VariantCategory::CleanHetIndel;
+    ins_noisy.lcd_var_i_to_cate = kCandCleanHetIndel;
+
+    nchunk.candidates.push_back(snp_noisy);
+    nchunk.candidates.push_back(snp_clean);
+    nchunk.candidates.push_back(ins_noisy);
+
+    std::unordered_set<int> noise_set = {0, 1, 2};
+    apply_hybrid_noise_filter(nchunk, nchunk.ref_seq, nchunk.ref_beg,
+                              nchunk.ref_end, noise_set, opts.noisy_reg_max_xgaps);
+
+    ok &= check(nchunk.candidates[0].counts.category == VariantCategory::NonVariant,
+                "noisy SNP demoted to NonVariant");
+    ok &= check(nchunk.candidates[0].lcd_var_i_to_cate == kLongcalldNonVar,
+                "noisy SNP gets NonVar flag (dropped from germline-clean mask)");
+    ok &= check((nchunk.candidates[0].lcd_var_i_to_cate & kCandCleanHetSnp) == 0,
+                "noisy SNP excluded from het SNP mask");
+
+    ok &= check(nchunk.candidates[1].counts.category == VariantCategory::CleanHetSnp,
+                "clean SNP in mixed region untouched");
+    ok &= check(nchunk.candidates[1].lcd_var_i_to_cate == kCandCleanHetSnp,
+                "clean SNP keeps CleanHetSnp flag");
+
+    ok &= check(nchunk.candidates[2].counts.category == VariantCategory::RepeatHetIndel,
+                "noisy indel demoted to RepeatHetIndel");
+    ok &= check(nchunk.candidates[2].lcd_var_i_to_cate == kLongcalldRepHetVar,
+                "noisy indel gets RepHetVar flag");
+
+    // Candidates outside the graph-only set are never touched.
+    PhasingChunk gchunk;
+    gchunk.ref_beg = 1;
+    gchunk.ref_end = static_cast<hts_pos_t>(nchunk.ref_seq.size());
+    gchunk.ref_seq = nchunk.ref_seq;
+    CandidateVariant snp_excluded = make_graph_snp(130, 5, 5);
+    snp_excluded.counts.category = VariantCategory::CleanHetSnp;
+    snp_excluded.counts.candvarcate_initial = VariantCategory::CleanHetSnp;
+    snp_excluded.lcd_var_i_to_cate = kCandCleanHetSnp;
+    gchunk.candidates.push_back(snp_excluded);
+    std::unordered_set<int> none_set;  // index 0 NOT in the graph-only set
+    apply_hybrid_noise_filter(gchunk, gchunk.ref_seq, gchunk.ref_beg,
+                              gchunk.ref_end, none_set, opts.noisy_reg_max_xgaps);
+    ok &= check(gchunk.candidates[0].counts.category == VariantCategory::CleanHetSnp,
+                "non-graph-only SNP in low-complexity left untouched");
+
     if (ok) {
         std::cout << "ALL PASS\n";
         return 0;

@@ -560,6 +560,48 @@ third-party `-Wunused-function` warning is unrelated).
 
 ---
 
+## Hybrid Model — graph SNP low-complexity gap
+
+The hybrid noise filter `apply_hybrid_noise_filter` previously skipped SNPs
+entirely (`if (k.type == Snp) continue;`), so a graph-only SNP that fell inside
+an SDUST low-complexity interval could enter het k-means as a clean anchor.
+
+### Why this differs from the standalone graph pipeline
+
+`apply_graph_noise_filter` (standalone graph pipeline) deliberately leaves SNPs
+alone — see "SNPs in low-complexity regions" above. That conservatism is correct
+for the graph pipeline, where graph sites are the *only* evidence and the BAM
+pipeline's indirect read-level mechanism that would demote such a SNP does not
+exist.
+
+The hybrid filter only acts on **graph-only** candidates — sites the BAM caller
+missed. These have no BAM read-level support, so a graph-only het SNP sitting in
+a low-complexity region is exactly the case the BAM pipeline would demote to
+`NonVariant` (via widened noisy spans + `apply_noisy_containment_filter`). Here
+the demotion is applied directly because the read-level machinery is unavailable
+in the GAF input. This closes the gap without affecting the BAM or standalone
+graph pipelines.
+
+### Change
+
+- `apply_hybrid_noise_filter` now also screens `CleanHetSnp` graph-only
+  candidates. For a SNP it builds the single-base ref/alt (for SNPs
+  `is_noisy_site` only consults the low-complexity intervals) and, if noisy,
+  demotes to `NonVariant` (`lcd_var_i_to_cate = kLongcalldNonVar`), dropping it
+  from the `kCandGermlineClean` k-means mask. Indels keep their existing
+  `RepeatHetIndel` demotion.
+
+### chr20 25M result
+
+- 11 graph-only SNPs in low-complexity regions reclassified
+  `CLEAN_HET_SNP` → `NON_VAR`, removing them from het k-means. Remaining diff
+  lines are ±1 per-read depth shifts at nearby indels (category unchanged), a
+  downstream consequence of the smaller k-means input.
+- BAM-only (1108) and graph-only (509) outputs unchanged — change is confined to
+  the hybrid graph-only path. `make unit-tests` all green.
+
+---
+
 ## Lessons / Pitfalls
 
 - **pgbam sidecar causes over-stitching:** Running BAM pipeline with `--pgbam-file` merged all 49 initial phase sets into 2 chr20-spanning blocks with near-random accuracy (55%). Do not use the sidecar without understanding its signal quality.
