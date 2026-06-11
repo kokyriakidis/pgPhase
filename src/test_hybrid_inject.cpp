@@ -203,6 +203,46 @@ int main() {
     ok &= check(nchunk.candidates[1].lcd_var_i_to_cate == kLongcalldRepHetVar,
                 "noisy indel gets RepHetVar flag");
 
+    // ── apply_hybrid_noise_filter: original VCF strings override key-based ────
+    // When a GraphOnlyVcfAlleles map supplies the catalog (pos, ref, alt), the
+    // filter screens on those instead of reconstructing from the VariantKey.
+    // This mirrors the standalone graph pipeline (apply_graph_noise_filter),
+    // which screens on catalog allele strings, and prevents over-demoting graph
+    // het indels whose key-reconstructed form lands in a different context.
+    {
+        // Put the candidate's KEY position inside the homopolymer run (would be
+        // demoted via reconstruction), but supply original VCF coordinates in a
+        // unique, non-low-complexity context so is_noisy_site returns false.
+        PhasingChunk ochunk;
+        ochunk.ref_beg = 1;
+        ochunk.ref_end = static_cast<hts_pos_t>(mixed.size() * 2 + 40);
+        ochunk.ref_seq = mixed + std::string(40, 'A') + mixed;
+
+        CandidateVariant ins = make_graph_snp(150, 5, 5);  // key pos in A-run
+        ins.key.type = VariantType::Insertion;
+        ins.key.ref_len = 0;
+        ins.key.alt = "A";
+        ins.counts.category = VariantCategory::CleanHetIndel;
+        ins.counts.candvarcate_initial = VariantCategory::CleanHetIndel;
+        ins.lcd_var_i_to_cate = kCandCleanHetIndel;
+        ochunk.candidates.push_back(ins);
+
+        // Original VCF: a clean 1 bp insertion at pos 10 (mixed sequence,
+        // not low-complexity, not homopolymer).
+        GraphOnlyVcfAlleles alleles;
+        alleles[0] = GraphOnlyVcfAllele{10, "A", "AC"};
+
+        std::unordered_set<int> oset = {0};
+        apply_hybrid_noise_filter(ochunk, ochunk.ref_seq, ochunk.ref_beg,
+                                  ochunk.ref_end, oset,
+                                  opts.noisy_reg_max_xgaps, &alleles);
+
+        ok &= check(ochunk.candidates[0].counts.category ==
+                        VariantCategory::CleanHetIndel,
+                    "indel kept when original VCF strings are non-noisy "
+                    "(even though key pos is in a homopolymer)");
+    }
+
     // ── prune_not_candidate_variants: drop non-call categories ───────────────
     // Mirrors the BAM pipeline's end-of-classification prune.  The hybrid
     // pipeline re-runs this after appending graph-only candidates so failed

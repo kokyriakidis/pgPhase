@@ -693,6 +693,78 @@ Hybrid-only change; the BAM and graph pipelines do not call this function.
 
 ---
 
+## Hybrid Model — graph het indels over-demoted (hybrid ≈ BAM)
+
+### Symptom
+
+Full-chromosome benchmarks showed the hybrid barely beating BAM (accuracy
+96.86% vs 97.03%, phased reads 81.2% vs 80.9%) while the standalone graph
+pipeline phased **93.4%** of reads. The hybrid was reproducing BAM instead of
+harvesting the graph's phasing power, and phase-block auN regressed (11.8M →
+8.9M).
+
+### Diagnosis (chr20 25M slice)
+
+Phasing in the hybrid runs only `collect_var_run_phasing`, whose first (and
+only) k-means uses `kCandGermlineClean` — **clean het SNP + clean het indel +
+clean hom**. So the count of *clean* het anchors drives phasing. Measured:
+
+| anchors into k-means | BAM | GRAPH | HYBRID (old) |
+|---|---|---|---|
+| clean het SNP + clean het indel | 384 | **509** | 438 |
+
+The graph's advantage is its **113 clean het indels**; the old hybrid kept only
+**41**, demoting **29 → RepeatHetIndel** and reclassifying the rest. Two causes,
+both from running BAM-conservative logic on graph-only candidates:
+
+1. **classify_graph_only_candidates** called `classify_variant_initial` (the BAM
+   classifier), which demotes homopolymer/repeat het indels to RepeatHetIndel
+   **inline**, keyed on the normalized `VariantKey`. The standalone graph
+   pipeline's `classify_graph_candidates` has no such inline demotion.
+2. **apply_hybrid_noise_filter** reconstructed vcf_ref/vcf_alt from the
+   normalized key, so `is_noisy_site` saw a different string/position than the
+   graph pipeline's `apply_graph_noise_filter` (which screens on the original
+   catalog ref/alt) — a different homopolymer verdict for the same site.
+
+### Fix (hybrid-only)
+
+Mirror the graph pipeline's two-step exactly:
+`classify_graph_candidates` (depth/AF/het/hom, **no** inline indel demotion)
+followed by `apply_graph_noise_filter` (screens on catalog strings).
+
+- `classify_graph_only_candidates` now classifies graph-only candidates with the
+  graph pipeline's depth/AF/het/hom logic (replicated inline; the shared
+  `classify_variant_initial` is left untouched for the frozen BAM pipeline) and
+  does **no** homopolymer demotion. LowAlleleFraction is still folded to
+  LowCoverage to match BAM pass-2 pruning.
+- `inject_graph_sites` now records each graph-only candidate's original VCF
+  (pos, ref, alt) in a `GraphOnlyVcfAlleles` side-map (remapped through the
+  post-injection sort permutation).
+- `apply_hybrid_noise_filter` uses those original strings when available, so its
+  homopolymer/repeat verdict matches the standalone graph pipeline; it falls
+  back to key-reconstruction only when unavailable.
+
+### Result (chr20 25M slice)
+
+- Clean het anchors **438 → 448**; clean het indels **41 → 51**;
+  RepeatHetIndel **54 → 44**.
+- Phased het variants (phased VCF) **527 → 535**.
+- The remaining gap to the graph's 509 clean anchors is **BAM-origin** sites
+  whose linear pileup is genuinely noisy (`NOISY_CAND_HET`): of the graph
+  clean-het sites the hybrid still marks noisy, **all 20 are bridged BAM-origin**
+  and **0 are graph-only** — i.e. real BAM/graph disagreements, not a bug.
+  Touching them would alter the frozen BAM classification, so they are out of
+  scope.
+- Invariants held: BAM (1108) and graph (509) outputs byte-identical (MD5);
+  BAM call parity 1108/1108; `make unit-tests` green. Added a noise-filter test
+  asserting original VCF strings override key-based reconstruction.
+
+This slice is a single phase block (saturated N50), so the block-contiguity /
+auN effect must be confirmed on a full chromosome with truth-based evaluation
+(diplinator/whatshap unavailable in this environment).
+
+---
+
 ## Lessons / Pitfalls
 
 - **pgbam sidecar causes over-stitching:** Running BAM pipeline with `--pgbam-file` merged all 49 initial phase sets into 2 chr20-spanning blocks with near-random accuracy (55%). Do not use the sidecar without understanding its signal quality.

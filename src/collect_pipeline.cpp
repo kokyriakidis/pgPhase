@@ -717,11 +717,12 @@ static PhasingChunk process_chunk_hybrid(
     // allele counts are final (see classify_graph_only_candidates below).
     SiteToCandidateMap site_map;
     std::unordered_set<int> graph_only_cands;
+    GraphOnlyVcfAlleles graph_only_vcf_alleles;
     int bridged = 0, added = 0;
     if (!chunk_view.empty()) {
         site_map = inject_graph_sites(
             chunk, chunk_view, chrom_remap, opts, &bridged, &added,
-            &graph_only_cands);
+            &graph_only_cands, &graph_only_vcf_alleles);
     }
 
     // Step 3.1: build BAM read profiles against augmented candidate table.
@@ -759,7 +760,8 @@ static PhasingChunk process_chunk_hybrid(
         if (!chunk.ref_seq.empty()) {
             apply_hybrid_noise_filter(
                 chunk, chunk.ref_seq, chunk.ref_beg, chunk.ref_end,
-                graph_only_cands, opts.noisy_reg_max_xgaps);
+                graph_only_cands, opts.noisy_reg_max_xgaps,
+                &graph_only_vcf_alleles);
         }
     }
 

@@ -19,6 +19,21 @@ namespace pgphase_collect {
 /// Maps graph site keys to candidate indices in the augmented table.
 using SiteToCandidateMap = std::unordered_map<std::string, int>;
 
+/// Original VCF representation of a graph-only candidate from the snarl
+/// catalog: site position, REF, and the chosen ALT.
+struct GraphOnlyVcfAllele {
+    hts_pos_t pos = 0;
+    std::string ref;
+    std::string alt;
+};
+
+/// Maps a graph-only candidate index to its original VCF (pos, ref, alt) from
+/// the snarl catalog.  The hybrid noise filter uses these so its
+/// homopolymer/repeat verdict matches the standalone graph pipeline
+/// (apply_graph_noise_filter), which screens on the catalog representation
+/// rather than on strings reconstructed from the normalized VariantKey.
+using GraphOnlyVcfAlleles = std::unordered_map<int, GraphOnlyVcfAllele>;
+
 /// Convert a VCF-style (pos, ref, alt) record to a normalized VariantKey.
 ///
 /// Deletions and insertions strip the full shared prefix so they use the same
@@ -54,7 +69,8 @@ SiteToCandidateMap inject_graph_sites(
     const Options& opts,
     int* sites_bridged_out,
     int* sites_added_out,
-    std::unordered_set<int>* graph_only_candidates_out = nullptr);
+    std::unordered_set<int>* graph_only_candidates_out = nullptr,
+    GraphOnlyVcfAlleles* graph_only_vcf_alleles_out = nullptr);
 
 /// Phase B: Inject graph-only reads and extend doubly-mapped read profiles.
 ///
@@ -93,7 +109,8 @@ void apply_hybrid_noise_filter(
     hts_pos_t ref_beg,
     hts_pos_t ref_end,
     const std::unordered_set<int>& graph_only_candidates,
-    int max_xgaps);
+    int max_xgaps,
+    const GraphOnlyVcfAlleles* graph_only_vcf_alleles = nullptr);
 
 /// Backfill allele counts on graph-only candidates from BAM read profiles.
 ///

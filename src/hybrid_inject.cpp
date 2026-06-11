@@ -5,6 +5,7 @@
 
 #include "collect_phase.hpp"
 #include "collect_var.hpp"
+#include "fisher_exact.hpp"
 #include "noise_filter.hpp"
 
 #include <algorithm>
@@ -147,14 +148,18 @@ SiteToCandidateMap inject_graph_sites(
         const Options& opts,
         int* sites_bridged_out,
         int* sites_added_out,
-        std::unordered_set<int>* graph_only_candidates_out) {
+        std::unordered_set<int>* graph_only_candidates_out,
+        GraphOnlyVcfAlleles* graph_only_vcf_alleles_out) {
     (void)opts;
     (void)chrom_remap;
     SiteToCandidateMap site_to_candidate;
     int bridged = 0, added = 0;
 
-    // Track pre-sort indices of graph-only candidates.
+    // Track pre-sort indices of graph-only candidates and their original VCF
+    // (ref, alt) strings so the noise filter can screen on the catalog
+    // representation, matching the standalone graph pipeline.
     std::vector<int> graph_only_pre_sort;
+    std::unordered_map<int, GraphOnlyVcfAllele> pre_sort_vcf_alleles;
 
     if (graph_sites.empty()) {
         if (sites_bridged_out) *sites_bridged_out = 0;
@@ -203,6 +208,8 @@ SiteToCandidateMap inject_graph_sites(
                     chunk, site, vcf_alt, chunk_tid);
                 site_to_candidate[site_key] = new_idx;
                 graph_only_pre_sort.push_back(new_idx);
+                pre_sort_vcf_alleles[new_idx] =
+                    GraphOnlyVcfAllele{site.pos, site.ref, vcf_alt};
                 ++added;
             }
             break;  // first ALT only
@@ -240,9 +247,20 @@ SiteToCandidateMap inject_graph_sites(
                 graph_only_candidates_out->insert(
                     old_to_new[static_cast<size_t>(pre_idx)]);
         }
-    } else if (graph_only_candidates_out) {
-        for (int idx : graph_only_pre_sort)
-            graph_only_candidates_out->insert(idx);
+        if (graph_only_vcf_alleles_out) {
+            for (const auto& [pre_idx, alleles] : pre_sort_vcf_alleles)
+                (*graph_only_vcf_alleles_out)[
+                    old_to_new[static_cast<size_t>(pre_idx)]] = alleles;
+        }
+    } else {
+        if (graph_only_candidates_out) {
+            for (int idx : graph_only_pre_sort)
+                graph_only_candidates_out->insert(idx);
+        }
+        if (graph_only_vcf_alleles_out) {
+            for (const auto& [idx, alleles] : pre_sort_vcf_alleles)
+                (*graph_only_vcf_alleles_out)[idx] = alleles;
+        }
     }
 
     if (sites_bridged_out) *sites_bridged_out = bridged;
@@ -480,7 +498,8 @@ void apply_hybrid_noise_filter(
         hts_pos_t ref_beg,
         hts_pos_t ref_end,
         const std::unordered_set<int>& graph_only_candidates,
-        int max_xgaps) {
+        int max_xgaps,
+        const GraphOnlyVcfAlleles* graph_only_vcf_alleles) {
     if (ref_seq.empty() || graph_only_candidates.empty()) return;
 
     const std::vector<Interval> lc = find_low_complexity_intervals(ref_seq, ref_beg);
@@ -490,35 +509,56 @@ void apply_hybrid_noise_filter(
         CandidateVariant& cand = chunk.candidates[static_cast<size_t>(ci)];
         if (cand.counts.category != VariantCategory::CleanHetIndel) continue;
 
-        // Build VCF-style ref/alt from VariantKey.
         const VariantKey& k = cand.key;
-        std::string vcf_ref, vcf_alt;
         if (k.type == VariantType::Snp) {
             // SNPs in low-complexity regions are NOT demoted: both the BAM
             // pipeline (recalls them as NOISY_CAND_HET via noisy-region MSA)
             // and the standalone graph pipeline (CLEAN_HET_SNP) keep these as
             // real het calls, so the hybrid pipeline must keep them too.
             continue;
-        } else if (k.type == VariantType::Insertion) {
-            // Anchor base at pos-1.
-            const hts_pos_t anchor = k.pos - 1;
-            if (anchor < ref_beg || anchor > ref_end) continue;
-            const char anchor_base = ref_seq[static_cast<size_t>(anchor - ref_beg)];
-            vcf_ref = std::string(1, anchor_base);
-            vcf_alt = anchor_base + k.alt;
-        } else {
-            // Deletion: anchor at pos-1, deleted bases at pos..pos+ref_len-1.
-            const hts_pos_t anchor = k.pos - 1;
-            if (anchor < ref_beg || k.pos + k.ref_len - 1 > ref_end) continue;
-            vcf_ref = ref_seq.substr(
-                static_cast<size_t>(anchor - ref_beg),
-                static_cast<size_t>(k.ref_len + 1));
-            const char anchor_base = ref_seq[static_cast<size_t>(anchor - ref_beg)];
-            vcf_alt = std::string(1, anchor_base);
-            if (!k.alt.empty()) vcf_alt += k.alt;
         }
 
-        if (is_noisy_site(k.pos, vcf_ref, vcf_alt, ref_seq, ref_beg, ref_end,
+        // Prefer the original VCF (pos, ref, alt) from the snarl catalog so the
+        // homopolymer/repeat verdict matches the standalone graph pipeline
+        // (apply_graph_noise_filter screens on the catalog representation).
+        // Reconstructing from the normalized VariantKey can yield a different
+        // string/position for the same site and over-demote graph het indels
+        // that the graph pipeline keeps as phasing anchors.  Fall back to
+        // reconstruction only when the original is unavailable.
+        hts_pos_t noisy_pos = k.pos;
+        std::string vcf_ref, vcf_alt;
+        bool have_alleles = false;
+        if (graph_only_vcf_alleles) {
+            auto it = graph_only_vcf_alleles->find(ci);
+            if (it != graph_only_vcf_alleles->end()) {
+                noisy_pos = it->second.pos;
+                vcf_ref = it->second.ref;
+                vcf_alt = it->second.alt;
+                have_alleles = true;
+            }
+        }
+        if (!have_alleles) {
+            if (k.type == VariantType::Insertion) {
+                const hts_pos_t anchor = k.pos - 1;
+                if (anchor < ref_beg || anchor > ref_end) continue;
+                const char anchor_base =
+                    ref_seq[static_cast<size_t>(anchor - ref_beg)];
+                vcf_ref = std::string(1, anchor_base);
+                vcf_alt = anchor_base + k.alt;
+            } else {
+                const hts_pos_t anchor = k.pos - 1;
+                if (anchor < ref_beg || k.pos + k.ref_len - 1 > ref_end) continue;
+                vcf_ref = ref_seq.substr(
+                    static_cast<size_t>(anchor - ref_beg),
+                    static_cast<size_t>(k.ref_len + 1));
+                const char anchor_base =
+                    ref_seq[static_cast<size_t>(anchor - ref_beg)];
+                vcf_alt = std::string(1, anchor_base);
+                if (!k.alt.empty()) vcf_alt += k.alt;
+            }
+        }
+
+        if (is_noisy_site(noisy_pos, vcf_ref, vcf_alt, ref_seq, ref_beg, ref_end,
                           lc, max_xgaps)) {
             cand.counts.category = VariantCategory::RepeatHetIndel;
             cand.counts.candvarcate_initial = VariantCategory::RepeatHetIndel;
@@ -574,23 +614,53 @@ int classify_graph_only_candidates(
         if (ci < 0 || static_cast<size_t>(ci) >= chunk.candidates.size())
             continue;
         CandidateVariant& cand = chunk.candidates[static_cast<size_t>(ci)];
+        VariantCounts& c = cand.counts;
 
-        // Reuse the BAM pipeline's depth/AF/het/hom logic now that ref/alt/
-        // total coverage are final.  classify_variant_initial sets
-        // allele_fraction and returns the category; category_to_flag then
-        // assigns the matching bitmask.  Only CleanHet{Snp,Indel} land in the
-        // het k-means mask, so LowCoverage/LowAlleleFraction/RepeatHetIndel
-        // sites are kept out of het phasing (CleanHom follows BAM behavior).
-        VariantCategory cat = classify_variant_initial(
-            cand.key, cand.counts, chunk.ref_seq, chunk.ref_beg,
-            chunk.ref_end, opts);
-        // Fold LowAlleleFraction into LowCoverage so it is pruned from output,
-        // matching the BAM pipeline's classify_chunk_candidates pass 2 (which
-        // rewrites LOW_AF to LOW_COV before prune_not_candidate_variants).
-        if (cat == VariantCategory::LowAlleleFraction)
+        // Classify graph-only candidates with the SAME depth/AF/het/hom logic
+        // the standalone graph pipeline uses (classify_graph_candidates), NOT
+        // the BAM classify_variant_initial.  The two differ in one place: the
+        // BAM classifier demotes homopolymer/repeat het indels to
+        // RepeatHetIndel inline, keyed on the normalized VariantKey.  Doing
+        // that here over-demotes graph het indels (the graph's main phasing
+        // advantage) and pre-empts apply_hybrid_noise_filter, which screens on
+        // the original catalog ref/alt.  So homopolymer screening is left
+        // entirely to apply_hybrid_noise_filter (called next), mirroring the
+        // graph pipeline's classify_graph_candidates + apply_graph_noise_filter
+        // ordering.  Only CleanHet{Snp,Indel} enter het k-means.
+        c.allele_fraction =
+            c.total_cov == 0
+                ? 0.0
+                : static_cast<double>(c.alt_cov) /
+                      static_cast<double>(c.total_cov);
+
+        VariantCategory cat;
+        if (c.total_cov < opts.min_depth || c.alt_cov < opts.min_alt_depth) {
             cat = VariantCategory::LowCoverage;
-        cand.counts.category = cat;
-        cand.counts.candvarcate_initial = cat;
+        } else if (opts.is_ont() &&
+                   [&] {
+                       const int fa = c.forward_alt;
+                       const int ra = c.reverse_alt;
+                       const int expected = (fa + ra) / 2;
+                       if (expected <= 0) return false;
+                       return fisher_exact_two_tail(fa, ra, expected, expected) <
+                              opts.strand_bias_pval;
+                   }()) {
+            cat = VariantCategory::StrandBias;
+        } else if (c.allele_fraction < opts.min_af) {
+            // Fold LowAlleleFraction into LowCoverage so it is pruned from
+            // output, matching the BAM pipeline's classify_chunk_candidates
+            // pass 2 (which rewrites LOW_AF to LOW_COV before prune).
+            cat = VariantCategory::LowCoverage;
+        } else if (c.allele_fraction > opts.max_af) {
+            cat = VariantCategory::CleanHom;
+        } else if (cand.key.type == VariantType::Snp) {
+            cat = VariantCategory::CleanHetSnp;
+        } else {
+            cat = VariantCategory::CleanHetIndel;
+        }
+
+        c.category = cat;
+        c.candvarcate_initial = cat;
         cand.lcd_var_i_to_cate = category_to_flag(cat);
         if (cat == VariantCategory::CleanHetSnp ||
             cat == VariantCategory::CleanHetIndel) {
