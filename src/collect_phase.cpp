@@ -663,7 +663,6 @@ static void apply_chunk_flip_and_merge(PhasingChunk& cur,
 // Overlap-read voting between adjacent chunks: count reads that agree vs
 // disagree on hap assignment, then flip + merge if disagreement wins.
 static bool flip_chunk_hap(PhasingChunk& pre, PhasingChunk& cur, const Options* opts) {
-    (void)opts;
     if (pre.region.tid != cur.region.tid) return false;
 
     int n_cur_ovlp_reads = 0;
@@ -717,7 +716,13 @@ static bool flip_chunk_hap(PhasingChunk& pre, PhasingChunk& cur, const Options* 
         }
     }
 
-    if (flip_hap_score == 0) return false;
+    // Abstain on weakly supported boundaries: require the net vote magnitude
+    // to strictly exceed the configured margin.  margin 0 reproduces the
+    // original behavior (merge on any non-zero score).  A boundary that
+    // abstains here is left as two separate phase blocks rather than risking a
+    // wrong merge across a discordant junction.
+    const int margin = (opts != nullptr) ? opts->stitch_min_margin : 0;
+    if (std::abs(flip_hap_score) <= margin) return false;
 
     apply_chunk_flip_and_merge(cur,
                                flip_hap_score > 0,

@@ -49,6 +49,7 @@ static void print_hybrid_help() {
         << "      --phased-vcf-out FILE     Phased VCF (GT:DP:AD:VAF:GQ:PS)\n"
         << "  -b, --out-bam FILE            Phased BAM output\n"
         << "      --pgbam-file FILE         Optional .pgbam sidecar for stitching\n"
+        << "      --stitch-min-margin INT   Min flip-vote margin to merge blocks [0]\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
         << "\n"
         << "Examples:\n"
@@ -84,6 +85,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         kRegionFileOption,
         kNoisyMaxXgapsOption,
         kRefineAlnOption,
+        kStitchMinMarginOption,
     };
 
     static struct option long_options[] = {
@@ -110,6 +112,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         {"out-bam",         required_argument, nullptr, 'b'},
         {"pgbam-file",      required_argument, nullptr, kPgbamFileOption},
         {"noisy-max-xgaps", required_argument, nullptr, kNoisyMaxXgapsOption},
+        {"stitch-min-margin", required_argument, nullptr, kStitchMinMarginOption},
         {"refine-aln",      no_argument,       nullptr, kRefineAlnOption},
         {"verbose",         required_argument, nullptr, 'V'},
         {"help",            no_argument,       nullptr, 'h'},
@@ -150,6 +153,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
                 break;
             case kPgbamFileOption:    opts.pgbam_file = optarg; break;
             case kNoisyMaxXgapsOption: opts.noisy_reg_max_xgaps = std::atoi(optarg); break;
+            case kStitchMinMarginOption: opts.stitch_min_margin = std::atoi(optarg); break;
             case kRefineAlnOption:    opts.refine_aln = true; break;
             case 'V':                 opts.verbose = std::atoi(optarg); break;
             case 'h':

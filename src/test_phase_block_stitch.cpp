@@ -146,11 +146,66 @@ static bool test_skipped_overlap_read_ignored() {
     return ok;
 }
 
+// Build two chunks joined by a single agreeing overlap read, so
+// flip_hap_score == +1.  At margin 0 they merge; at margin 1 the boundary
+// abstains (|1| <= 1) and the blocks stay separate.
+static void make_single_agree_pair(std::vector<PhasingChunk>& chunks) {
+    chunks.clear();
+    chunks.resize(2);
+    PhasingChunk& pre = chunks[0];
+    PhasingChunk& cur = chunks[1];
+    pre.region.tid = cur.region.tid = 0;
+
+    pre.reads.push_back(min_read());
+    pre.haps.push_back(1);
+    pre.phase_sets.push_back(100);
+    pre.candidates.push_back(dummy_cand(100));
+    pre.down_ovlp_read_i = {{0}};
+
+    cur.reads.push_back(min_read());
+    cur.haps.push_back(1);  // agrees with pre → score +1 (no flip)
+    cur.phase_sets.push_back(200);
+    cur.candidates.push_back(dummy_cand(200));
+    cur.up_ovlp_read_i = {{0}};
+}
+
+static bool test_margin_zero_merges_single_vote() {
+    std::printf("--- test_margin_zero_merges_single_vote ---\n");
+    std::vector<PhasingChunk> chunks;
+    make_single_agree_pair(chunks);
+
+    Options opts;
+    opts.stitch_min_margin = 0;  // default behavior
+    stitch_chunk_haps(chunks, &opts, nullptr);
+
+    bool ok = check(chunks[1].candidates[0].phase_set == 100,
+                    "single agreeing vote merges at margin 0");
+    std::printf("%s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static bool test_margin_one_abstains_single_vote() {
+    std::printf("--- test_margin_one_abstains_single_vote ---\n");
+    std::vector<PhasingChunk> chunks;
+    make_single_agree_pair(chunks);
+
+    Options opts;
+    opts.stitch_min_margin = 1;  // |score|=1 <= 1 → abstain
+    stitch_chunk_haps(chunks, &opts, nullptr);
+
+    bool ok = check(chunks[1].candidates[0].phase_set == 200,
+                    "single agreeing vote abstains at margin 1");
+    std::printf("%s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main() {
     int failures = 0;
     failures += test_cross_chunk_flip_when_haps_disagree() ? 0 : 1;
     failures += test_flip_score_zero_no_merge() ? 0 : 1;
     failures += test_skipped_overlap_read_ignored() ? 0 : 1;
+    failures += test_margin_zero_merges_single_vote() ? 0 : 1;
+    failures += test_margin_one_abstains_single_vote() ? 0 : 1;
     if (failures == 0)
         std::printf("ALL PASS\n");
     else

@@ -51,6 +51,11 @@ constexpr int kNoisyRegFlankLen = 10;
 constexpr int kLongcalldMinSvLen = 30;
 constexpr double kDefaultStrandBiasPvalOnt = 0.01;
 constexpr int kDefaultNoisyRegMaxXgaps = 5;
+// Chunk-stitch abstain margin: adjacent chunks merge only when the absolute
+// flip-vote score strictly exceeds this margin.  0 reproduces the original
+// behavior (merge on any non-zero vote).  Higher values abstain on weakly
+// supported boundaries to avoid over-merging discordant blocks.
+constexpr int kDefaultStitchMinMargin = 0;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Enumerations
@@ -133,6 +138,9 @@ struct Options {
     ReadTechnology read_technology = ReadTechnology::Hifi;
     double strand_bias_pval = kDefaultStrandBiasPvalOnt;
     int noisy_reg_max_xgaps = kDefaultNoisyRegMaxXgaps;
+    // Chunk-stitch abstain margin (see kDefaultStitchMinMargin).  Adjacent
+    // chunks merge only when |flip_hap_score| > stitch_min_margin.
+    int stitch_min_margin = kDefaultStitchMinMargin;
     // Step 4: noisy-region MSA options.
     int max_noisy_reg_len = 50000; // skip regions longer than this bp
     int max_noisy_reg_cov = 1000;  // skip regions with more overlapping reads

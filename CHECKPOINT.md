@@ -502,6 +502,64 @@ both CLEAN_HET_SNP: alleles are counted correctly.
 
 ---
 
+## Hybrid Model — Phase 3 (stitch abstain margin)
+
+Phase 3 adds an abstain rule to chunk stitching so weakly supported block
+boundaries are not merged.  This is the mitigation for the CHECKPOINT "32%
+discordant pairs" over-merge risk: a wrong merge injects a switch error, so
+when the evidence is thin it is safer to leave two blocks.
+
+### Change
+
+- `flip_chunk_hap` now merges adjacent chunks only when
+  `|flip_hap_score| > opts.stitch_min_margin`.  The previous rule
+  (`flip_hap_score == 0 → no merge`) is exactly `margin = 0`, the default.
+- `Options::stitch_min_margin` (default `kDefaultStitchMinMargin = 0`).
+- CLI flag `--stitch-min-margin INT` added to `collect-hybrid-variation`
+  **only**.  The BAM and graph commands do not expose it and keep margin 0, so
+  their behavior is unchanged.
+
+### Safety: shared code, default-preserving
+
+`flip_chunk_hap`/`stitch_chunk_haps` is shared by all pipelines.  Because the
+default margin is 0 and the abstain test reduces to the original `== 0` check,
+BAM and graph outputs are byte-identical (re-verified: 1108 / 509 candidates,
+527/446 het, same blocks/N50 as Phase 1).
+
+### chr20 margin sweep (real data)
+
+Default chunk size (500 kb) puts the whole 500 kb data slice in one chunk, so
+stitching is not exercised.  Forcing `--chunk-size 100000` (≈5 data chunks):
+
+| Margin | Blocks | N50 |
+|---|---|---|
+| 0 | 2 | 406,166 |
+| 1–2 | 2 | 406,166 |
+| 4 | 3 | 305,381 |
+| 8 | 4 | 297,133 |
+| 16 | 5 | 98,172 |
+
+Monotonic and correct: higher margin → more abstentions → more, smaller blocks.
+The boundaries here need margin ≥ 4 before any abstains, i.e. they are
+**well-supported merges**, not discordant over-merges.  At the default 500 kb
+chunk size the hybrid single 498 kb block survives margins up to 128+,
+confirming that stitch is genuine.
+
+### Tests
+
+`src/test_phase_block_stitch.cpp` gains two cases: a single agreeing overlap
+read (score +1) merges at margin 0 and abstains at margin 1.  All unit tests
+green; build has zero warnings from project code (one pre-existing abPOA
+third-party `-Wunused-function` warning is unrelated).
+
+### Open
+
+- Still pending the diplinator switch-error gate to prove abstain margins trade
+  N50 for accuracy as intended.  The margin gives a knob to *tune* that
+  trade-off once truth-based evaluation is available.
+
+---
+
 ## Lessons / Pitfalls
 
 - **pgbam sidecar causes over-stitching:** Running BAM pipeline with `--pgbam-file` merged all 49 initial phase sets into 2 chr20-spanning blocks with near-random accuracy (55%). Do not use the sidecar without understanding its signal quality.
