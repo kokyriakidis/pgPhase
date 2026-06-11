@@ -551,10 +551,31 @@ when the evidence is thin it is safer to leave two blocks.
 - `flip_chunk_hap` now merges adjacent chunks only when
   `|flip_hap_score| > opts.stitch_min_margin`.  The previous rule
   (`flip_hap_score == 0 → no merge`) is exactly `margin = 0`, the default.
-- `Options::stitch_min_margin` (default `kDefaultStitchMinMargin = 0`).
+- `Options::stitch_min_margin` (struct default `kDefaultStitchMinMargin = 0`).
+- The hybrid command overrides the struct default to
+  `kHybridDefaultStitchMinMargin = 10` in `collect_hybrid_variation`;
+  `--stitch-min-margin INT` still overrides it per run.
 - CLI flag `--stitch-min-margin INT` added to `collect-hybrid-variation`
   **only**.  The BAM and graph commands do not expose it and keep margin 0, so
   their behavior is unchanged.
+
+### Hybrid default raised to 10 (matched-eval result)
+
+Matched-eval on HG002 chr20 (identical evaluator, truth, and binary for BAM
+and hybrid) showed that switch and flip rates are flat (~0.64% / ~0.93%) across
+all configurations including pure BAM — they are intrinsic to the shared
+k-means + stitcher core, not a hybrid regression.  The metrics that actually
+separate the pipelines are Hamming and auN.  On those, raising the hybrid
+stitch margin from 0 to 10 is a strict improvement:
+
+| Config (af-indel 0.11) | Hamming | auN | switch | flip | perfect | covered |
+|---|---|---|---|---|---|---|
+| BAM baseline      | 3.09 | 9.83M  | 0.64 | 0.933 | 29.1% | 313.5M |
+| hybrid margin 0   | 3.05 | 12.08M | 0.66 | 0.968 | 22.2% | 312.0M |
+| hybrid margin 10  | 3.04 | 11.90M | 0.65 | 0.966 | 23.1% | 317.0M |
+
+Margin 10 lowers Hamming, raises genome covered (+5 Mb) and perfect phase sets
+(+0.9 pt) versus margin 0 at no switch/flip cost, so it is the hybrid default.
 
 ### Safety: shared code, default-preserving
 

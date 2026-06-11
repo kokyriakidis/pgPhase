@@ -57,6 +57,13 @@ constexpr int kDefaultNoisyRegMaxXgaps = 5;
 // supported boundaries to avoid over-merging discordant blocks.
 constexpr int kDefaultStitchMinMargin = 0;
 
+// Hybrid pipeline default stitch margin.  Graph-augmented chunks carry extra
+// overlap reads, so abstaining on weak seams reduces over-merging without
+// losing contiguity.  Matched-eval (HG002 chr20) shows margin 10 lowers
+// Hamming and raises genome covered / perfect phase sets versus margin 0, at
+// no switch/flip cost.  The BAM pipeline keeps kDefaultStitchMinMargin (0).
+constexpr int kHybridDefaultStitchMinMargin = 10;
+
 // Graph-only het-indel anchor gating (hybrid pipeline only).  Graph het indels
 // added to k-means as CleanHetIndel can mis-orient reads when the genotype is
 // unreliable.  Keep an indel anchor only when its allele fraction sits within

@@ -49,7 +49,7 @@ static void print_hybrid_help() {
         << "      --phased-vcf-out FILE     Phased VCF (GT:DP:AD:VAF:GQ:PS)\n"
         << "  -b, --out-bam FILE            Phased BAM output\n"
         << "      --pgbam-file FILE         Optional .pgbam sidecar for stitching\n"
-        << "      --stitch-min-margin INT   Min flip-vote margin to merge blocks [0]\n"
+        << "      --stitch-min-margin INT   Min flip-vote margin to merge blocks [10]\n"
         << "      --graph-indel-af-margin F Max |AF-0.5| for graph het-indel anchor [0.11]\n"
         << "      --graph-indel-min-alt INT Min alt support for graph het-indel anchor [0]\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
@@ -69,6 +69,9 @@ static void print_hybrid_help() {
 
 int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
     Options opts;
+    // Hybrid uses a non-zero stitch margin by default (see
+    // kHybridDefaultStitchMinMargin); --stitch-min-margin overrides it.
+    opts.stitch_min_margin = kHybridDefaultStitchMinMargin;
 
     enum HybridLongOption {
         kRefOption = 1000,
