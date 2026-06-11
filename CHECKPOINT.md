@@ -341,54 +341,67 @@ reference-context checks are the only applicable noise filter.
 
 ---
 
-## BAM Pipeline Parity: `propagate_overlap_read_phase_to_output_owner`
+## Overlap-Read Phase Propagation at Chunk Boundaries
 
-### Observation
+### The problem
 
-Side-by-side evaluation of pgphase BAM pipeline vs longcallD on the same input showed pgphase
-phasing ~1,300 more reads (220,377 vs 219,090) and producing 2 extra phase sets (431 vs 429).
-All other metrics (N50, auN, largest block, accuracy, switch/hamming error) were near-identical.
+The genome is tiled into overlapping chunks for parallel phasing. A long read that spans a
+chunk boundary exists as independent copies in both the upstream and downstream chunks. Each
+chunk phases its copy using its own candidates. The BAM writer emits each read from its
+**owning** (upstream) chunk only.
 
-### Root cause
+Example: chunks A (0–5 Mb) and B (4.5–10 Mb) overlap at 4.5–5 Mb. Read R starts at 4.8 Mb
+and ends at 5.2 Mb. R appears in both chunks:
 
-`propagate_overlap_read_phase_to_output_owner` (commit `f094cea`) is a pgphase-only addition
-in `stitch_chunk_haps`. After chunk-boundary stitching, it copies HP/PS from the downstream
-chunk to overlap reads that are unphased (hap=0) in the upstream (owning) chunk. LongcallD
-does not have this function.
+```
+Chunk A (owns R):  candidates at 4.0, 4.3, 4.6 Mb
+Chunk B:           candidates at 4.9, 5.1, 5.5, 5.8 Mb
+                         ▲         ▲
+                         R covers these in chunk B
+```
 
-### Why longcallD omits it
+In chunk A, R's variant profile covers the candidate at 4.6 Mb but no het sites are nearby —
+R gets hap=0 (unphased). In chunk B, R covers candidates at 4.9 and 5.1 Mb, both het SNPs —
+R gets hap=1, PS=4900000.
 
-Overlap reads exist in both adjacent chunks as independent copies. Each chunk phases its copy
-using its own candidates and phasing context. The BAM writer emits each read from its owning
-(upstream) chunk. `apply_chunk_flip_and_merge` only rewrites the **downstream** chunk's PS
-values — it never touches the upstream chunk's reads.
+After stitching, `flip_chunk_hap` uses overlap reads (including R's phased copy in B) to
+vote on whether to flip/merge chunks A and B. If the vote succeeds (flip_hap_score != 0),
+chunk B's PS is rewritten to match chunk A's PS, and hap labels are flipped if needed. Now
+R's copy in chunk B has HP/PS consistent with chunk A's phasing.
 
-When `flip_chunk_hap` merges two chunks (flip_hap_score != 0), the downstream copy's PS is
-rewritten to `max_pre_ps` (the upstream PS) and hap labels are flipped if needed. In this case,
-propagation would be correct: the downstream copy's HP/PS is now consistent with the upstream
-chunk's phasing. The upstream copy just happens to be unphased because its variant profile in
-the owning chunk had no informative candidates.
+But the BAM writer emits R from chunk A, where it is still hap=0, PS=-1. R is written
+unphased despite being successfully phased in chunk B. LongcallD has this same gap.
 
-However, when `flip_hap_score == 0` (equal agree/disagree votes), the chunks are **not merged**
-and their relative phase is unknown. `propagate_overlap_read_phase_to_output_owner` does not
-distinguish between merged and unmerged pairs — it propagates unconditionally. This is
-incorrect for unmerged pairs:
+### The original (broken) fix
 
-1. **Wrong haplotype.** The downstream hap=1 may correspond to the upstream hap=2. Propagating
-   without adjusting for the unknown relative phase can assign the read to the wrong haplotype.
+Commit `f094cea` added `propagate_overlap_read_phase_to_output_owner`, which copies HP/PS
+from the downstream chunk to unphased upstream overlap reads. This recovered ~1,300 reads
+but propagated **unconditionally** — including for unmerged pairs where `flip_hap_score == 0`.
+For unmerged pairs the relative phase between chunks is unknown, so:
 
-2. **Orphan phase sets.** The propagated PS value comes from the downstream chunk's unmerged
-   phase block. This PS doesn't correspond to any candidate in the upstream chunk, creating
-   phase sets that inflate the count without improving phasing.
+- The downstream hap=1 may correspond to the upstream hap=2 (wrong haplotype).
+- The downstream PS doesn't exist in the upstream chunk (orphan phase set).
 
-### Decision
+This caused pgphase to diverge from longcallD: +1,300 phased reads, +2 phase sets, with
+some reads potentially assigned to the wrong haplotype.
 
-Conditional propagation: `stitch_chunk_haps` now tracks which adjacent pairs were successfully
-merged by `flip_chunk_hap` (via a `pair_stitched` vector) and only calls
-`propagate_overlap_read_phase_to_output_owner` for those pairs. For merged pairs the downstream
-PS has been rewritten to `max_pre_ps` and hap labels flipped if needed, so propagation is safe.
-Unmerged pairs (flip_hap_score == 0) are skipped — no propagation, no wrong-haplotype risk.
+### The fix
 
-This recovers the ~1,300 overlap reads that longcallD leaves unphased at chunk boundaries,
-without introducing orphan phase sets or haplotype errors. Expected effect vs longcallD:
-slightly more phased reads, same phase set count, same or better accuracy.
+`stitch_chunk_haps` now tracks which adjacent pairs were successfully merged by
+`flip_chunk_hap` via a `pair_stitched` vector. Propagation only fires for merged pairs,
+where the downstream PS has been rewritten to match the upstream PS and hap labels have
+been flipped if needed. Unmerged pairs are skipped.
+
+### Evaluation (HG002 HiFi chr20)
+
+| Metric | longcallD | pgphase (unconditional) | pgphase (merged-only) |
+|---|---|---|---|
+| Phased reads | 219,090 (80.5%) | 220,377 (81.0%) | 219,925 (80.9%) |
+| Phase sets | 429 | 431 | 429 |
+| Phase block N50 | 937,648 bp | 937,121 bp | 937,648 bp |
+| Overall accuracy | 97.03% | 97.02% | 97.03% |
+| Switch error rate | 0.61% | 0.62% | 0.61% |
+| Phaseable accuracy | 98.15% | 98.14% | 98.15% |
+
+The merged-only propagation recovers 835 reads (+0.4%) over longcallD with identical phase
+set count, block structure, accuracy, and switch error rate.
