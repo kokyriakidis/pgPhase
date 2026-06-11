@@ -93,6 +93,26 @@ void backfill_graph_candidate_counts(
     PhasingChunk& chunk,
     const std::unordered_set<int>& graph_only_candidates);
 
+/// Gate graph-only candidates with the same depth/AF/het thresholds the BAM
+/// pipeline applies, now that their allele counts are final.
+///
+/// add_graph_only_candidate adds sites unclassified (flag 0) so they stay out
+/// of k-means until their support has been accumulated from BAM and graph
+/// reads.  This function runs classify_variant_initial on each graph-only
+/// candidate and assigns the matching bitmask via category_to_flag.  Only
+/// candidates passing the het band (min_depth, min_alt_depth,
+/// min_af ≤ AF ≤ max_af) become CleanHet and enter het k-means; low-depth,
+/// low-AF, homozygous, and repeat-indel sites get their non-het flags and are
+/// excluded from het phasing.
+///
+/// Call AFTER inject_graph_reads (so counts include graph read support),
+/// BEFORE apply_hybrid_noise_filter and collect_var_run_phasing.  Returns the
+/// number of candidates promoted to a clean-het flag.
+int classify_graph_only_candidates(
+    PhasingChunk& chunk,
+    const std::unordered_set<int>& graph_only_candidates,
+    const Options& opts);
+
 }  // namespace pgphase_collect
 
 #endif  // PGPHASE_HYBRID_INJECT_HPP

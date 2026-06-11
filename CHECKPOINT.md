@@ -331,6 +331,177 @@ reference-context checks are the only applicable noise filter.
 
 ---
 
+## Hybrid Model — Phase 0 Baseline (measurement harness)
+
+Phase 0 of the hybrid-model plan: build a measurement harness and establish a
+baseline for the existing `collect-hybrid-variation` command before changing it.
+
+### Deliverables
+
+- `scripts/bench_hybrid.sh` — runs hybrid mode and, with `--compare`, also the
+  BAM-only and graph-only pipelines on the same input into sibling dirs for A/B.
+  Per-pipeline BAM flag differs: graph uses `--phased-bam-out`, bam/hybrid use
+  `--out-bam`.
+- `scripts/phase_block_stats.py` — VCF-level metrics (het/hom, phased fraction,
+  block count, N50) from a phased VCF alone. No truth set needed. For
+  switch/accuracy use `evaluate_phase_accuracy.sh` (needs diplinator).
+
+### Environment note
+
+The chr20 HG002 dataset and diplinator from the original eval are **not present**
+in this environment, so the full switch/accuracy gate from the plan could not be
+reproduced here. Phase 0 instead used the checked-in `test_data/graph/` fixture
+(MICB/KIR3DL1, chr6+chr19) by reconstructing reads from the GAF `cs` tags and
+aligning them with minimap2 to produce a matched BAM+sites+GAF triple.
+
+> **Caveat:** the fixture is ultra-low-depth (~0.04× mean, 151 bp short reads),
+> not the HiFi/ONT long-read target. Numbers below validate the *harness and code
+> behavior*, not phasing quality. The real gate still requires the chr20 data.
+
+### A/B result (fixture)
+
+| Pipeline | Candidates | Phased het | Blocks | N50 |
+|---|---|---|---|---|
+| BAM-only | 1 | 1 | 1 | 0 |
+| Graph-only | 292 | 279 | 52 | 1062 |
+| Hybrid | 918 | 68 | 17 | 146 |
+
+### Findings (confirm the static analysis)
+
+- **`bridged=0` on every chunk.** No graph site matched a BAM candidate, so the
+  intended bridging never fired. Partly because BAM found ~1 candidate at this
+  depth, but it also exercises the `find_matching_candidate` sort-assumption gap.
+- **Hybrid phases *fewer* het variants (68) than graph-only (279)** despite adding
+  917 graph-only candidates. The unconditionally-`CleanHet` graph candidates
+  (no AF/depth/het gate) flood the unified k-means and degrade it rather than
+  augment it — exactly the Phase 1 hazard.
+- **Verbose stats only print when `added>0` AND a worker logs them**; counts are
+  per-chunk and the same `added=` value repeats across overlapping chunks,
+  suggesting overlap-region sites are added in both chunks (double-add).
+
+### Decision gate
+
+The intended "BAM-primary, graph-rescue" behavior is **not** what the code does
+(it co-phases and can regress below graph-only). This confirms the plan's
+direction: proceed to **Phase 1** (graph candidate quality gates) and the
+**Phase 2** BAM-frozen rescue rather than tuning the current co-phasing path.
+The chr20 switch-error gate must still be run once that data is available before
+any hybrid path is declared shippable.
+
+---
+
+## Hybrid Model — Phase 1 (graph candidate quality gates)
+
+Phase 1 hardened graph-only candidate handling so graph sites can no longer
+enter k-means as unconditional clean-het anchors.
+
+### Changes
+
+- **Deferred classification** (`add_graph_only_candidate`): graph sites are now
+  added unclassified (category `LowCoverage`, flag 0) instead of stamped
+  `CleanHet`. They stay out of k-means until gated.
+- **Quality gate** (`classify_graph_only_candidates`): after counts are final
+  (post `inject_graph_reads`), each graph-only candidate is run through the BAM
+  pipeline's `classify_variant_initial` and `category_to_flag`. Only sites
+  passing the het band (`min_depth`, `min_alt_depth`, `min_af ≤ AF ≤ max_af`)
+  become `CleanHet` and enter het k-means. `classify_variant_initial` was
+  exposed in `collect_var.hpp` for reuse (was file-static).
+- **Ordering fix** (`process_chunk_hybrid`): the indel noise filter
+  (`apply_hybrid_noise_filter`, which only acts on `CleanHetIndel`) now runs
+  *after* the gate, not before. Verbose log adds `promoted=N`.
+- **Sort-precondition fix** (`find_matching_candidate`): the bridge binary
+  search now takes an explicit `n` = original BAM candidate count and only
+  searches `candidates[0, n)`. `inject_graph_sites` asserts that range is
+  sorted, so a future ordering change fails loudly instead of silently missing
+  bridges.
+- **Unit test** `src/test_hybrid_inject.cpp` (wired into `make unit-tests`):
+  clean het promoted; homozygous, low-depth, low-alt-depth, and low-AF sites
+  excluded from the het mask. All unit tests green.
+
+### A/B result (same fixture as Phase 0)
+
+| Pipeline | Candidates | Phased het | Promoted |
+|---|---|---|---|
+| BAM-only | 1 | 1 | — |
+| Graph-only | 292 | 279 | — |
+| Hybrid (Phase 0) | 918 | 68 | (ungated) |
+| **Hybrid (Phase 1)** | 918 | **2** | **2 / 917** |
+
+### Verification
+
+- BAM-only path unchanged from Phase 0 (386 het / 182 hom / N50 194368) — no
+  regression from exposing `classify_variant_initial`.
+- `make -j` builds with zero warnings; `make unit-tests` all green.
+- Asserts are active (no `-DNDEBUG`), so the sort precondition is enforced.
+
+### Correction: the "AF=0 bug" was a synthetic-data artifact
+
+The low-depth fixture suggested hybrid allele counting was broken (graph het
+sites showing REFc=N, ALTc=0, AF=0). **This did not reproduce on real chr20
+data** (see next section) — there, the same sites show correct AF≈0.4–0.5. The
+AF=0 came from the Phase 0 read-reconstruction harness (`gaf_to_fastq.py` +
+minimap2 short-read alignment did not carry variant alleles faithfully), not
+from the hybrid pipeline. Lesson: validate hybrid behavior only on real aligned
+reads, not reconstructed ones.
+
+---
+
+## Hybrid Model — chr20 25M validation (REAL data)
+
+Real HG002 HiFi test data was added at `test_data/graph_chr20/`: a 500 kb
+chr20 slice (25,000,001–25,500,000) with a matched BAM, coordinate GAF (2,048
+reads), sites VCF (6,963 snarl sites), and N-padded ref. This is the first
+hybrid run on genuine aligned reads.
+
+> Note: `samtools index` the BAM first (`.bam.bai` is gitignored, not shipped).
+
+### Expected-output assertions (both pass with Phase 1 build)
+
+| Pipeline | Candidates | Expected |
+|---|---|---|
+| BAM-only | 1108 | 1108 ✓ |
+| Graph-only | 509 (13,490 filtered) | 509 ✓ |
+
+Phase 1 changes preserve both verified pipeline outputs exactly.
+
+### Hybrid A/B (Phase 1)
+
+| Pipeline | Phased het | Blocks | N50 | Largest block |
+|---|---|---|---|---|
+| BAM-only | 527 | 2 | 296,271 | 296,271 |
+| Graph-only | 446 | 2 | 393,964 | 393,964 |
+| **Hybrid** | **522** | **1** | **498,281** | 498,281 |
+
+Hybrid bridging works on real data: **791 sites bridged**, 13,135 graph-only
+sites added, **72 promoted** to clean-het by the gate, 1,692 BAM reads extended
+with graph observations (`reads_injected=0` — the GAF and BAM are the same HG002
+reads, so there are no graph-only reads to inject here).
+
+Result: hybrid phases nearly as many het as BAM (522 vs 527) but collapses the
+two BAM blocks into **one block with N50 498 kb** — larger than either
+standalone pipeline. This is the pangenome-bridging stitching benefit the plan
+predicted, appearing for the first time on real data.
+
+### Gate behavior on real data (sanity)
+
+Graph-only candidate categories after gating: 5,875 LOW_COV, 598 CLEAN_HOM,
+397 CLEAN_HET_SNP, 88 NOISY_HET, 76 REP_HET_INDEL, 38 NOISY_HOM,
+37 CLEAN_HET_INDEL, 32 LOW_AF. Only the clean-het sites enter het k-means; hom,
+low-cov, low-AF, and repeat sites are correctly excluded. Spot-check vs graph
+pipeline at chr20:25001841 — graph AF 0.52, hybrid AF 0.36 (REFc=7/ALTc=4),
+both CLEAN_HET_SNP: alleles are counted correctly.
+
+### Open items
+
+- The **switch-error / accuracy** gate against the diploid truth still needs
+  `diplinator` (not in this environment). The N50 gain is promising but must be
+  confirmed not to come with a switch-error regression before shipping.
+- Phase 2 (BAM-frozen rescue) is most valuable where the GAF contains reads
+  absent from the BAM; this fixture has none, so that path needs a dataset with
+  graph-only reads to exercise.
+
+---
+
 ## Lessons / Pitfalls
 
 - **pgbam sidecar causes over-stitching:** Running BAM pipeline with `--pgbam-file` merged all 49 initial phase sets into 2 chr20-spanning blocks with near-random accuracy (55%). Do not use the sidecar without understanding its signal quality.

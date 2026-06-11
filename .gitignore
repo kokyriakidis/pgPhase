@@ -5,6 +5,7 @@
 /test_graph_sites
 /test_graph_phase
 /test_graph_bam_adapter
+/test_hybrid_inject
 /dist/
 /release/
 *.tar

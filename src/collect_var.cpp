@@ -1457,12 +1457,12 @@ static void cr_add_var_to_noisy_cr(cgranges_t* var_cr,
  * @param opts Depth, AF, strand p-value, and `noisy_reg_max_xgaps`.
  * @return Initial `VariantCategory` before noisy-overlap second pass.
  */
-static VariantCategory classify_variant_initial(const VariantKey& key,
-                                                VariantCounts& counts,
-                                                const std::string& ref_slice,
-                                                hts_pos_t ref_beg,
-                                                hts_pos_t ref_end,
-                                                const Options& opts) {
+VariantCategory classify_variant_initial(const VariantKey& key,
+                                         VariantCounts& counts,
+                                         const std::string& ref_slice,
+                                         hts_pos_t ref_beg,
+                                         hts_pos_t ref_end,
+                                         const Options& opts) {
     const int depth_with_low_quality = counts.total_cov + counts.low_qual_cov;
     counts.allele_fraction =
         counts.total_cov == 0

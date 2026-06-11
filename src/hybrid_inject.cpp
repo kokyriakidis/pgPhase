@@ -4,9 +4,11 @@
 #include "hybrid_inject.hpp"
 
 #include "collect_phase.hpp"
+#include "collect_var.hpp"
 #include "noise_filter.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <unordered_set>
 
 extern "C" {
@@ -45,12 +47,19 @@ static VariantKey vcf_to_variant_key(int tid, hts_pos_t vcf_pos,
 }
 
 /// Find a BAM candidate matching a VariantKey by exact position + type + allele.
-/// Candidates must be sorted by sort_pos().
+///
+/// The binary search requires candidates[0, n) to be sorted by sort_pos().
+/// Only the original BAM candidates satisfy this (collect_var_classify sorts
+/// them); graph-only candidates are appended unsorted, so callers must pass
+/// n = original BAM candidate count to keep the search valid.
 static int find_matching_candidate(const CandidateTable& candidates,
-                                   const VariantKey& target) {
+                                   const VariantKey& target,
+                                   int n) {
+    if (n > static_cast<int>(candidates.size()))
+        n = static_cast<int>(candidates.size());
     const hts_pos_t target_sort = target.sort_pos();
     int lo = 0;
-    int hi = static_cast<int>(candidates.size()) - 1;
+    int hi = n - 1;
     while (lo <= hi) {
         const int mid = lo + (hi - lo) / 2;
         const hts_pos_t mid_sort = candidates[static_cast<size_t>(mid)].key.sort_pos();
@@ -63,7 +72,7 @@ static int find_matching_candidate(const CandidateTable& candidates,
                    candidates[static_cast<size_t>(start - 1)].key.sort_pos() == target_sort)
                 --start;
             for (int i = start;
-                 i < static_cast<int>(candidates.size()) &&
+                 i < n &&
                  candidates[static_cast<size_t>(i)].key.sort_pos() == target_sort;
                  ++i) {
                 const VariantKey& k = candidates[static_cast<size_t>(i)].key;
@@ -80,6 +89,13 @@ static int find_matching_candidate(const CandidateTable& candidates,
 }
 
 /// Add a new CandidateVariant from a graph site.
+///
+/// The candidate is added UNCLASSIFIED (category LowCoverage, flag 0) so it is
+/// excluded from k-means until its allele counts have been accumulated from
+/// BAM and graph reads.  classify_graph_only_candidates() then applies the same
+/// depth/AF/het gates the BAM pipeline uses before any graph site can become a
+/// CleanHet phasing anchor.  Stamping CleanHet here (before counts exist) let
+/// homozygous and low-support graph sites flood k-means and degrade phasing.
 static int add_graph_only_candidate(PhasingChunk& chunk,
                                     const GraphSite& site,
                                     const std::string& vcf_alt,
@@ -88,13 +104,9 @@ static int add_graph_only_candidate(PhasingChunk& chunk,
     CandidateVariant cand;
     cand.key = vcf_to_variant_key(tid, site.pos, site.ref, vcf_alt);
     cand.counts.n_uniq_alles = 2;
-    cand.counts.category = (cand.key.type == VariantType::Snp)
-                               ? VariantCategory::CleanHetSnp
-                               : VariantCategory::CleanHetIndel;
-    cand.counts.candvarcate_initial = cand.counts.category;
-    cand.lcd_var_i_to_cate = (cand.key.type == VariantType::Snp)
-                                 ? kCandCleanHetSnp
-                                 : kCandCleanHetIndel;
+    cand.counts.category = VariantCategory::LowCoverage;
+    cand.counts.candvarcate_initial = VariantCategory::LowCoverage;
+    cand.lcd_var_i_to_cate = 0;  // excluded from k-means until gated
     cand.lcd_make_variants_region_pass = true;
     chunk.candidates.push_back(std::move(cand));
     return idx;
@@ -129,6 +141,17 @@ SiteToCandidateMap inject_graph_sites(
     const int chunk_tid = chunk.region.tid;
     const int orig_count = static_cast<int>(chunk.candidates.size());
 
+    // find_matching_candidate binary-searches candidates[0, orig_count) and
+    // requires them sorted by sort_pos().  collect_var_classify guarantees
+    // this; assert it so a future change to candidate ordering fails loudly
+    // here rather than silently missing bridges.
+    assert(std::is_sorted(
+        chunk.candidates.begin(),
+        chunk.candidates.begin() + orig_count,
+        [](const CandidateVariant& a, const CandidateVariant& b) {
+            return a.key.sort_pos() < b.key.sort_pos();
+        }));
+
     for (size_t si = 0; si < graph_sites.size(); ++si) {
         const GraphSite& site = graph_sites[si];
         if (!site.eligible) continue;
@@ -146,7 +169,7 @@ SiteToCandidateMap inject_graph_sites(
                 chunk_tid, site.pos, site.ref, vcf_alt);
 
             const int match_idx = find_matching_candidate(
-                chunk.candidates, target);
+                chunk.candidates, target, orig_count);
 
             if (match_idx >= 0 && match_idx < orig_count) {
                 site_to_candidate[site_key] = match_idx;
@@ -507,6 +530,42 @@ void backfill_graph_candidate_counts(
             ++cand.counts.total_cov;
         }
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Quality gate for graph-only candidates
+// ────────────────────────────────────────────────────────────────────────────
+
+int classify_graph_only_candidates(
+        PhasingChunk& chunk,
+        const std::unordered_set<int>& graph_only_candidates,
+        const Options& opts) {
+    if (graph_only_candidates.empty()) return 0;
+
+    int promoted = 0;
+    for (int ci : graph_only_candidates) {
+        if (ci < 0 || static_cast<size_t>(ci) >= chunk.candidates.size())
+            continue;
+        CandidateVariant& cand = chunk.candidates[static_cast<size_t>(ci)];
+
+        // Reuse the BAM pipeline's depth/AF/het/hom logic now that ref/alt/
+        // total coverage are final.  classify_variant_initial sets
+        // allele_fraction and returns the category; category_to_flag then
+        // assigns the matching bitmask.  Only CleanHet{Snp,Indel} land in the
+        // het k-means mask, so LowCoverage/LowAlleleFraction/RepeatHetIndel
+        // sites are kept out of het phasing (CleanHom follows BAM behavior).
+        const VariantCategory cat = classify_variant_initial(
+            cand.key, cand.counts, chunk.ref_seq, chunk.ref_beg,
+            chunk.ref_end, opts);
+        cand.counts.category = cat;
+        cand.counts.candvarcate_initial = cat;
+        cand.lcd_var_i_to_cate = category_to_flag(cat);
+        if (cat == VariantCategory::CleanHetSnp ||
+            cat == VariantCategory::CleanHetIndel) {
+            ++promoted;
+        }
+    }
+    return promoted;
 }
 
 }  // namespace pgphase_collect

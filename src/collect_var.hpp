@@ -109,6 +109,19 @@ void populate_chunk_read_indexes(PhasingChunk& chunk);
 // noisy-region adjustments and AF→LowCov rewrites.
 void classify_chunk_candidates(PhasingChunk& chunk, const Options& opts, const bam_hdr_t* header);
 
+// First-pass category from depth, ONT strand bias, AF band, and repeat
+// context.  Sets counts.allele_fraction.  Returns the initial category
+// (CleanHetSnp/CleanHetIndel/CleanHom/LowCoverage/RepeatHetIndel/StrandBias)
+// before any noisy-overlap second pass.  Exposed for the hybrid pipeline,
+// which gates graph-only candidates with the same thresholds as the BAM
+// pipeline once their allele counts are final.
+VariantCategory classify_variant_initial(const VariantKey& key,
+                                         VariantCounts& counts,
+                                         const std::string& ref_slice,
+                                         hts_pos_t ref_beg,
+                                         hts_pos_t ref_end,
+                                         const Options& opts);
+
 // Steps 1-2: candidate discovery + classification.  Collects sites from
 // digars, counts alleles, classifies candidates, and prunes NON_VAR.
 // After this call, chunk.candidates is sorted and classified but no

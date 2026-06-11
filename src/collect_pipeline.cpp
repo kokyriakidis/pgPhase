@@ -712,7 +712,9 @@ static PhasingChunk process_chunk_hybrid(
             chunk_view, opts.min_mapq);
     }
 
-    // Phase A: add graph-only sites to candidate table.
+    // Phase A: add graph-only sites to candidate table.  Sites are added
+    // unclassified (flag 0) and only gated into k-means later, once their
+    // allele counts are final (see classify_graph_only_candidates below).
     SiteToCandidateMap site_map;
     std::unordered_set<int> graph_only_cands;
     int bridged = 0, added = 0;
@@ -720,13 +722,6 @@ static PhasingChunk process_chunk_hybrid(
         site_map = inject_graph_sites(
             chunk, chunk_view, chrom_remap, opts, &bridged, &added,
             &graph_only_cands);
-    }
-
-    // Noise filter on graph-only candidates.
-    if (!graph_only_cands.empty() && !chunk.ref_seq.empty()) {
-        apply_hybrid_noise_filter(
-            chunk, chunk.ref_seq, chunk.ref_beg, chunk.ref_end,
-            graph_only_cands, opts.noisy_reg_max_xgaps);
     }
 
     // Step 3.1: build BAM read profiles against augmented candidate table.
@@ -754,10 +749,26 @@ static PhasingChunk process_chunk_hybrid(
             chunk.ordered_read_ids.push_back(static_cast<int>(i));
     }
 
+    // Gate graph-only candidates with the BAM pipeline's depth/AF/het
+    // thresholds now that counts are final, then run the indel noise filter
+    // on the promoted CleanHetIndel candidates.  Order matters: the noise
+    // filter only acts on CleanHetIndel, so it must follow classification.
+    int promoted = 0;
+    if (!graph_only_cands.empty()) {
+        promoted = classify_graph_only_candidates(chunk, graph_only_cands, opts);
+        if (!chunk.ref_seq.empty()) {
+            apply_hybrid_noise_filter(
+                chunk, chunk.ref_seq, chunk.ref_beg, chunk.ref_end,
+                graph_only_cands, opts.noisy_reg_max_xgaps);
+        }
+    }
+
     if (opts.verbose >= 1 && (added > 0 || reads_injected > 0 || reads_extended > 0)) {
         std::fprintf(stderr,
-            "hybrid chunk %d: bridged=%d added=%d reads_injected=%d reads_extended=%d\n",
-            region.chunk_id, bridged, added, reads_injected, reads_extended);
+            "hybrid chunk %d: bridged=%d added=%d promoted=%d "
+            "reads_injected=%d reads_extended=%d\n",
+            region.chunk_id, bridged, added, promoted,
+            reads_injected, reads_extended);
     }
 
     // Steps 3.2-4: k-means + noisy-region MSA.
