@@ -908,32 +908,43 @@ binary after all fixes above.
 
 | Metric | BAM | Graph | Hybrid |
 |---|---|---|---|
+| **Completeness** | | | |
 | Input reads | 272,016 | 231,382 | 272,016 |
-| Phased reads | 219,925 (80.9%) | 216,130 (93.4%) | **220,952 (81.2%)** |
-| Phase sets | 429 | 425 | **408** |
-| Phase block N50 | 937,648 bp | 898,076 bp | **954,036 bp** |
-| Phase block auN | 9,834,195 bp | 981,035 bp | **12,086,393 bp** |
+| Phased reads | 219,925 (80.8%) | 216,130 (93.4%) | **220,734 (81.1%)** |
+| Unphased reads | 52,091 | 15,252 | 51,282 |
+| Phase sets | 429 | 425 | **419** |
+| Perfect phase sets | 136 / 429 (31.7%) | 96 / 419 (22.9%) | 106 / 411 (25.8%) |
+| **Contiguity** | | | |
+| Phase block N50 | 937,648 bp | 898,076 bp | **951,564 bp** |
+| Phase block auN | 9,834,195 bp | 981,035 bp | **11,905,552 bp** |
 | Largest block | 53,165,843 bp | 2,141,283 bp | **59,316,535 bp** |
-| **Overall accuracy** | 97.03% | 92.77% | **97.07%** |
-| Hamming error rate | 2.97% | 7.23% | **2.93%** |
+| Median block span | 867,222 bp | 870,222 bp | 869,828 bp |
+| Genome covered | 313,515,638 bp | 257,734,535 bp | **317,065,439 bp** |
+| **Accuracy** | | | |
+| Concordant reads | 213,386 | 200,481 | **214,277** |
+| Discordant reads | 6,539 | 15,631 | **6,436** |
+| Overall accuracy | 97.03% | 92.77% | **97.08%** |
+| Hamming error rate | 2.97% | 7.23% | **2.92%** |
+| Switch errors | 1,337 | 2,251 | 1,385 |
+| Flip errors | 1,812 | 3,167 | 1,892 |
+| Switchflip errors | 3,149 | 5,418 | 3,277 |
+| Switch opportunities | 219,496 | 215,693 | 220,302 |
 | Switch error rate | 0.61% | 1.04% | 0.63% |
 | Flip error rate | 0.83% | 1.47% | 0.86% |
 | Switchflip error rate | 1.43% | 2.51% | 1.49% |
-| Switch errors | 1,337 | 2,251 | 1,396 |
-| Flip errors | 1,812 | 3,167 | 1,896 |
-| Switchflip errors | 3,149 | 5,418 | 3,292 |
-| Switch opportunities | 219,496 | 215,693 | 220,530 |
-| Phaseable accuracy | 98.15% | 95.36% | **98.11%** |
-| Unphaseable accuracy | 53.63% | 54.48% | 53.75% |
-| Perfect phase sets | 136 / 429 (31.7%) | 96 / 419 (22.9%) | 99 / 401 (24.7%) |
+| **Phaseable / Unphaseable** | | | |
+| Phaseable PS (>60%) | 365 | 327 | 345 |
+| Phaseable accuracy | 98.15% | 95.36% | **98.14%** |
+| Unphaseable PS (≤60%) | 64 | 92 | 66 |
+| Unphaseable accuracy | 53.63% | 54.48% | 53.82% |
 
 ### Observations
 
-- **Hybrid accuracy matches BAM**: 97.07% vs 97.03% — the AF gate on graph het-indels
-  eliminates the accuracy regression while retaining the contiguity gains.
-- **Hybrid contiguity exceeds BAM**: auN +23% (12.1M vs 9.8M), largest block +12%
-  (59.3M vs 53.2M), 21 fewer phase sets.
-- **Hybrid phases more reads**: 220,952 (81.2%) vs 219,925 (80.9%) for BAM — +1,027 reads.
+- **Hybrid accuracy exceeds BAM**: 97.08% vs 97.03%, Hamming 2.92% vs 2.97% — the AF gate
+  and stitch margin=10 default together eliminate the accuracy regression.
+- **Hybrid contiguity exceeds BAM**: auN +21% (11.9M vs 9.8M), largest block +12%
+  (59.3M vs 53.2M), genome covered +3.5M bp more.
+- **Hybrid phases more reads**: 220,734 vs 219,925 (+809 reads).
 - **Switch/flip rates near-identical to BAM**: switch 0.63% vs 0.61%, flip 0.86% vs 0.83%.
 - **Graph**: highest read phasing rate (93.4%) but substantially lower accuracy (92.77%)
   and fragmented blocks (auN 981k). Sees fewer input reads (231k vs 272k) because the
