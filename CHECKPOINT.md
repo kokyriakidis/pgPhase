@@ -629,12 +629,67 @@ The 7141 breakdown: 1234 real calls + 5875 `LOW_COV` + 32 `LOW_AF` + 11
   (CLEAN_HOM / CLEAN_HET_SNP / NOISY_CAND_HET / REP_HET_INDEL / NOISY_CAND_HOM /
   CLEAN_HET_INDEL); no LOW_COV / LOW_AF / NON_VAR leak.
 - BAM-only (1108) and graph-only (509) outputs byte-identical (MD5 verified).
-- BAM↔hybrid site parity: of 1108 BAM sites, only 2 differ — both DEL
-  allele-encoding differences (`AA>.` vs `AA>A`, same position, both homozygous),
-  not real losses.
+- BAM↔hybrid site parity: of 1108 BAM sites, only 2 differed — both DEL
+  encoding differences (`AA>.` vs `AA>A`). These were later traced to a real
+  deletion key-collision bug and fixed (see "deletion key collision" section
+  below); parity is now 1108/1108.
 - Phased VCF / candidate VCF / phased BAM (HP+PS tags) all emit correctly.
 - `make unit-tests` all green; added a `prune_not_candidate_variants` test and
   updated the noise-filter test to assert SNPs are kept.
+
+---
+
+## Hybrid Model — deletion key collision overwrote BAM calls
+
+The 2 BAM↔hybrid site differences noted above (`AA>.` vs `AA>A`) were not a
+cosmetic encoding choice — they were a real bug: the hybrid path silently
+**overwrote a verified BAM deletion** with a graph deletion of a different
+length.
+
+### Root cause
+
+`vcf_to_variant_key` (hybrid_inject.cpp) built deletion keys by stripping only a
+**single** anchor base from the VCF REF/ALT, instead of the full shared prefix.
+For a homopolymer site like `25412767 TAA→TA` (a 1 bp deletion) it produced
+`pos=25412768, ref_len=2, alt="A"` — an internally inconsistent key claiming a
+2-base ref span while keeping a residual `alt="A"`.
+
+Two downstream consequences:
+
+1. **No bridging.** `find_matching_candidate` requires `k.alt == target.alt`.
+   BAM deletions always have `alt=""` (`variant_key_from_digar`), so a graph
+   deletion key with `alt="A"` could never match — graph deletions were always
+   added as separate candidates instead of bridging.
+2. **Silent overwrite.** `exact_comp_var_site` **ignores `alt` for deletions**
+   (it keys deletions on `pos` and `ref_len` only). The inflated `ref_len=2`
+   made the graph 1 bp deletion compare *equal* to the genuine BAM **2 bp**
+   deletion at the same locus. In `merge_chunk_candidates` the graph candidate
+   (`lcd_make_variants_region_pass=true`) overwrote the BAM call, so only the
+   graph allele survived.
+
+This is why the VCF site `TAA→TA,T` (genuinely biallelic: a 1 bp and a 2 bp
+deletion) collapsed to a single hybrid row that did not match BAM.
+
+### Fix
+
+Strip the **full** shared prefix in the deletion branch of
+`vcf_to_variant_key`, matching both the BAM path (`variant_key_from_digar`) and
+the standalone graph path (`graph_collect.cpp`): `pos = first deleted base`,
+`ref_len = deleted span`, `alt = ""`. For a single-base anchor this reduces to
+the previous behavior, so only homopolymer / repeat deletions change.
+
+Hybrid-only change; the BAM and graph pipelines do not call this function.
+
+### chr20 25M result
+
+- BAM↔hybrid parity is now **complete**: all **1108/1108** BAM calls (and all
+  **108/108** BAM deletions) are present in the hybrid output (was 1106 / 106).
+- The biallelic homopolymer sites now emit **both** deletion alleles as distinct
+  rows (e.g. `25412768 AA>.` 2 bp + `25412769 A>.` 1 bp), consistent across
+  TSV / candidate VCF / phased VCF.
+- BAM-only (1108) and graph-only (509) outputs remain byte-identical (MD5).
+- Added a `vcf_to_variant_key` unit test asserting SNP / INS / DEL normalization
+  and that 1 bp vs 2 bp homopolymer deletions encode distinct keys.
 
 ---
 

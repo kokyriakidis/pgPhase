@@ -41,6 +41,62 @@ static CandidateVariant make_graph_snp(hts_pos_t pos, int ref_cov, int alt_cov) 
 int main() {
     bool ok = true;
 
+    // ── vcf_to_variant_key: deletion / insertion normalization ───────────────
+    // Deletions must strip the full shared prefix to match the BAM convention
+    // (variant_key_from_digar): alt = "", ref_len = deleted span, pos = first
+    // deleted base.  A homopolymer deletion like TAA->TA is a 1 bp deletion and
+    // must NOT keep a residual alt base or an inflated ref_len, otherwise it
+    // collides with a genuine BAM deletion at the same locus (exact_comp_var_site
+    // ignores alt for deletions) and overwrites it during merge.
+    {
+        // SNP: G->T at pos 100.
+        VariantKey snp = vcf_to_variant_key(0, 100, "G", "T");
+        ok &= check(snp.type == VariantType::Snp && snp.pos == 100 &&
+                        snp.ref_len == 1 && snp.alt == "T",
+                    "SNP G->T maps to pos=100 ref_len=1 alt=T");
+
+        // Single-base-anchor deletion: TA->T at pos 100 is a 1 bp deletion.
+        VariantKey del1 = vcf_to_variant_key(0, 100, "TA", "T");
+        ok &= check(del1.type == VariantType::Deletion && del1.pos == 101 &&
+                        del1.ref_len == 1 && del1.alt.empty(),
+                    "DEL TA->T maps to pos=101 ref_len=1 alt=\"\"");
+
+        // Homopolymer 1 bp deletion: TAA->TA.  Old code yielded ref_len=2,
+        // alt=\"A\"; normalized form is pos=102 ref_len=1 alt=\"\".
+        VariantKey del_hp1 = vcf_to_variant_key(0, 100, "TAA", "TA");
+        ok &= check(del_hp1.type == VariantType::Deletion && del_hp1.pos == 102 &&
+                        del_hp1.ref_len == 1 && del_hp1.alt.empty(),
+                    "DEL TAA->TA normalizes to pos=102 ref_len=1 alt=\"\"");
+
+        // Homopolymer 2 bp deletion: TAA->T.  pos=101 ref_len=2 alt=\"\".
+        VariantKey del_hp2 = vcf_to_variant_key(0, 100, "TAA", "T");
+        ok &= check(del_hp2.type == VariantType::Deletion && del_hp2.pos == 101 &&
+                        del_hp2.ref_len == 2 && del_hp2.alt.empty(),
+                    "DEL TAA->T normalizes to pos=101 ref_len=2 alt=\"\"");
+
+        // The 1 bp and 2 bp homopolymer deletions must encode distinct keys so
+        // they do not alias under exact_comp_var_site (which keys deletions on
+        // pos and ref_len).
+        ok &= check(del_hp1.pos != del_hp2.pos || del_hp1.ref_len != del_hp2.ref_len,
+                    "1bp and 2bp homopolymer deletions are distinct keys");
+
+        // Single-base-anchor insertion: T->TA at pos 100 -> ref_len=0 alt=A at
+        // pos 101 (unchanged from the pre-normalization behavior).
+        VariantKey ins = vcf_to_variant_key(0, 100, "T", "TA");
+        ok &= check(ins.type == VariantType::Insertion && ins.pos == 101 &&
+                        ins.ref_len == 0 && ins.alt == "A",
+                    "INS T->TA maps to pos=101 ref_len=0 alt=A");
+
+        // Multi-base-anchor insertion: TA->TAAA at pos 100 is a 2 bp insertion
+        // after the shared "TA" run.  Full-prefix strip yields pos=102,
+        // ref_len=0, alt="AA"; the old single-base strip mis-encoded this as
+        // pos=101 ref_len=1 alt="AAA".
+        VariantKey ins_hp = vcf_to_variant_key(0, 100, "TA", "TAAA");
+        ok &= check(ins_hp.type == VariantType::Insertion && ins_hp.pos == 102 &&
+                        ins_hp.ref_len == 0 && ins_hp.alt == "AA",
+                    "INS TA->TAAA normalizes to pos=102 ref_len=0 alt=AA");
+    }
+
     // Chunk with a reference slice long enough for the candidate positions.
     PhasingChunk chunk;
     chunk.ref_beg = 1;

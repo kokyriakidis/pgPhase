@@ -19,6 +19,20 @@ namespace pgphase_collect {
 /// Maps graph site keys to candidate indices in the augmented table.
 using SiteToCandidateMap = std::unordered_map<std::string, int>;
 
+/// Convert a VCF-style (pos, ref, alt) record to a normalized VariantKey.
+///
+/// Deletions and insertions strip the full shared prefix so they use the same
+/// normalized form as the BAM path (variant_key_from_digar) and the standalone
+/// graph path (graph_collect.cpp): a deletion yields alt = "" and ref_len = the
+/// deleted span; an insertion yields ref_len = 0 and alt = the inserted bases.
+/// Matching the BAM convention lets graph deletions bridge to BAM deletions and
+/// prevents them from colliding with (and overwriting) BAM calls during the
+/// exact_comp_var_site dedup in merge_chunk_candidates, which ignores alt for
+/// deletions and would otherwise treat differing-length encodings as equal.
+VariantKey vcf_to_variant_key(int tid, hts_pos_t vcf_pos,
+                              const std::string& vcf_ref,
+                              const std::string& vcf_alt);
+
 /// Result of augmenting a BAM chunk with graph sites and reads.
 struct HybridInjectionResult {
     int sites_added = 0;        // graph-only sites added to candidate table

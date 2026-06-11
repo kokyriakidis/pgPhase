@@ -21,10 +21,10 @@ namespace pgphase_collect {
 // Internal helpers
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Convert a VCF-style (pos, ref, alt) to a VariantKey.
-static VariantKey vcf_to_variant_key(int tid, hts_pos_t vcf_pos,
-                                     const std::string& vcf_ref,
-                                     const std::string& vcf_alt) {
+// Declared in hybrid_inject.hpp.
+VariantKey vcf_to_variant_key(int tid, hts_pos_t vcf_pos,
+                              const std::string& vcf_ref,
+                              const std::string& vcf_alt) {
     VariantKey key;
     key.tid = tid;
     if (vcf_ref.size() == 1 && vcf_alt.size() == 1) {
@@ -33,15 +33,39 @@ static VariantKey vcf_to_variant_key(int tid, hts_pos_t vcf_pos,
         key.ref_len = 1;
         key.alt = vcf_alt;
     } else if (vcf_alt.size() > vcf_ref.size()) {
+        // Strip the full shared prefix, mirroring the deletion branch and the
+        // BAM convention (variant_key_from_digar: ref_len=0, alt=inserted
+        // bases).  A clean left-anchored insertion consumes the entire REF
+        // (shared == ref.size()) and yields ref_len=0; a multi-base anchor like
+        // TA->TAAA reduces to pos after the shared run, alt="A", ref_len=0.  The
+        // previous single-base strip mis-encoded such sites (pos and alt off by
+        // the extra anchor bases).  For a single-base anchor this reduces to the
+        // old result.
+        size_t shared = 0;
+        const size_t max_shared = std::min(vcf_ref.size(), vcf_alt.size());
+        while (shared < max_shared && vcf_ref[shared] == vcf_alt[shared]) ++shared;
         key.type = VariantType::Insertion;
-        key.pos = vcf_pos + 1;
-        key.ref_len = 0;
-        key.alt = vcf_alt.substr(1);
+        key.pos = vcf_pos + static_cast<hts_pos_t>(shared);
+        key.ref_len = static_cast<int>(vcf_ref.size() - shared);
+        key.alt = vcf_alt.substr(shared);
     } else {
+        // Strip the full shared prefix so deletions use the same normalized form
+        // as the BAM path (variant_key_from_digar) and the standalone graph path
+        // (graph_collect.cpp): pos = first deleted base, ref_len = deleted span,
+        // alt = "" for a pure deletion.  The previous single-base anchor strip
+        // left a residual base in alt and an inflated ref_len for homopolymer
+        // deletions (e.g. TAA->TA yielded ref_len=2, alt="A"), which (a) blocked
+        // bridging to BAM deletions in find_matching_candidate (alt never matched
+        // BAM's "") and (b) collided with the BAM deletion in
+        // merge_chunk_candidates, silently overwriting the verified BAM call.
+        // For a single-base anchor (shared == 1) this reduces to the old result.
+        size_t shared = 0;
+        const size_t max_shared = std::min(vcf_ref.size(), vcf_alt.size());
+        while (shared < max_shared && vcf_ref[shared] == vcf_alt[shared]) ++shared;
         key.type = VariantType::Deletion;
-        key.pos = vcf_pos + 1;
-        key.ref_len = static_cast<int>(vcf_ref.size()) - 1;
-        key.alt = vcf_alt.size() > 1 ? vcf_alt.substr(1) : "";
+        key.pos = vcf_pos + static_cast<hts_pos_t>(shared);
+        key.ref_len = static_cast<int>(vcf_ref.size() - shared);
+        key.alt = vcf_alt.substr(shared);
     }
     return key;
 }
