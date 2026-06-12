@@ -684,6 +684,13 @@ static bool flip_chunk_hap(PhasingChunk& pre, PhasingChunk& cur, const Options* 
     hts_pos_t max_pre_read_ps = -1;
     hts_pos_t min_cur_read_ps = INT64_MAX;
 
+    // Per-haplotype-link evidence counts.  Each overlap read maps a phased
+    // upstream hap (1 or 2) to a phased downstream hap (1 or 2).  The four
+    // link types group into two orientations:
+    //   no-flip: pre1->cur1 (n11) and pre2->cur2 (n22)
+    //   flip:    pre1->cur2 (n12) and pre2->cur1 (n21)
+    int n11 = 0, n12 = 0, n21 = 0, n22 = 0;
+
     for (size_t bi = 0; bi < n_bams; ++bi) {
         const std::vector<int>& cur_list = cur.up_ovlp_read_i[bi];
         const std::vector<int>& pre_list = pre.down_ovlp_read_i[bi];
@@ -711,21 +718,82 @@ static bool flip_chunk_hap(PhasingChunk& pre, PhasingChunk& cur, const Options* 
                 --flip_hap_score;
             else
                 ++flip_hap_score;
+            if (pre_read_hap == 1 && cur_read_hap == 1) ++n11;
+            else if (pre_read_hap == 1 && cur_read_hap == 2) ++n12;
+            else if (pre_read_hap == 2 && cur_read_hap == 1) ++n21;
+            else ++n22;
             if (max_pre_read_ps < pre_read_ps) max_pre_read_ps = pre_read_ps;
             if (min_cur_read_ps > cur_read_ps) min_cur_read_ps = cur_read_ps;
         }
     }
 
-    // Abstain on weakly supported boundaries: require the net vote magnitude
-    // to strictly exceed the configured margin.  margin 0 reproduces the
-    // original behavior (merge on any non-zero score).  A boundary that
-    // abstains here is left as two separate phase blocks rather than risking a
-    // wrong merge across a discordant junction.
     const int margin = (opts != nullptr) ? opts->stitch_min_margin : 0;
-    if (std::abs(flip_hap_score) <= margin) return false;
+    const int rule = (opts != nullptr) ? opts->stitch_rule : kStitchRuleNetMargin;
+
+    // Decide which orientation (if any) to merge under the selected rule.
+    // do_flip is only meaningful when merge == true.
+    bool merge = false;
+    bool do_flip = false;
+    switch (rule) {
+        case kStitchRuleBothStrands: {
+            // Reading A: merge only when the winning orientation has evidence on
+            // BOTH of its haplotype links.  no-flip needs n11>=1 AND n22>=1;
+            // flip needs n12>=1 AND n21>=1.  When both orientations qualify,
+            // pick the one with more net votes (ties stay unmerged).
+            const bool noflip_ok = (n11 >= 1 && n22 >= 1);
+            const bool flip_ok = (n12 >= 1 && n21 >= 1);
+            const int noflip_votes = n11 + n22;
+            const int flip_votes = n12 + n21;
+            if (noflip_ok && flip_ok) {
+                if (flip_votes > noflip_votes) { merge = true; do_flip = true; }
+                else if (noflip_votes > flip_votes) { merge = true; do_flip = false; }
+            } else if (noflip_ok) {
+                merge = true; do_flip = false;
+            } else if (flip_ok) {
+                merge = true; do_flip = true;
+            }
+            break;
+        }
+        case kStitchRuleLiteral: {
+            // Reading B: merge whenever both orientations have >=1 supporting
+            // read (>=2 reads total, at least one each way).  Diagnostic: this
+            // deliberately stitches contested seams.  Orientation follows the
+            // net vote.
+            const int noflip_votes = n11 + n22;
+            const int flip_votes = n12 + n21;
+            if (noflip_votes >= 1 && flip_votes >= 1) {
+                merge = true;
+                do_flip = flip_hap_score > 0;
+            }
+            break;
+        }
+        case kStitchRuleBothStrandsMargin: {
+            // Reading C: Reading A AND the net vote still exceeds the margin.
+            const bool noflip_ok = (n11 >= 1 && n22 >= 1);
+            const bool flip_ok = (n12 >= 1 && n21 >= 1);
+            if (std::abs(flip_hap_score) > margin) {
+                if (flip_hap_score > 0 && flip_ok) { merge = true; do_flip = true; }
+                else if (flip_hap_score < 0 && noflip_ok) { merge = true; do_flip = false; }
+            }
+            break;
+        }
+        case kStitchRuleNetMargin:
+        default: {
+            // Abstain on weakly supported boundaries: require the net vote
+            // magnitude to strictly exceed the configured margin.  margin 0
+            // reproduces the original behavior (merge on any non-zero score).
+            if (std::abs(flip_hap_score) > margin) {
+                merge = true;
+                do_flip = flip_hap_score > 0;
+            }
+            break;
+        }
+    }
+
+    if (!merge) return false;
 
     apply_chunk_flip_and_merge(cur,
-                               flip_hap_score > 0,
+                               do_flip,
                                max_pre_read_ps,
                                min_cur_read_ps);
     return true;

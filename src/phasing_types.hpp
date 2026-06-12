@@ -64,6 +64,28 @@ constexpr int kDefaultStitchMinMargin = 0;
 // no switch/flip cost.  The BAM pipeline keeps kDefaultStitchMinMargin (0).
 constexpr int kHybridDefaultStitchMinMargin = 10;
 
+// Chunk-stitch decision rule (experimental).  Selects how flip_chunk_hap
+// decides whether to merge two adjacent chunks:
+//   0 = net-margin (default): merge when |flip_votes - noflip_votes| > margin.
+//   1 = both-strands-bridged (Reading A): merge when the winning orientation
+//       has >=1 read confirming EACH of its two haplotype links (e.g. for a
+//       no-flip merge, >=1 read on pre1->cur1 AND >=1 on pre2->cur2).  Guards
+//       against merging on evidence from a single haplotype.
+//   2 = literal (Reading B): merge when >=2 reads with >=1 supporting flip and
+//       >=1 supporting no-flip (stitches on contested seams; diagnostic only).
+//   3 = both-strands + net margin (Reading C): Reading A AND the net vote still
+//       wins by more than the configured margin.
+constexpr int kStitchRuleNetMargin = 0;
+constexpr int kStitchRuleBothStrands = 1;
+constexpr int kStitchRuleLiteral = 2;
+constexpr int kStitchRuleBothStrandsMargin = 3;
+// BAM/graph pipelines default to the original net-margin rule.
+constexpr int kDefaultStitchRule = kStitchRuleNetMargin;
+// Hybrid pipeline defaults to both-strands-bridged: it improves contiguity at
+// no accuracy cost on HG002 chr20 (auN 11.91M -> 12.00M, +163 reads phased,
+// Hamming flat).  --stitch-rule overrides it.
+constexpr int kHybridDefaultStitchRule = kStitchRuleBothStrands;
+
 // Graph-only het-indel anchor gating (hybrid pipeline only).  Graph het indels
 // added to k-means as CleanHetIndel can mis-orient reads when the genotype is
 // unreliable.  Keep an indel anchor only when its allele fraction sits within
@@ -157,6 +179,8 @@ struct Options {
     // Chunk-stitch abstain margin (see kDefaultStitchMinMargin).  Adjacent
     // chunks merge only when |flip_hap_score| > stitch_min_margin.
     int stitch_min_margin = kDefaultStitchMinMargin;
+    // Chunk-stitch decision rule (see kStitchRule* constants above).
+    int stitch_rule = kDefaultStitchRule;
     // Graph-only het-indel anchor gates (hybrid pipeline).  See constants above.
     double graph_indel_af_margin = kDefaultGraphIndelAfMargin;
     int graph_indel_min_alt = kDefaultGraphIndelMinAlt;

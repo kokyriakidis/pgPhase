@@ -50,6 +50,7 @@ static void print_hybrid_help() {
         << "  -b, --out-bam FILE            Phased BAM output\n"
         << "      --pgbam-file FILE         Optional .pgbam sidecar for stitching\n"
         << "      --stitch-min-margin INT   Min flip-vote margin to merge blocks [10]\n"
+        << "      --stitch-rule INT         Stitch rule: 0=net-margin 1=both-strands 2=literal 3=both+margin [1]\n"
         << "      --graph-indel-af-margin F Max |AF-0.5| for graph het-indel anchor [0.11]\n"
         << "      --graph-indel-min-alt INT Min alt support for graph het-indel anchor [0]\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
@@ -72,6 +73,9 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
     // Hybrid uses a non-zero stitch margin by default (see
     // kHybridDefaultStitchMinMargin); --stitch-min-margin overrides it.
     opts.stitch_min_margin = kHybridDefaultStitchMinMargin;
+    // Hybrid defaults to the both-strands-bridged stitch rule (see
+    // kHybridDefaultStitchRule); --stitch-rule overrides it.
+    opts.stitch_rule = kHybridDefaultStitchRule;
 
     enum HybridLongOption {
         kRefOption = 1000,
@@ -91,6 +95,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         kNoisyMaxXgapsOption,
         kRefineAlnOption,
         kStitchMinMarginOption,
+        kStitchRuleOption,
         kGraphIndelAfMarginOption,
         kGraphIndelMinAltOption,
     };
@@ -120,6 +125,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         {"pgbam-file",      required_argument, nullptr, kPgbamFileOption},
         {"noisy-max-xgaps", required_argument, nullptr, kNoisyMaxXgapsOption},
         {"stitch-min-margin", required_argument, nullptr, kStitchMinMarginOption},
+        {"stitch-rule", required_argument, nullptr, kStitchRuleOption},
         {"graph-indel-af-margin", required_argument, nullptr, kGraphIndelAfMarginOption},
         {"graph-indel-min-alt", required_argument, nullptr, kGraphIndelMinAltOption},
         {"refine-aln",      no_argument,       nullptr, kRefineAlnOption},
@@ -163,6 +169,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
             case kPgbamFileOption:    opts.pgbam_file = optarg; break;
             case kNoisyMaxXgapsOption: opts.noisy_reg_max_xgaps = std::atoi(optarg); break;
             case kStitchMinMarginOption: opts.stitch_min_margin = std::atoi(optarg); break;
+            case kStitchRuleOption: opts.stitch_rule = std::atoi(optarg); break;
             case kGraphIndelAfMarginOption: opts.graph_indel_af_margin = std::atof(optarg); break;
             case kGraphIndelMinAltOption: opts.graph_indel_min_alt = std::atoi(optarg); break;
             case kRefineAlnOption:    opts.refine_aln = true; break;

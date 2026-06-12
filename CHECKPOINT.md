@@ -1010,3 +1010,98 @@ The 0.11 gate **Pareto-beats BAM on every axis**: lower Hamming (−0.038pp,
 ~830 reads), +23% auN, +11% largest block, +1,027 phased reads. Sweep was
 non-monotone with a clear optimum at 0.11 (0.12 already crosses back above BAM
 accuracy), confirming a genuine edge rather than a tuning endpoint.
+
+---
+
+## Chunk-Stitch Rule: both-strands-bridged (hybrid default)
+
+### Problem
+
+The genome is phased in 500 kb chunks, then adjacent chunks are stitched by an
+overlap-read vote in `flip_chunk_hap` (`collect_phase.cpp`). The original rule
+merges when the net flip-vote magnitude exceeds `stitch_min_margin`. The net
+margin conflates two very different seams: "1 clean read, 0 conflicts" and
+"11 reads splitting 6-vs-5" both yield margin 1. Raising the margin to abstain
+on the coin-flip case also abstains on the clean low-coverage case, leaving
+blocks unmerged that could have been joined safely.
+
+### Rules tested
+
+`--stitch-rule` selects the decision (named constants in `phasing_types.hpp`):
+
+- **0 net-margin** — original: merge when `|flip − noflip| > margin`.
+- **1 both-strands-bridged (Reading A)** — merge only when the winning
+  orientation has ≥1 read on *each* of its two haplotype links (no-flip needs
+  `pre1→cur1` AND `pre2→cur2`; flip needs `pre1→cur2` AND `pre2→cur1`). Guards
+  against merging on evidence from a single haplotype.
+- **2 literal (Reading B)** — merge when both orientations have ≥1 read
+  (stitches contested seams; diagnostic only).
+- **3 both-strands + margin (Reading C)** — Reading A AND net vote > margin.
+
+### Result (chr20, af0.11, full-chromosome truth eval)
+
+| rule | Hamming hq0 | Hamming hq10 | auN | phased | blocks/chrom |
+|---|---|---|---|---|---|
+| 0 net-margin (control) | 3.0401 | 1.8550 | 11.91M | 220,734 | 411 |
+| **1 both-strands (default)** | 3.0415 | 1.8541 | **12.00M** | **220,897** | **404** |
+| 2 literal | 2.6530 | 1.4490 | 10.66M | 220,340 | 488 |
+| 3 both-strands + m2 | 3.0385 | 1.8539 | 11.97M | 220,853 | 407 |
+
+**Rule 1 improves contiguity at no accuracy cost**: auN +0.8%, +163 reads
+phased, blocks/chrom 411 → 404, Hamming flat (hq0 +0.001, hq10 −0.001),
+switch/flip unchanged. The control (rule 0) reproduced the baseline exactly,
+confirming the refactor is behavior-preserving.
+
+**Rule 2's apparent Hamming win is an artifact**, not an improvement: it only
+merges contested seams and refuses clean unanimous ones, so blocks/chrom jumps
+to 488 (genome fragmented into more, smaller blocks). Hamming is measured
+within-block, so shorter blocks mechanically score lower while auN drops to
+10.66M and 394 reads are lost. Diagnostic only.
+
+### Decision
+
+Rule 1 is the **hybrid default** (`kHybridDefaultStitchRule`), set in
+`hybrid_collect.cpp` alongside the stitch-margin default. BAM/graph pipelines
+keep rule 0. `--stitch-rule` overrides. This is the only lever found that adds
+contiguity for free — every other lever (below) traded accuracy or auN away.
+
+---
+
+## Rejected graph-native levers (kept for the record)
+
+Two graph-specific anchor-quality gates were prototyped and evaluated against
+the shipped config (af0.11 + margin10), then **dropped** — neither helped on
+HiFi without a worse cost elsewhere. Documented here so they are not re-tried.
+
+### Graph read-divergence gate (`--graph-max-dv`)
+
+The GAF carries a per-alignment divergence tag `dv:f` (the graph analog of the
+BAM pipeline's XID/noisy-read filter, which the graph path lacks). Idea: drop a
+read's allele votes when `dv` is high, before allele-fraction aggregation, so
+noisy reads can't skew a site's AF off-center and trip the indel gate.
+
+Result: at dv=0.005 it gave a marginal hq0 Hamming improvement (3.040 → 3.029)
+but flat hq10 (1.855 → 1.854) and slightly lower auN/reads. The effect is tiny
+because **HiFi reads are too accurate** — only 1.4% have dv>0.01, 0.26% >0.05
+(median 0.0002, p99 0.0167). The filter is correct (extreme dv collapsed
+candidate counts; dv=1.0 reproduced the baseline byte-for-byte) but there is
+almost no noise to remove on HiFi. **Expected to matter on ONT**, where the
+divergence tail is large. Not shipped.
+
+### Graph SNP AF-window gate (`--graph-snp-af-margin`)
+
+Mirrors the indel AF gate for graph het SNPs (default 0.5 = admit all). A 2×2
+matched eval (af0.11, margin10):
+
+| config | Hamming hq0 | Hamming hq10 | auN |
+|---|---|---|---|
+| neither (shipped) | 3.040 | 1.855 | 11.91M |
+| dv-only (0.005) | 3.029 | 1.854 | 11.86M |
+| sam-only (0.10) | 2.986 | 1.800 | 9.59M |
+| both | 2.975 | 1.799 | 9.57M |
+
+sam=0.10 drives the Hamming win but **collapses auN to 9.59M, below the BAM
+baseline (9.83M)** — the same accuracy/contiguity trap as a too-wide indel
+gate. Filtering off-center SNP anchors removes the long-range bridges that give
+the graph its contiguity edge. Not shipped; default-off (admit all) remains
+Pareto-best for SNPs.

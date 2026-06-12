@@ -46,6 +46,7 @@ coverage/
 /test_data/HG002_chr20*
 /test_data/chm13v2.0*
 /test_data/chr20_quick/
+/test_data/chr20_eval/
 /test_data/deepVariantTest/
 /test_data/full_chr20_post_stitch_prop/
 
