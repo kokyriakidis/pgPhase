@@ -1100,6 +1100,48 @@ The standing conclusion holds: the residual seam errors are confident and
 upstream of the stitch decision — no reweighting or thresholding of the
 overlap vote separates them from correct merges.
 
+### BAM-CIGAR-only AF gate on graph indel anchors (rejected)
+
+Since stitch-side fixes all failed, this attacked the genotype at its source.
+The standard graph het-indel AF window uses **mixed BAM+GAF counts**: GAF
+graph-read alt support can make an indel look het that BAM CIGAR evidence alone
+shows as homozygous or thin-alt. The gate (`--graph-indel-bam-af-gate`)
+snapshots BAM-CIGAR-only allele counts *before* `inject_graph_reads` adds GAF
+observations, and admits a het-indel anchor only if its BAM-only AF is also
+within the margin of 0.5 (for candidates with ≥ min-depth BAM reads). It reuses
+the trusted BAM-CIGAR genotyping the BAM pipeline already does, upstream of
+k-means.
+
+Full chr20 sweep (diplinator truth eval; gate-off control byte-identical to HEAD):
+
+| config | Hamming% | auN | N50 | phased | switchflip% | perfPS | anchors |
+|---|---|---|---|---|---|---|---|
+| off (shipped) | **3.0415** | 12.00M | 951,564 | 220,897 | 1.6206 | 91 | 134,616 |
+| gate depth=3 | 3.2110 | 11.93M | 947,575 | 220,765 | 1.5790 | 99 | 128,830 |
+| gate depth=5 | 3.2110 | 11.93M | 947,575 | 220,765 | 1.5790 | 99 | 128,910 |
+| gate depth=8 | 3.2110 | 11.93M | 947,575 | 220,765 | 1.5790 | 99 | 128,987 |
+
+**Net loss.** The gate is *not* timid — it removes ~5,700 graph indel anchors
+(many graph indels genuinely have BAM-CIGAR AF inconsistent with their mixed
+het call) and the depth knob barely changes the eval. Switchflip drops (1.62 →
+1.58) and perfect-PS rises sharply (91 → 99), so it *does* remove
+mis-genotyped, seam-mis-orienting anchors. But read-level **Hamming rises 3.04
+→ 3.21%** and auN drops 62 kb: the removed anchors were, on net, contributing
+more correct read assignments than wrong orientations. Even the trusted
+BAM-CIGAR caller cannot separate the good from the bad — the indels it
+disagrees with are still net-positive for phasing.
+
+**Fourth confirmation of the same result.** Margin sweeps, the linkage gate,
+confidence weighting, and now source-level BAM re-genotyping all fail
+identically: any operation that *removes or down-weights* the suspect anchors
+trades a real read-assignment/contiguity loss for a switchflip/perfect-PS gain
+that does not net out. The mis-oriented seams and the contiguity-providing
+bridges are the **same population** of off-center/GAF-supported indels; no
+1-D signal (AF, LD, confidence, BAM-AF) separates them. Reverted from code;
+kept here so it is not re-tried. If there is a win left it requires *correcting*
+an anchor's orientation rather than *dropping* it — a fundamentally harder change
+than any gate.
+
 ---
 
 ## Rejected graph-native levers (kept for the record)
