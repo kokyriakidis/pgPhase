@@ -1065,6 +1065,41 @@ Rule 1 is the **hybrid default** (`kHybridDefaultStitchRule`), set in
 keep rule 0. `--stitch-rule` overrides. This is the only lever found that adds
 contiguity for free — every other lever (below) traded accuracy or auN away.
 
+### Rule 4 confidence-weighted stitch (rejected)
+
+The seam-merge regression traces to a minority of *confident-wrong* merges —
+boundaries where the overlap vote is lopsided the wrong way (the margin sweep
+0→8 barely moved Hamming, so the bad votes are not thin-margin). Hypothesis: a
+cluster of reads all phased off one weak anchor casts many votes that are
+really one piece of evidence; weighting each overlap read's vote by its k-means
+assignment confidence `max(0,(agree−conflict)/(agree+conflict))` (from the
+persisted clean-het SNP tallies, using `min(conf_pre,conf_cur)` per read) would
+shrink such a seam's effective strand weight below threshold and abstain. Added
+as `--stitch-rule 4` + `--stitch-min-strand-weight` (both-strands structure on
+weighted sums).
+
+Full chr20 sweep (diplinator truth eval; rule-1 control byte-identical to HEAD):
+
+| config | Hamming% | auN | N50 | phased | perfect PS |
+|---|---|---|---|---|---|
+| rule 1 (shipped) | 3.0415 | 12.00M | 951,564 | 220,897 | 91 |
+| rule 4 w≤1.0 | 3.0415 | 12.00M | 951,564 | 220,897 | 91 |
+| rule 4 w=1.5–2.0 | 3.0416 | 12.00M | 951,564 | 220,861 | 92 |
+| rule 4 w=3.0 | 3.0396 | 11.93M | 947,261 | 220,776 | 94 |
+| rule 4 w=5.0 | 3.0405 | 11.87M | 947,261 | 220,678 | 96 |
+
+**No-op at low weight, net loss at high weight.** At w≤1.0 the output is
+byte-identical to rule 1: the bridging reads are *confidently* phased
+(conf≈1.0), so weighting by confidence equals counting — confirming the
+confident-wrong merges are not driven by weakly-assigned reads. Only at w≥3.0
+does the gate bite, and then it shows the same accuracy/contiguity trap as every
+other lever: a tiny Hamming gain (−0.0019) for real contiguity loss (auN −63 to
+−127 kb, N50 951k→947k, −121 to −219 reads). Perfect-PS rises (91→96) but
+overall it is not a win. Reverted from code; kept here so it is not re-tried.
+The standing conclusion holds: the residual seam errors are confident and
+upstream of the stitch decision — no reweighting or thresholding of the
+overlap vote separates them from correct merges.
+
 ---
 
 ## Rejected graph-native levers (kept for the record)
@@ -1105,3 +1140,44 @@ baseline (9.83M)** — the same accuracy/contiguity trap as a too-wide indel
 gate. Filtering off-center SNP anchors removes the long-range bridges that give
 the graph its contiguity edge. Not shipped; default-off (admit all) remains
 Pareto-best for SNPs.
+
+### Graph anchor BAM-linkage gate (`--graph-anchor-min-concordance`)
+
+The block-merge regression was localized to graph-only het-indel anchors that
+mis-orient a seam (see "Graph Het-Indel AF Gate"). The AF window (0.11) is a
+1-D proxy for "is this anchor's genotype reliable." This lever tried to replace
+the proxy with a **direct** signal: a real graph het indel co-segregates with
+neighboring confident BAM het SNPs on the reads spanning both (same physical
+molecules), so per-anchor linkage concordance against BAM SNPs should separate
+reliable bridges from mis-genotyped anchors better than AF alone. The gate runs
+before k-means (so it uses `read_var_profile` linkage, not post-k-means
+haplotype labels), computing each indel's best phase-agnostic 2×2 concordance
+(`max(n00+n11, n01+n10)/total`) over BAM het SNP partners sharing ≥4 informative
+reads, and demoting anchors below the threshold to LowCoverage.
+
+Full chr20 sweep (diplinator truth eval; control byte-identical to HEAD and
+reproduces the shipped hybrid row exactly):
+
+| threshold | Hamming% | auN | N50 | phased | switchflip% | perfect PS |
+|---|---|---|---|---|---|---|
+| off (shipped) | **3.0415** | 12.00M | 951,564 | 220,897 | 1.6206 | 91 |
+| 0.6 | 3.1869 | 12.00M | 951,564 | 220,828 | 1.6034 | 93 |
+| 0.7 | 3.1657 | 12.03M | 954,036 | 220,794 | 1.5905 | 94 |
+| 0.8 | 3.1410 | 12.00M | 951,564 | 220,714 | 1.5725 | 95 |
+| 0.9 | 3.1485 | 11.97M | 951,564 | 220,692 | 1.5722 | 95 |
+
+**Net loss at every threshold**: Hamming rises 3.04 → 3.14–3.19% while auN stays
+flat. The signal *does* work in the intended direction — switchflip rate drops
+monotonically (1.62 → 1.57) and perfect-PS count rises (91 → 95), so the gate
+removes some genuinely mis-oriented seam anchors. But overall read-level Hamming
+*rises*: the demoted anchors were, on balance, contributing more correct read
+assignments than wrong orientations. Linkage concordance flags real
+mis-genotypes **and** good-but-low-LD anchors indiscriminately — the same
+all-or-nothing trap the AF window was tuned to 0.11 to avoid. It is not a
+cleaner separator than AF; it is a noisier one. This is consistent with the
+earlier finding that the wrong merges are **confident, not thin-margin**: a
+filter cannot distinguish a confidently-wrong anchor from a confidently-right
+one when both show strong LD with their neighbors. Reverted from code (default
+0.0 reproduced the baseline byte-for-byte); kept here so it is not re-tried.
+Possibly worth revisiting on ONT, where genotyping noise is larger and the
+good/bad anchor populations may separate more cleanly.
