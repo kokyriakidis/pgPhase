@@ -242,12 +242,43 @@ void apply_graph_noise_filter(GraphChunkBuildResult& result,
         const GraphSiteMeta& meta = result.site_meta[ci];
         if (meta.alts.empty()) continue;
 
-        // Use the first alt allele (biallelic pairs have exactly one).
-        const std::string& vcf_ref = meta.ref;
-        const std::string& vcf_alt = meta.alts[0];
-
-        if (is_noisy_site(meta.pos, vcf_ref, vcf_alt, ref_seq, ref_beg, ref_end,
-                          lc, max_xgaps)) {
+        // Check every alt allele of the (possibly multiallelic) site. A het indel
+        // sitting in a homopolymer / STR context is noise regardless of which alt
+        // is eventually phased, so demote the site if ANY alt is noisy.
+        //
+        // Graph alleles are not minimal: a small indel inside a repeat is emitted
+        // with the full repeat run on both sides (e.g. CAAAAAAAAAAA > CAAAAAAAA for a
+        // 3 bp deletion). is_noisy_site derives the indel length from the allele
+        // sizes, so without trimming the length exceeds max_xgaps and the
+        // homopolymer/repeat scan is skipped. Trim each allele pair to its minimal
+        // VCF representation first.
+        bool noisy = false;
+        for (const std::string& raw_alt : meta.alts) {
+            std::string vcf_ref = meta.ref;
+            std::string vcf_alt = raw_alt;
+            hts_pos_t vcf_pos = meta.pos;
+            while (vcf_ref.size() > 1 && vcf_alt.size() > 1 &&
+                   vcf_ref.back() == vcf_alt.back()) {
+                vcf_ref.pop_back();
+                vcf_alt.pop_back();
+            }
+            size_t pfx = 0;
+            while (pfx + 1 < vcf_ref.size() && pfx + 1 < vcf_alt.size() &&
+                   vcf_ref[pfx] == vcf_alt[pfx]) {
+                ++pfx;
+            }
+            if (pfx > 0) {
+                vcf_ref.erase(0, pfx);
+                vcf_alt.erase(0, pfx);
+                vcf_pos += static_cast<hts_pos_t>(pfx);
+            }
+            if (is_noisy_site(vcf_pos, vcf_ref, vcf_alt, ref_seq, ref_beg, ref_end,
+                              lc, max_xgaps)) {
+                noisy = true;
+                break;
+            }
+        }
+        if (noisy) {
             cand.counts.category = VariantCategory::RepeatHetIndel;
             cand.counts.candvarcate_initial = VariantCategory::RepeatHetIndel;
             cand.lcd_var_i_to_cate = kLongcalldRepHetVar;

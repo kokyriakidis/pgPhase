@@ -143,8 +143,14 @@ static CandidateTable graph_chunks_to_candidate_table(
                 cand.counts.ref_cov = ref_cov;
                 cand.counts.alt_cov = alt_cov;
                 cand.counts.total_cov = total_cov;
-                cand.counts.forward_ref = ref_cov;
-                cand.counts.forward_alt = alt_cov;
+                // Preserve the strand split computed during biallelic decomposition
+                // (graph_bam_adapter.cpp). Candidates are biallelic here, so the
+                // chunk candidate's forward/reverse fields already correspond to
+                // this ref/alt pair; copying them keeps REVERSE counts non-zero.
+                cand.counts.forward_ref = mcand.counts.forward_ref;
+                cand.counts.reverse_ref = mcand.counts.reverse_ref;
+                cand.counts.forward_alt = mcand.counts.forward_alt;
+                cand.counts.reverse_alt = mcand.counts.reverse_alt;
                 cand.counts.allele_fraction =
                     total_cov > 0 ? static_cast<double>(alt_cov) / total_cov : 0.0;
                 cand.counts.n_uniq_alles = 2;
@@ -168,6 +174,15 @@ static CandidateTable graph_chunks_to_candidate_table(
                     cand.counts.category = VariantCategory::CleanHetSnp;
                     cand.counts.candvarcate_initial = VariantCategory::CleanHetSnp;
                     cand.lcd_var_i_to_cate = kCandCleanHetSnp;
+                } else if (mcand.counts.category == VariantCategory::RepeatHetIndel) {
+                    // Preserve the noise-filter demotion (apply_graph_noise_filter).
+                    // Re-classifying from scratch would re-promote homopolymer/STR
+                    // indels to CleanHetIndel, letting them pass the germline output
+                    // gate as phased het indels even though they were excluded from
+                    // k-means (hence never properly phased).
+                    cand.counts.category = VariantCategory::RepeatHetIndel;
+                    cand.counts.candvarcate_initial = VariantCategory::RepeatHetIndel;
+                    cand.lcd_var_i_to_cate = kLongcalldRepHetVar;
                 } else {
                     cand.counts.category = VariantCategory::CleanHetIndel;
                     cand.counts.candvarcate_initial = VariantCategory::CleanHetIndel;

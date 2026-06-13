@@ -99,13 +99,17 @@ bool is_homopolymer_indel(
     } else if (kind == VarKind::Insertion) {
         const int alt_len = static_cast<int>(alt.size()) - 1; // VCF: first base is anchor
         if (alt_len > max_xgaps) return false;
-        start_pos = pos - 1;
-        end_pos = pos;
+        // VCF anchor base sits at `pos`; inserted bases sit between pos and pos+1.
+        // The flanking repeat context begins downstream at pos+1 and upstream at pos.
+        start_pos = pos;
+        end_pos = pos + 1;
     } else { // Deletion
         const int del_len = static_cast<int>(ref.size()) - 1; // VCF: first base is anchor
         if (del_len > max_xgaps) return false;
-        start_pos = pos + del_len;
-        end_pos = pos;
+        // VCF anchor base sits at `pos`; deleted bases span pos+1..pos+del_len.
+        // Downstream context resumes after the deletion; upstream context is the anchor.
+        start_pos = pos;
+        end_pos = pos + del_len + 1;
     }
 
     constexpr int max_unit_len = 6;
@@ -164,13 +168,17 @@ bool is_repeat_indel(
 
     const VarKind kind = classify_variant(ref, alt);
 
+    // VCF anchor base sits at `pos`; indel content begins at pos+1. The flanking
+    // tandem-repeat context therefore starts one base past the anchor.
+    const hts_pos_t content_pos = pos + 1;
+
     if (kind == VarKind::Deletion) {
         const int del_len = static_cast<int>(ref.size()) - 1; // VCF anchor base
         if (del_len <= 0 || del_len > max_xgaps) return false;
         const int len = del_len * 3;
-        if (pos < ref_beg || pos + del_len + len > ref_end) return false;
-        const size_t off  = static_cast<size_t>(pos - ref_beg);
-        const size_t off2 = static_cast<size_t>(pos + del_len - ref_beg);
+        if (content_pos < ref_beg || content_pos + del_len + len > ref_end) return false;
+        const size_t off  = static_cast<size_t>(content_pos - ref_beg);
+        const size_t off2 = static_cast<size_t>(content_pos + del_len - ref_beg);
         if (off + static_cast<size_t>(len) > ref_seq.size() ||
             off2 + static_cast<size_t>(len) > ref_seq.size()) return false;
         return std::memcmp(ref_seq.data() + off,
@@ -182,18 +190,19 @@ bool is_repeat_indel(
         const int ins_len = static_cast<int>(alt.size()) - 1; // VCF anchor base
         if (ins_len <= 0 || ins_len > max_xgaps) return false;
         const int len = ins_len * 3;
-        if (pos < ref_beg || pos + len > ref_end) return false;
-        const size_t off = static_cast<size_t>(pos - ref_beg);
+        if (content_pos < ref_beg || content_pos + len > ref_end) return false;
+        const size_t off = static_cast<size_t>(content_pos - ref_beg);
         if (off + static_cast<size_t>(len) > ref_seq.size()) return false;
-        std::string ref_b = ref_seq.substr(off, static_cast<size_t>(len));
-        std::string alt_b = ref_b;
-        // Fill with the inserted motif (skip VCF anchor base).
+        // Compare nt4-encoded so soft-masked (lowercase) reference still matches.
         const std::string ins_seq = alt.substr(1);
-        for (int j = 0; j < ins_len; ++j)
-            alt_b[static_cast<size_t>(j)] = ins_seq[static_cast<size_t>(j)];
-        for (int j = ins_len; j < len; ++j)
-            alt_b[static_cast<size_t>(j)] = alt_b[static_cast<size_t>(j - ins_len)];
-        return ref_b == alt_b;
+        for (int j = 0; j < len; ++j) {
+            const int ref_base = ref_nt4_at(ref_seq, ref_beg, content_pos + j);
+            const int alt_base = (j < ins_len)
+                ? nt4_from_char(ins_seq[static_cast<size_t>(j)])
+                : ref_nt4_at(ref_seq, ref_beg, content_pos + (j - ins_len));
+            if (ref_base != alt_base) return false;
+        }
+        return true;
     }
 
     return false; // SNPs are not repeat indels.
