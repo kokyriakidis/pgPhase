@@ -964,6 +964,42 @@ anchoring, nt4 insertion compare, non-minimal graph-allele trimming).
 > anchoring fix, but non-minimal graph-only het indels in repeats may not be
 > demoted in hybrid. Not pursued because hybrid accuracy is BAM-dominated and flat;
 > revisit if graph-only candidates are shown to drive hybrid errors.
+
+### Post-fix error decomposition: is graph's accuracy transferable to hybrid? (NO)
+
+`split_marginal.py` on the post-fix hybrid per-read results, splitting discordant
+reads by origin (graph-influenced = phased by hybrid but NOT by standalone BAM;
+bam-shared = phased by both):
+
+| Read subset | Reads | Discordant | Hamming |
+|---|---:|---:|---:|
+| graph-influenced (marginal) | 1,704 | 284 | **16.67%** |
+| bam-shared | 219,004 | 6,815 | 3.11% |
+| ALL hybrid-phased | 220,708 | 7,099 | 3.22% |
+
+Two conclusions for the "lower Hamming/switch" goal:
+
+- **96% of hybrid errors are in the BAM core** (6,815 / 7,099). The BAM-shared
+  Hamming (3.11%) is identical to standalone BAM (3.09%) — hybrid is BAM plus a
+  thin graph layer, not a dilution of graph accuracy. Removing every
+  graph-influenced error would drop hybrid Hamming only 3.22% → 3.11%, still above
+  BAM. So tightening the hybrid noise filter (the trimming caveat above) cannot
+  close the gap to graph; confirmed, not estimated.
+- **Graph's 0.80% Hamming is a denominator effect, not per-read superiority.** The
+  same graph-marginal reads error at **16.67%** when added to hybrid — the
+  opposite of low. Graph's headline accuracy comes from phasing a smaller, easier
+  read population (231k vs 272k input, minus 17.5k demoted noisy indels), not from
+  graph candidates being individually more accurate. This matches the established
+  root cause: **GAF reads are a strict subset of BAM reads (271,930 ⊂ 272,016,
+  0 unique)** — the graph carries no read evidence independent of BAM, only ~3,541
+  extra easy sites. You cannot obtain graph's low Hamming at BAM's coverage by
+  blending; the low Hamming is inseparable from phasing fewer, easier reads.
+
+**Net answer:** graph wins the Hamming/switch *metric* (0.80% / 0.18% vs BAM 3.09%
+/ 0.63%) but only by attempting an easier subset. No blend recovers it at BAM
+coverage. Per the rejected-lever ledger, the only path to beating BAM on shared
+reads is **data BAM lacks** (trio/parental reads or a second orthogonal
+technology), not reprocessing the graph alignment of the same reads.
 - **Hybrid phases more reads**: 220,897 vs 219,925 (+972 reads).
 - **BAM edges hybrid on two secondary metrics**: switchflip 1.57% vs 1.62% and perfect
   PS 125 vs 91 — the cost of hybrid's more aggressive (contiguity-gaining) merging.
