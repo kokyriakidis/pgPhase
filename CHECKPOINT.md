@@ -937,6 +937,72 @@ restores the old behaviour). See "Hybrid step-4 re-orientation" below.
 | Switch error rate | 0.63% | 0.18% | 0.63% | **0.15%** |
 | Switchflip error rate | 1.57% | 0.60% | 1.60% | **0.60%** |
 
+### Latest verified run (commit `c36026e`, full metrics + timings)
+
+Re-run of all three pipelines after the snarl-duplicate dedup (`d3ac898`), the
+CLI arg-parse crash fix (`49e4a49`), and the `--exclude-bed` revert (`c36026e`).
+HG002 HiFi chr20 → CHM13, diplinator truth, `--min-reads 5`, 8 threads. Runtime
+is wall-clock for the collect+phase run (excludes eval and BAM index/sort).
+
+**Accuracy & errors**
+
+| Metric | BAM | Graph | **Hybrid** |
+|---|---|---|---|
+| **Runtime** | 98 s | **53 s** | 326 s |
+| Accuracy | 96.909% | 99.210% | **99.232%** |
+| Hamming | 3.091% | 0.790% | **0.768%** |
+| Switch errors | 1,393 | 364 | **291** |
+| Flip errors | 2,052 | 856 | 906 |
+| Switchflip | 3,445 | 1,220 | **1,197** |
+| Switch rate | 0.635% | 0.179% | **0.137%** |
+| Switchflip rate | 1.570% | 0.600% | **0.565%** |
+| Switch opportunities | 219,496 | 203,357 | 211,900 |
+| Concordant reads | 213,127 | 202,110 | 210,610 |
+| Discordant reads | 6,798 | 1,610 | 1,630 |
+
+**Yield & phase blocks**
+
+| Metric | BAM | Graph | **Hybrid** |
+|---|---|---|---|
+| Total input reads | 272,016 | 231,382 | 272,016 |
+| Phased reads | 219,925 | 203,734 | 212,259 |
+| Fraction phased | 80.85% | **88.05%** | 78.03% |
+| Reads evaluated | 219,925 | 203,720 | 212,240 |
+| Phase sets (eval) | 429 | 363 | 340 |
+| Perfect PS | 125 | **142** | 115 |
+| Perfect PS % | 29.14% | **39.12%** | 33.82% |
+| Candidates | 120,124 | 73,627 | 134,646 |
+| Block N50 (bp) | 937,648 | 917,581 | **993,831** |
+| Block auN (bp) | 9,834,145 | 989,984 | 7,153,008 |
+| Block median span (bp) | 867,222 | 871,853 | 866,966 |
+| Block max span (bp) | 53,165,843 | 2,080,875 | 39,388,202 |
+| Genome covered (bp) | 313,517,513 | 221,615,836 | 246,734,240 |
+
+**Phaseable vs unphaseable split** (confidence threshold 0.6)
+
+| Metric | BAM | Graph | **Hybrid** |
+|---|---|---|---|
+| Phaseable PS / reads | 366 / 214,444 | 343 / 202,881 | 324 / 211,704 |
+| Phaseable accuracy | 98.02% | **99.40%** | 99.34% |
+| Unphaseable PS / reads | 63 / 5,481 | 20 / 839 | 16 / 536 |
+| Unphaseable accuracy | 53.62% | 54.11% | 55.04% |
+
+- **No regression.** Hybrid holds at 99.232% / 0.768% / switch 291 (matches the
+  pre-/post-dedup verification). Graph holds the Fix-B no-pool gain: switch
+  367 → 364, accuracy 99.195% → 99.210%.
+- **Hybrid wins every error metric** (best accuracy, Hamming, switch, switch+flip
+  rate) and the longest block N50 (993,831 bp), but is the slowest (326 s).
+- **Graph is the accuracy-per-second winner** (99.210% in 53 s), highest fraction
+  phased (88.05%), most perfect phase sets (142 / 39.12%), and best phaseable
+  accuracy (99.40%). Its auN is far lower because it produces many uniform ~0.9 Mb
+  blocks rather than a few huge spanning blocks.
+- **BAM** has the largest auN/max-span (one 53 Mb block) and most genome covered,
+  but the worst accuracy (3.091% Hamming) — the long blocks accumulate errors. It
+  is the fallback when no graph/GAF inputs are available.
+- **auN caveat:** BAM/hybrid's large auN comes from a single chromosome-spanning
+  block; for switch-error quality the per-read accuracy metrics above are the
+  meaningful comparison, not auN.
+
 ### Observations
 
 - **The indel noise-filter fix transforms the graph pipeline.** Graph overall
