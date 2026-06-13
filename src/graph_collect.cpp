@@ -233,6 +233,40 @@ static CandidateTable graph_chunks_to_candidate_table(
                          return exact_comp_cand_var(&a, &b) < 0;
                      });
 
+    // Collapse duplicate variants. Overlapping/nested snarls in the catalog can
+    // emit the same physical variant from several sites; after minimal-VCF
+    // normalization these share an identity and sort adjacently. Keep the
+    // highest-coverage copy so the output VCF/TSV carries each variant once.
+    // (Phasing already ran upstream per snarl site; this only de-duplicates the
+    // emitted table.) If two copies disagree on the phased haplotype, the
+    // higher-coverage call wins and the conflict is reported under --verbose.
+    if (!result.empty()) {
+        size_t write = 0;
+        int collapsed = 0;
+        int hap_conflicts = 0;
+        for (size_t read = 1; read < result.size(); ++read) {
+            if (exact_comp_cand_var(&result[write], &result[read]) == 0) {
+                ++collapsed;
+                if (result[write].phase_set == result[read].phase_set &&
+                    result[write].hap_alt != result[read].hap_alt) {
+                    ++hap_conflicts;
+                }
+                if (result[read].counts.total_cov > result[write].counts.total_cov) {
+                    result[write] = std::move(result[read]);
+                }
+            } else {
+                ++write;
+                if (write != read) result[write] = std::move(result[read]);
+            }
+        }
+        result.resize(write + 1);
+        if (opts.verbose && collapsed > 0) {
+            std::cerr << "graph: collapsed " << collapsed
+                      << " duplicate variant record(s) from overlapping snarls ("
+                      << hap_conflicts << " with conflicting haplotype calls)\n";
+        }
+    }
+
     return result;
 }
 

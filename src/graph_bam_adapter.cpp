@@ -5,6 +5,8 @@
 #include "noise_filter.hpp"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <ostream>
 #include <stdexcept>
@@ -27,6 +29,69 @@ struct GraphProfileObservation {
     int site_index = -1;
     int allele = -1;
 };
+
+// Minimal-VCF identity of an allele pair, expressed as views into the original
+// ref/alt strings (no allocation). Two allele pairs that denote the same physical
+// variant — even when emitted by different overlapping snarls — share the same
+// (pos, ref-range, alt-range), so comparing these views is an exact dedup test.
+struct MinimalVcfId {
+    hts_pos_t pos = 0;
+    const char* ref = nullptr;
+    size_t ref_len = 0;
+    const char* alt = nullptr;
+    size_t alt_len = 0;
+
+    bool operator==(const MinimalVcfId& o) const {
+        return pos == o.pos && ref_len == o.ref_len && alt_len == o.alt_len &&
+               std::memcmp(ref, o.ref, ref_len) == 0 &&
+               std::memcmp(alt, o.alt, alt_len) == 0;
+    }
+};
+
+// Reduce (pos, ref, alt) to minimal VCF form as offset ranges into the inputs:
+// trim the shared suffix, then the shared prefix (advancing pos), keeping ≥1 base
+// in each. Allocation-free — mirrors trim_to_minimal_vcf without copying.
+MinimalVcfId minimal_vcf_id(hts_pos_t pos, const std::string& ref,
+                            const std::string& alt) {
+    size_t rb = 0, re = ref.size();
+    size_t ab = 0, ae = alt.size();
+    while (re - rb > 1 && ae - ab > 1 && ref[re - 1] == alt[ae - 1]) {
+        --re;
+        --ae;
+    }
+    while (re - rb > 1 && ae - ab > 1 && ref[rb] == alt[ab]) {
+        ++rb;
+        ++ab;
+        ++pos;
+    }
+    return MinimalVcfId{pos, ref.data() + rb, re - rb, alt.data() + ab, ae - ab};
+}
+
+// 64-bit FNV-1a fingerprint of a minimal-VCF identity. Used as the hash-map key;
+// exact MinimalVcfId comparison guards against collisions, so a clash can never
+// cause an incorrect merge.
+uint64_t minimal_vcf_fingerprint(const MinimalVcfId& id) {
+    uint64_t h = 14695981039346656037ULL;
+    auto mix = [&h](uint64_t v) {
+        for (int b = 0; b < 8; ++b) {
+            h ^= static_cast<uint8_t>(v & 0xFF);
+            h *= 1099511628211ULL;
+            v >>= 8;
+        }
+    };
+    mix(static_cast<uint64_t>(id.pos));
+    for (size_t k = 0; k < id.ref_len; ++k) {
+        h ^= static_cast<uint8_t>(id.ref[k]);
+        h *= 1099511628211ULL;
+    }
+    h ^= 0xFFULL;  // delimiter so "AB|C" and "A|BC" differ
+    h *= 1099511628211ULL;
+    for (size_t k = 0; k < id.alt_len; ++k) {
+        h ^= static_cast<uint8_t>(id.alt[k]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
 
 // True when a site was eligible and had ≥2 allele walks but the walk vectors
 // have been cleared (CompactGraphSiteIndex took ownership of the walk data).
@@ -553,6 +618,27 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
     struct NewPairEntry { int new_idx; int old_alt_phase1; };
     std::vector<std::vector<NewPairEntry>> old_site_to_pairs(n_cands);
 
+    // Overlapping/nested snarls can emit the same physical variant from different
+    // sites. Keyed by snarl order_pos() these look distinct, but in minimal VCF
+    // form they are identical and would enter k-means as separate anchors, giving
+    // one variant 2-4x the votes it should cast. Map each minimal-VCF identity to
+    // the first candidate that produced it; later duplicates pool their counts
+    // into that canonical candidate instead of creating a new one. Per-read
+    // observation dedup (Phase 3) then collapses a read seen at both snarls into a
+    // single vote.
+    //
+    // Keyed by a 64-bit fingerprint (cache-friendly int hashing, no per-pair
+    // string allocation); the bucket stores the exact MinimalVcfId + canonical
+    // index so fingerprint collisions are resolved without ever merging distinct
+    // variants. Reserved to the pair upper bound to avoid rehashing.
+    // old_i records the source site so the two alts of a single multiallelic
+    // snarl are never collapsed into each other: they are distinct variants by
+    // construction even if their minimal-VCF strings coincide degenerately
+    // (e.g. when node sequences are unavailable). Only cross-site matches dedup.
+    struct CanonEntry { MinimalVcfId id; int new_idx; size_t old_i; };
+    std::unordered_map<uint64_t, std::vector<CanonEntry>> canonical_by_fp;
+    canonical_by_fp.reserve(n_cands * 2);
+
     std::vector<CandidateVariant> new_cands;
     std::vector<std::string>      new_ids;
     std::vector<GraphSiteMeta>    new_meta;
@@ -607,16 +693,46 @@ GraphChunkBuildResult build_graph_chunk(const GraphSiteCatalogView& catalog,
             const int fwd_alt = a < fc.size() ? fc[a] : 0;
             const int rev_alt = a < rc_s.size() ? rc_s[a] : 0;
 
+            // Compute the minimal-VCF identity (pos, ref, alt) of this pair so
+            // duplicates from overlapping snarls share a key. Identity views point
+            // into meta.ref / meta.alts[alt_idx], which outlive this loop.
+            const GraphSiteMeta& meta = out.site_meta[i];
+            const size_t alt_idx = static_cast<size_t>(orig_alt - 1);
+            const std::string& id_alt_src =
+                alt_idx < meta.alts.size() ? meta.alts[alt_idx] : meta.ref;
+            const MinimalVcfId identity = minimal_vcf_id(meta.pos, meta.ref, id_alt_src);
+            const uint64_t fp = minimal_vcf_fingerprint(identity);
+
+            int canon = -1;
+            std::vector<CanonEntry>& bucket = canonical_by_fp[fp];
+            for (const CanonEntry& e : bucket) {
+                if (e.old_i != i && e.id == identity) { canon = e.new_idx; break; }
+            }
+            if (canon >= 0) {
+                // Duplicate variant from an overlapping snarl: pool counts into the
+                // canonical candidate and route this site's observations there. Do
+                // not create a new k-means anchor.
+                // Route this snarl's observations to the canonical anchor so the
+                // variant is not double-counted in k-means, but keep the canonical
+                // candidate's original counts: pooling coverage across overlapping
+                // snarls over-weights these anchors and net-regresses Hamming. The
+                // per-read observation dedup in Phase 3 still collapses a read seen
+                // at both snarls into one vote.
+                const size_t canon_idx = static_cast<size_t>(canon);
+                old_site_to_pairs[i].push_back(
+                    {static_cast<int>(canon_idx), static_cast<int>(a)});
+                continue;
+            }
+
             const int new_idx = static_cast<int>(new_cands.size());
+            bucket.push_back({identity, new_idx, i});
             old_site_to_pairs[i].push_back({new_idx, static_cast<int>(a)});
 
             CandidateVariant pair_cand = out.chunk.candidates[i];
 
             // Derive variant type from VCF REF/ALT sequence lengths.
             {
-                const GraphSiteMeta& meta = out.site_meta[i];
                 const size_t ref_len = meta.ref.size();
-                const size_t alt_idx = static_cast<size_t>(orig_alt - 1);
                 const size_t alt_len = alt_idx < meta.alts.size() ? meta.alts[alt_idx].size() : ref_len;
                 if (ref_len < alt_len) {
                     pair_cand.key.type = VariantType::Insertion;

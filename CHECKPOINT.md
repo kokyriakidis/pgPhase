@@ -3020,3 +3020,78 @@ corrupted the **emitted allele strings/POS** in the candidate TSV and VCF. The f
 makes graph/hybrid VCF output match the BAM pipeline's canonical variant
 representation. Covered by `test_trim_to_minimal_vcf` in `test_noise_filter.cpp`.
 Validated offline.
+
+---
+
+## Duplicate Variant Records & k-means Double-Counting (graph/hybrid)
+
+**Symptom.** After minimal-VCF normalization (see previous section), the graph
+pipeline still emitted some variants more than once, and the same physical variant
+could enter k-means as several independent anchors.
+
+**Root cause.** The snarl catalog wraps a single physical locus in multiple
+overlapping/nested snarls. In `build_graph_chunk` candidates are keyed by snarl
+`order_pos()`, so overlapping snarls that decompose to the *same* minimal-VCF
+variant look distinct. Two consequences:
+
+1. **Output:** the candidate TSV/VCF carried the same variant several times.
+   475 duplicate loci on chr20, 471 sharing a phase set.
+2. **k-means:** each duplicate cast an independent germline-het vote. 317
+   k-means-eligible duplicates produced 329 redundant anchor votes (0.58% of
+   eligible anchors), slightly distorting the clustering.
+
+**Fix A — output dedup (`graph_collect.cpp`).** After the existing
+`stable_sort`, a single pass collapses adjacent records with
+`exact_comp_cand_var()==0`, keeping the highest-coverage copy and reporting any
+conflicting haplotype calls under `--verbose`. Graph VCF duplicates 319→0 within a
+chunk (a lone cross-chunk dup remains and is the reason this backstop stays even
+with Fix B). Candidate rows 74,119→73,627.
+
+**Fix B — k-means anchor dedup (`graph_bam_adapter.cpp`).** In Phase 2 each
+biallelic pair is reduced to its minimal-VCF identity `(pos, ref, alt)` and
+deduplicated *across snarl sites* before becoming a k-means anchor:
+
+- Identity is computed with zero allocation: `minimal_vcf_id` trims to offset
+  ranges over the existing `meta.ref`/`meta.alts` strings (views, not copies).
+- A 64-bit FNV-1a fingerprint (`minimal_vcf_fingerprint`) buckets candidates in an
+  `unordered_map<uint64_t, vector<CanonEntry>>`, reserved to the pair upper bound
+  to avoid rehashing. Exact `MinimalVcfId` comparison inside the bucket resolves
+  fingerprint collisions, so distinct variants are never merged.
+- Same-site guard: `CanonEntry` records the source site index; the two alts of a
+  single multiallelic snarl are never collapsed into each other (they are distinct
+  variants by construction even if their minimal-VCF strings coincide degenerately
+  when node sequences are unavailable). Only cross-site matches dedup.
+- **No-pool semantics (critical).** A duplicate routes its read observations to the
+  canonical anchor but does **not** pool counts. Per-read observation dedup in
+  Phase 3 still collapses a read seen at both snarls into one vote.
+
+**Pooled-vs-no-pool A/B (graph pipeline).** Pooling coverage across overlapping
+snarls *regressed* phasing: it over-weights the surviving anchor and net-degrades
+Hamming. Removing the extra votes *without* distorting the surviving anchor's
+weight is what helps.
+
+| variant | accuracy | Hamming | switch | flip |
+|---|---|---|---|---|
+| NORM-only (baseline) | 99.1954% | 0.8046% | 367 | 858 |
+| Fix B pooled | 99.0443% ❌ | 0.9557% ❌ | 355 | 848 |
+| **Fix B no-pool (chosen)** | **99.2097%** ✅ | **0.7903%** ✅ | **364** ✅ | **856** ✅ |
+
+Fix B eliminated all 329 within-chunk redundant anchor votes
+(eligible-distinct-loci 56,281→56,278, redundant 329→0).
+
+**Hybrid impact: none (verified).** `build_graph_chunk` is shared by graph and
+hybrid, so hybrid was re-evaluated before/after Fix A+B on the full chr20 harness:
+
+| pipeline | before | after |
+|---|---|---|
+| hybrid accuracy / Hamming | 99.232% / 0.768% | **99.232% / 0.768%** (identical) |
+| hybrid switch / flip / perfect-PS | 291 / 906 / 115 | **291 / 906 / 115** (identical) |
+| hybrid candidate categories | — | identical |
+
+Hybrid is unaffected because its BAM base already anchors phasing; the graph
+augment only contributes at sites the BAM pass did not resolve, where the
+redundant snarl votes did not change the cluster assignment. The graph-only
+pipeline gains (99.195→99.210%) while hybrid holds steady.
+
+Covered by the existing `test_graph_bam_adapter` multiallelic-decomposition tests
+(which guard the same-site case) and `make unit-tests`.
