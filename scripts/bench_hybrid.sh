@@ -27,10 +27,12 @@
 # Add --compare to also run the BAM-only and graph-only pipelines into
 # sibling subdirectories (bam/ and graph/) for head-to-head comparison.
 #
-# Add --gapfill (implies --compare) to also emit hybrid_gapfill/phased.bam: the
-# hybrid phased core with reads the BAM pipeline phased but hybrid dropped,
+# Add --gapfill [N] (implies --compare) to also emit hybrid_gapfill/phased.bam:
+# the hybrid phased core with reads other pipelines phased but hybrid dropped,
 # added back as disjoint phase sets. (All pipelines phase the same vg-giraffe
 # alignment, so this is a cross-pipeline label transfer, not a re-alignment.)
+#   N=1 (default): + BAM-pipeline reads           -> max accuracy gain vs BAM
+#   N=2:           + BAM-pipeline + graph reads    -> max coverage (full union)
 # This recovers the hard reads the hybrid skip_noisy_kmeans default drops, and
 # Pareto-beats the BAM pipeline (more reads, lower error, higher auN). See
 # CHECKPOINT.md "hybrid-core + gap-fill".
@@ -50,6 +52,9 @@ PLATFORM="hifi"   # hifi or ont
 PGPHASE="./pgphase"
 COMPARE=0
 GAPFILL=0
+GAPFILL_SOURCES=1
+readonly GAPFILL_PS_OFFSET_BAM=1000000000
+readonly GAPFILL_PS_OFFSET_GRAPH=2000000000
 
 die() {
     echo "Error: $*" >&2
@@ -69,7 +74,9 @@ Required:
 
 Optional:
   --compare        Also run BAM-only and graph-only pipelines for A/B
-  --gapfill        Emit hybrid_gapfill/phased.bam (implies --compare)
+  --gapfill [N]    Emit hybrid_gapfill/phased.bam (implies --compare).
+                   N=1 (default): + BAM-pipeline reads (max accuracy vs BAM).
+                   N=2: + BAM + graph reads (max coverage, full union).
   --ont            ONT mode [default: HiFi]
   --pgphase PATH   Path to pgphase binary [./pgphase]
   --threads INT    Threads [8]
@@ -87,7 +94,11 @@ while [[ $# -gt 0 ]]; do
         --outdir)  OUTDIR="$2";  shift 2 ;;
         --threads) THREADS="$2"; shift 2 ;;
         --compare) COMPARE=1;    shift ;;
-        --gapfill) GAPFILL=1; COMPARE=1; shift ;;
+        --gapfill)
+            GAPFILL=1; COMPARE=1
+            if [[ "${2:-}" =~ ^[12]$ ]]; then GAPFILL_SOURCES="$2"; shift 2
+            else shift; fi
+            ;;
         --ont)     PLATFORM="ont"; shift ;;
         --pgphase) PGPHASE="$2"; shift 2 ;;
         -h|--help) usage ;;
@@ -165,10 +176,11 @@ if [[ "${COMPARE}" -eq 1 ]]; then
         --gaf "${GAF}" --sites "${SITES}"
 fi
 
-# ── Optional additive gap-fill: hybrid core + BAM-pipeline reads ──────
-# Stamp the reads the BAM pipeline phased but hybrid dropped onto the hybrid
-# phased BAM, in a disjoint phase-set namespace (no re-stitch). Needs the BAM
-# pipeline output, which --gapfill forces by also setting --compare.
+# ── Optional additive gap-fill: hybrid core + other-pipeline reads ────
+# Stamp the reads other pipelines phased but hybrid dropped onto the hybrid
+# phased BAM, each in its own disjoint phase-set namespace (no re-stitch).
+# Needs the bam (and, for N=2, graph) pipeline output, which --gapfill forces
+# by also setting --compare. Chained: source 2 fills onto source 1's result.
 if [[ "${GAPFILL}" -eq 1 ]]; then
     gapfill_dir="${OUTDIR}/hybrid_gapfill"
     gapfill_bam="${gapfill_dir}/phased.bam"
@@ -177,11 +189,24 @@ if [[ "${GAPFILL}" -eq 1 ]]; then
     else
         command -v samtools >/dev/null 2>&1 || die "samtools required for --gapfill"
         mkdir -p "${gapfill_dir}"
-        echo "[hybrid_gapfill] Building hybrid core + BAM gap-fill ..."
+        echo "[hybrid_gapfill] Building hybrid core + ${GAPFILL_SOURCES}-source gap-fill ..."
+        # Source 1: BAM-pipeline reads (disjoint PS namespace).
         python3 "${SCRIPT_DIR}/gapfill.py" \
             "${OUTDIR}/hybrid/phased.bam" \
             "${OUTDIR}/bam/phased.bam" \
-            "${gapfill_bam}"
+            "${gapfill_bam}" \
+            samtools "${GAPFILL_PS_OFFSET_BAM}"
+        # Source 2 (optional): graph-pipeline reads (second disjoint namespace).
+        if [[ "${GAPFILL_SOURCES}" -eq 2 ]]; then
+            stage1="${gapfill_dir}/stage1.bam"
+            mv "${gapfill_bam}" "${stage1}"
+            python3 "${SCRIPT_DIR}/gapfill.py" \
+                "${stage1}" \
+                "${OUTDIR}/graph/phased.bam" \
+                "${gapfill_bam}" \
+                samtools "${GAPFILL_PS_OFFSET_GRAPH}"
+            rm -f "${stage1}"
+        fi
         samtools index "${gapfill_bam}"
     fi
 fi

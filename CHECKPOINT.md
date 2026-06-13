@@ -1315,11 +1315,13 @@ accuracy. Additive gap-fill is strictly better than `--keep-noisy-kmeans` (2.15%
 vs 3.21% Hamming at comparable coverage) because it does not let the noisy reads
 re-orient the clean core.
 
-**Status:** prototype validated (`scripts/gapfill.py`, exposed via
-`scripts/bench_hybrid.sh --gapfill`). It is a post-process over phased BAMs that
-transfers HP/PS labels by read name; chain it for multi-source fill. Not wired
-into the binary — promote to a CLI subcommand only if accuracy-at-high-coverage
-becomes a shipped target.
+**Status:** prototype validated (`scripts/gapfill.py`). Exposed via
+`scripts/bench_hybrid.sh --gapfill [N]`: `N=1` (default) adds BAM-pipeline
+reads, `N=2` chains a second pass to also add graph-pipeline reads. Both modes
+verified to reproduce the BAMs above (221,428 / 222,802 phased). It is a
+post-process over phased BAMs that transfers HP/PS labels by read name; the
+hybrid binary itself only does hybrid-default — promote gap-fill to a CLI
+subcommand only if accuracy-at-high-coverage becomes a shipped target.
 
 ---
 
