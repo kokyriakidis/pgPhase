@@ -2746,7 +2746,16 @@ with ≥2 SNPs and outside known segdup/centromere bands, (3) append them to the
 phasing. Worth doing for N50/auN even though aggregate switch/Hamming barely move.
 Validated offline; no production change yet.
 
-### BUG FOUND: graph candidate strand counts are always forward (REVERSE=0)
+### BUG FOUND (RESOLVED in 8f93774): graph candidate strand counts were always forward (REVERSE=0)
+
+> **Status: FIXED.** Resolved by commit 8f93774 in `graph_collect.cpp:148-153`
+> (copy `mcand.counts.{forward,reverse}_{ref,alt}` instead of deriving
+> forward-only from `alle_covs`). Verified on current HEAD: all 74,119 rows of
+> `graph.candidates.tsv` satisfy `FWD+REV == COUNT` for both ref and alt, including
+> multiallelic sites. The strand-bias filter remains correctly `is_ont()`-gated, so
+> it does not run on the HiFi path. The historical investigation below is retained
+> for the diagnostic trail.
+
 
 While testing a strand-bias filter for the graph-only blocks, every graph
 candidate showed `REVERSE_REF=0` and `REVERSE_ALT=0`. Investigation showed this
