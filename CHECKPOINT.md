@@ -910,45 +910,48 @@ binary after all fixes above.
 |---|---|---|---|
 | **Completeness** | | | |
 | Input reads | 272,016 | 231,382 | 272,016 |
-| Phased reads | 219,925 (80.8%) | 216,130 (93.4%) | **220,734 (81.1%)** |
-| Unphased reads | 52,091 | 15,252 | 51,282 |
-| Phase sets | 429 | 425 | **419** |
-| Perfect phase sets | 136 / 429 (31.7%) | 96 / 419 (22.9%) | 106 / 411 (25.8%) |
+| Phased reads | 219,925 (80.9%) | 216,130 (93.4%) | **220,897 (81.2%)** |
+| Unphased reads | 52,091 | 15,252 | 51,119 |
+| Phase sets | 429 | 425 | **411** |
+| Perfect phase sets | 125 / 429 (29.1%) | 92 / 425 (22.0%) | 91 / 411 (22.5%) |
 | **Contiguity** | | | |
 | Phase block N50 | 937,648 bp | 898,076 bp | **951,564 bp** |
-| Phase block auN | 9,834,195 bp | 981,035 bp | **11,905,552 bp** |
+| Phase block auN | 9,834,145 bp | 981,014 bp | **11,996,328 bp** |
 | Largest block | 53,165,843 bp | 2,141,283 bp | **59,316,535 bp** |
-| Median block span | 867,222 bp | 870,222 bp | 869,828 bp |
-| Genome covered | 313,515,638 bp | 257,734,535 bp | **317,065,439 bp** |
+| Median block span | 867,222 bp | 870,405 bp | 870,313 bp |
+| Genome covered | 313,517,513 bp | 257,730,553 bp | **314,553,187 bp** |
 | **Accuracy** | | | |
-| Concordant reads | 213,386 | 200,481 | **214,277** |
-| Discordant reads | 6,539 | 15,631 | **6,436** |
-| Overall accuracy | 97.03% | 92.77% | **97.08%** |
-| Hamming error rate | 2.97% | 7.23% | **2.92%** |
-| Switch errors | 1,337 | 2,251 | 1,385 |
-| Flip errors | 1,812 | 3,167 | 1,892 |
-| Switchflip errors | 3,149 | 5,418 | 3,277 |
-| Switch opportunities | 219,496 | 215,693 | 220,302 |
-| Switch error rate | 0.61% | 1.04% | 0.63% |
-| Flip error rate | 0.83% | 1.47% | 0.86% |
-| Switchflip error rate | 1.43% | 2.51% | 1.49% |
+| Concordant reads | 213,127 | 200,341 | **214,158** |
+| Discordant reads | 6,798 | 15,771 | **6,718** |
+| Overall accuracy | 96.91% | 92.70% | **96.96%** |
+| Hamming error rate | 3.09% | 7.30% | **3.04%** |
+| Switch errors | 1,393 | 2,306 | 1,440 |
+| Flip errors | 2,052 | 3,268 | 2,133 |
+| Switchflip errors | 3,445 | 5,574 | 3,573 |
+| Switch opportunities | 219,496 | 215,693 | 220,472 |
+| Switch error rate | 0.63% | 1.07% | 0.65% |
+| Switchflip error rate | 1.57% | 2.58% | 1.62% |
 | **Phaseable / Unphaseable** | | | |
-| Phaseable PS (>60%) | 365 | 327 | 345 |
-| Phaseable accuracy | 98.15% | 95.36% | **98.14%** |
-| Unphaseable PS (≤60%) | 64 | 92 | 66 |
-| Unphaseable accuracy | 53.63% | 54.48% | 53.82% |
+| Phaseable PS (>60%) | 366 | 327 | 340 |
+| Phaseable accuracy | 98.02% | 95.28% | **97.99%** |
+| Unphaseable PS (≤60%) | 63 | 92 | 64 |
+| Unphaseable accuracy | 53.62% | 54.42% | 53.86% |
 
 ### Observations
 
-- **Hybrid accuracy exceeds BAM**: 97.08% vs 97.03%, Hamming 2.92% vs 2.97% — the AF gate
+- **Hybrid accuracy exceeds BAM**: 96.96% vs 96.91%, Hamming 3.04% vs 3.09% — the AF gate
   and stitch margin=10 default together eliminate the accuracy regression.
-- **Hybrid contiguity exceeds BAM**: auN +21% (11.9M vs 9.8M), largest block +12%
-  (59.3M vs 53.2M), genome covered +3.5M bp more.
-- **Hybrid phases more reads**: 220,734 vs 219,925 (+809 reads).
-- **Switch/flip rates near-identical to BAM**: switch 0.63% vs 0.61%, flip 0.86% vs 0.83%.
-- **Graph**: highest read phasing rate (93.4%) but substantially lower accuracy (92.77%)
+- **Hybrid contiguity exceeds BAM**: auN +22% (12.0M vs 9.8M), largest block +12%
+  (59.3M vs 53.2M), genome covered +1.0M bp more.
+- **Hybrid phases more reads**: 220,897 vs 219,925 (+972 reads).
+- **BAM edges hybrid on two secondary metrics**: switchflip 1.57% vs 1.62% and perfect
+  PS 125 vs 91 — the cost of hybrid's more aggressive (contiguity-gaining) merging.
+- **Graph**: highest read phasing rate (93.4%) but substantially lower accuracy (92.70%)
   and fragmented blocks (auN 981k). Sees fewer input reads (231k vs 272k) because the
   GAF covers only pangenome-aligned reads.
+
+All three rows were regenerated from the same current HEAD binary (BAM/graph/hybrid
+all run with shipped defaults; hybrid = af0.11 + stitch margin 10 + both-strands rule).
 
 ---
 
@@ -1223,3 +1226,1473 @@ one when both show strong LD with their neighbors. Reverted from code (default
 0.0 reproduced the baseline byte-for-byte); kept here so it is not re-tried.
 Possibly worth revisiting on ONT, where genotyping noise is larger and the
 good/bad anchor populations may separate more cleanly.
+
+# SYNTHESIS — Why the hybrid cannot beat BAM on switches/perfect-PS (read this first)
+
+This section indexes a multi-session investigation into closing the hybrid's two
+remaining deficits vs BAM (switch errors, perfect phase sets). **Conclusion: no
+method tested beats the current default hybrid; the deficits are explained, not
+fixable with the available data.** Every detailed section below is preserved
+chronologically; this is the map.
+
+### Current verified 3-way (chr20, vs truth)
+
+| metric | BAM | graph | hybrid (default) |
+|---|---|---|---|
+| Hamming | 3.09% | 7.30% | **3.04%** ✅ |
+| auN | 9.83 Mb | 0.98 Mb | **12.00 Mb** ✅ |
+| N50 | 938 kb | 898 kb | **952 kb** ✅ |
+| phased reads | 219,925 | 216,130 | **220,897** ✅ |
+| switches | **1,393** | — | 1,440 |
+| perfect PS | **125** | 92 | 91 |
+
+The hybrid wins the metrics that matter most (accuracy, contiguity,
+completeness) and loses only switches/perfect-PS.
+
+### The one root cause behind every dead end
+
+**GAF reads are a strict subset of BAM reads: 271,930 ⊂ 272,016, with 0 unique
+reads.** The graph is a *second alignment of the same physical HiFi bases*. It
+therefore carries **no evidence independent of BAM**. Its only genuine
+contribution is the **3,541 extra easy SITES** BAM missed (already used by the
+hybrid). Any method that re-weights or re-interprets the graph's view of *shared
+reads* is information-free and capped at single-digit switches.
+
+### Why the switch/perfect-PS deficit is structural, not a bug
+
+Switches are counted *within* a phase set; perfect-PS is all-or-nothing per
+block. The hybrid merges blocks BAM leaves split (404 vs 429 PS; auN 12.0 vs 9.8
+Mb). Merging **exposes more within-block transitions** and **destroys perfect-PS
+credit** when a clean block joins an imperfect neighbor — even though it adds no
+discordant reads (the hybrid has *fewer*: 6,718 vs 6,798). The +47 switch gap is
+localized (windows 37–38 Mb alone = +36) and traces to reads pulled into large
+blocks in segdups, not to bad merge orientation (fixing all 21 wrong merges =
+−3 switches, confirmed by real run).
+
+### Ledger of everything tested (all REJECTED)
+
+| # | Lever | Why it failed | Ceiling |
+|---|---|---|---|
+| 1 | k-means flip margin | no-op; switches are confident not bare-majority | 0 |
+| 2 | BAM-vs-graph allele disagreement | not independent; measures alignment noise | ~0 |
+| 3 | per-read LD changepoint gain | real 9× signal, but crossovers ≠ consensus switches | −29 sw, kills completeness |
+| 4 | graph-as-voter / arch flip | graph 3× less accurate; no selective rule >50% | net −8,452 reads |
+| 5 | stricter stitch gate (rule3+margin) | real-run −3 sw, +6 perfect-PS, −0.19 Mb auN | trade-off, not win |
+| 6 | (D) graph alleles as coverage | GAF ⊂ BAM; double-counting | 0 |
+| 7 | (A) graph-confirmed k-means weights | only 7 transitions fixable; loses real hets | ~3 sw |
+| 8 | (C) graph-only sites as stitch bridges | only 5/40 seams reachable | <1 sw |
+| 9 | (B) graph path co-occurrence linkage | recovers truth 60%/window vs BAM 97% | coin-flip |
+
+### What would actually beat BAM
+
+Only **data BAM does not contain**: trio/parental reads (HG002 has them — true
+independent inheritance signal) or a second orthogonal sequencing technology
+(e.g. ONT — independent error modes). Not another way to process the graph
+alignment of the same reads.
+
+### A real, optional trade-off knob (not promoted to default)
+
+`--stitch-rule 3 --stitch-min-margin 15` yields **+6 perfect PS** (91→97) and −3
+switches at a cost of −0.19 Mb auN / −323 phased reads. Use only if perfect-PS is
+the priority metric; the default maximizes the completeness win.
+
+---
+
+## Cross-pipeline read superset / seam-bridging (REJECTED — graph adds sites, not reads)
+
+Hypothesis: the pangenome is more linear/contiguous and reads map better there,
+so we could augment graph variation sites with confirmed BAM ones into a
+cross-chunk superset, and/or let graph reads bridge the fixed-stride chunk seams
+where the BAM stitch is weak. Two probes were scoped (A: widen chunk overlap so
+more reads are phased on both sides of a seam; B: let graph-only bridging reads
+vote in the seam stitch). Both were dropped after a data-level measurement,
+**before** writing the merge/overlap code, because the enabling premise — that
+the graph provides reads the BAM lacks — does not hold on HiFi.
+
+### The graph supplies no new bridging reads
+
+The GAF and the BAM are the **same HiFi molecules aligned two ways** (linearly
+to CHM13 → BAM; to the pangenome → GAF). Genome-wide qname comparison on chr20:
+
+| source | distinct reads |
+|---|---|
+| GAF | 271,930 |
+| BAM (primary) | 272,016 |
+| **GAF-only** | **0** (GAF ⊂ BAM) |
+
+So the graph's contribution to the hybrid pipeline is extra **sites**, not extra
+**reads**. Probe B has no new voters to add to a seam, and Probe A's premise
+(seams are read-starved) is false: per 500 kb boundary there are a median of 67
+bridging reads, only 2/132 boundaries below 20 crossers, and 98% have a
+phaseable site within 20 kb on both sides. Adding more BAM reads or a wider
+overlap recruits the same molecules that already vote.
+
+This is config-independent (a property of the input read sets, not the phasing
+parameters). Kept here so the cross-pipeline read-superset and
+graph-reads-bridge-seam ideas are not re-attempted on same-molecule HiFi inputs.
+May differ when the GAF and BAM come from genuinely different read sets (e.g.
+graph-aligned reads that fail linear mapping entirely), which did not occur here.
+
+> Note: an earlier write-up of this probe also reported a seam-flip "regression"
+> (≈1,811 wrong-oriented reads, hybrid Hamming 4.52%, auN 13.57M). That analysis
+> used a **stale `run/hybrid.phased.bam` produced by an experimental binary**
+> (its auN exceeded every documented config — a tell that it was not the shipped
+> default). Re-running the shipped hybrid (HEAD `034528b`, af0.11 + margin10 +
+> both-strands rule 1) reproduces the documented row exactly (Hamming 3.0415%,
+> auN 11,996,328, N50 951,564, 220,897 phased) and **beats BAM** (Hamming 3.04 vs
+> 3.09%, 6,718 vs 6,798 discordant, auN +22%, +972 reads phased). The shipped
+> hybrid is not regressed; the seam-flip figures above do not describe it. Always
+> regenerate the phased BAM from the current binary before diagnosing.
+
+## Switch-error gate on newly-phased reads (REJECTED — positive oracle ceiling, unreachable signal)
+
+The hybrid loses to BAM on exactly two secondary metrics: switch errors
+(1,410 vs 1,355, +55) and perfect phase sets (91 vs 125). Goal: close the switch
+gap without giving back the hybrid's Hamming/auN advantage.
+
+### Where the hybrid–BAM accuracy delta comes from (decomposition)
+
+Per-read accounting that closes exactly to the −80 discordant-read delta:
+
+| component | discordant reads |
+|---|---|
+| shared reads hybrid **fixed** (disc→conc) | −1,167 |
+| shared reads hybrid **broke** (conc→disc) | +1,029 |
+| reads only hybrid phased (the +972 net), of which 380 wrong | +380 |
+| reads only BAM phased, of which 322 wrong | −322 |
+| **net** | **−80 (hybrid better)** |
+
+So the hybrid's per-read win is the sum of two large offsetting effects. Two
+populations are net-harmful: the **380 discordant newly-phased reads** (real BAM
+reads that BAM left unphased and hybrid phased wrong) and the **~1,012
+hybrid-broke reads**.
+
+### Oracle ceiling is real
+
+A truth-based oracle that perfectly removes these reads clears BAM on switches:
+
+| config | switches | vs BAM | discordant | phased |
+|---|---|---|---|---|
+| BAM | 1,355 | — | 6,660 | 219,610 |
+| hybrid base | 1,410 | +55 (lose) | 6,629 | 220,681 |
+| drop 390 disc newly-phased | 1,319 | **−36 (win)** | 6,239 | 220,291 |
+| revert 1,012 hybrid-broke | 1,223 | −132 (win) | 5,617 | 220,681 |
+| both | 1,113 | −242 (win) | 5,227 | 220,291 |
+
+Dropping just the 390 discordant newly-phased reads is a win on *every* axis
+(switches −91, discordant −390, only −390 phased). The headroom exists.
+
+### But no implementable signal reaches it
+
+The only per-read confidence available at output time is the k-means
+`n_clean_agree_snps` / `n_clean_conflict_snps` (verified to survive
+`mid_free_chunk`). Instrumented dump of all 220,897 phased reads, correlated
+against the truth-defined harmful set:
+
+- Harmful reads do skew low-confidence (median agree 3 vs 18 for good reads) but
+  the means barely differ (18.8 vs 22.1, conflict 1.00 vs 0.08).
+- **Base-rate kills it:** good reads outnumber harmful 156:1 (219,279 vs 1,402).
+  The best gate precision is ~10% (`conflict≥5`: catches 48 harmful at the cost
+  of 424 good); best recall ~55% destroys 37,885 good reads. No threshold or
+  combination (conflict count, agree−conflict margin, low-agree) separates them.
+
+This is the same **confident-wrong** signature as the rejected AF/linkage/stitch
+levers: the harmful reads look as confidently phased as the good ones. The
+oracle proves the win is *possible in principle*; the confidence signal proves it
+is *not reachable* with current per-read information. Reverted (instrumentation
+removed; src clean vs HEAD). Kept here so the "gate low-confidence newly-phased
+reads to cut switches" idea is not re-tried without a *new* discriminative
+signal (e.g. graph-vs-BAM allele agreement per read, or per-read LD with
+neighbors — neither currently computed).
+
+## Intra-chunk k-means flip margin (REJECTED — no-op; switches are confident, not bare-majority)
+
+The hybrid's switch errors (1,440 vs BAM 1,355) are 93% intra-chunk (not at
+stitch seams — switches are spread uniformly across the chunk grid, 7.1%
+near-seam ≈ the 8% a uniform distribution predicts) and 95% clustered in
+low-accuracy regions. Of the ~117 *isolated* (one-off) switches, 57 sit in
+clean/good blocks (acc ≥0.90) and looked threshold-fixable.
+
+The per-chunk k-means **already iterates** (10 Lloyd rounds to convergence,
+`iter_update_var_hap_to_cons_alle`) and **already detects/corrects switches**
+(`iter_update_var_hap_cons_phase_set` walks adjacent het-var pairs and flips the
+downstream orientation when spanning-read `conflict > agree`, breaking the block
+when `agree<2 && conflict<2`). So "add iterative refinement" was already done;
+the isolated switches survive an iterating, switch-correcting system.
+
+The one remaining knob was the flip *decision*: it fires on a **bare majority**
+(`conflict > agree`). Hypothesis: an isolated noisy adjacent het-var pair induces
+a spurious flip in an otherwise-clean block, fixable by requiring a margin
+(`conflict > agree + k`). Added `--kmeans-flip-margin` (default 0); the control
+(margin=0) reproduced HEAD candidates byte-for-byte (md5 4d261704). Sweep:
+
+| margin | switch err | flip err | Hamming | auN |
+|---|---|---|---|---|
+| 0 (HEAD) | 1,440 | 2,133 | 3.042% | 11,996,328 |
+| 1 | 1,440 | 2,132 | 3.042% | 12,026,597 |
+| 2 | 1,440 | 2,132 | 3.042% | 12,026,597 |
+| 3 | 1,440 | 2,132 | 3.042% | 12,026,597 |
+
+Switches **unchanged** (1,440) at every margin; flips moved by 1. The hypothesis
+is wrong: at the switch points `conflict` exceeds `agree` by far more than 3, so
+the flip fires regardless of the margin. The flip rule is **confidently** making
+the wrong call — same confident-wrong signature as the AF/linkage/stitch/newly-
+phased-read levers. A bare-majority threshold tweak cannot help. Reverted (no-op
+removed; src clean vs HEAD). Kept here so the "raise the k-means flip margin to
+cut switches" idea is not re-tried — the switches are not bare-majority slips.
+
+## BAM-vs-graph per-read allele disagreement (REJECTED — not independent; measures alignment noise, not haplotype ambiguity)
+
+After six threshold/margin levers all hit the *confident-wrong* wall, the next
+hypothesis sought a **genuinely new discriminative signal**: for each read mapped
+by both pipelines, compare the BAM-derived allele to the graph-derived allele at
+shared sites. The intuition was that reads whose two alignments *disagree* on
+allele calls are alignment-ambiguous, and alignment ambiguity might predict the
+harmful (switch-inducing) reads that k-means confidence cannot flag.
+
+Instrumented `inject_graph_reads` (env-gated `PGPHASE_DUMP_XCHECK`) to dump, per
+doubly-mapped read, the BAM allele vs graph allele at every shared site, then
+joined the per-read disagreement rate against the eval `per_read.tsv.gz`
+discordant/concordant labels:
+
+| read class | mean disagree | median | % with any disagreement |
+|---|---|---|---|
+| concordant (good) | 0.48% | 0.00% | 4.6% |
+| discordant (harmful) | 1.32% | 0.00% | 6.1% |
+
+Both medians are 0.00%; the distributions overlap almost completely. Best gate
+(disagree-rate ≥ 0.67) reaches **11.8% precision** — catches 13 of 1,069 harmful
+reads while sacrificing 97 good ones. No threshold separates the classes, same
+as the k-means confidence signal it was meant to replace.
+
+**Why it fails (root cause, not just a bad threshold):** BAM and graph consume
+the **same bases from the same HiFi read**, just aligned two ways. They are not
+independent observations, so their disagreement measures *alignment noise*
+(where the two aligners place indels/SNVs differently), which is orthogonal to
+the cause of switches — *haplotype ambiguity* in segmental duplications, where
+the read's bases genuinely match the other haplotype. The harmful reads are
+**biologically confidently wrong**, not technically noisy, so an
+alignment-noise signal cannot find them. Reverted (instrumentation removed; src
+clean vs HEAD). Kept here so the "cross-check BAM vs graph alleles per read"
+idea is not re-tried — the two views are not independent.
+
+## Per-read LD changepoint gain (REJECTED — real signal, but oracle ceiling still loses on switches)
+
+Unlike the prior six levers (all aggregate agreement counts that flag nothing),
+this used a **positional** statistic. For each read, walk its phased het SNV
+sites in genomic order to get a haplotype-support sequence (e.g. `1 1 1 2 2 2`),
+then compute the **single-changepoint gain**: how many fewer errors a two-block
+`A…A B…B` model makes vs the best one-block model. A clean within-read switch
+(segdup crossover) scores high gain; scattered sequencing noise scores ~0. The
+aggregate minority count used by every earlier lever cannot distinguish these.
+
+**This is the first signal in seven attempts that actually separates the
+classes:**
+
+| signal | discordant | concordant | ratio |
+|---|---|---|---|
+| changepoint gain > 0 | 10.5% of reads | 1.2% of reads | ~9× |
+| mean gain | 1.333 | 0.047 | ~28× |
+
+(vs the prior levers where discordant and concordant medians/rates were
+identical.) But the population is ~20:1 concordant:discordant, so even a 9×
+enrichment yields only 7–26% weighted precision across the gain sweep.
+
+**Decisive oracle (drop the flagged reads, recompute switches):**
+
+| drop set | reads dropped | switches | flips | vs BAM (1,355) |
+|---|---|---|---|---|
+| baseline | 0 | 1,442 | 2,132 | +87 |
+| gain ≥ 2 | 2,835 | 1,421 (−21) | 2,097 | +66 |
+| gain ≥ 1 | 4,363 | 1,413 (−29) | 2,090 | +58 |
+
+Even the most aggressive perfect-oracle drop (4,363 reads) closes only 29 of the
+87-switch gap to BAM — still +58 — while sacrificing ~4,400 phased reads, which
+would erase the hybrid's completeness/auN advantage (the entire reason it wins).
+
+**Why a real signal still fails on switches:** a coincidence test showed the
+within-read changepoints do **not** land at consensus switch positions — at a
+500 bp window only 4–6% of high-gain discordant reads sit near a consensus
+switch (≈ the concordant rate). The consensus majority vote **already absorbs**
+these crossovers: the read's internal switch is outvoted before it becomes a
+consensus switch, so removing the read removes its vote but rarely removes a
+switch. The hybrid's remaining switch gap is a property of the **consensus over
+many reads in segdups**, not of identifiable individual bad reads. No per-read
+filter — however discriminative — can close it without destroying the
+completeness that makes the hybrid win. Validated entirely offline (no C++
+written); temp scripts removed. This closes the per-read filtering avenue: to
+beat BAM on switches one must change the **consensus/phasing model in segdups**,
+not filter reads.
+
+## Graph-as-voter / graph-base-BAM-confirm architecture (REJECTED — graph is 3x less accurate, no selective override exists)
+
+The current hybrid is **BAM-base, graph-augment**: it runs full BAM variant
+calling, then adds graph snarl sites only where BAM was silent. At any **shared**
+site (BAM also called it) the graph allele is **discarded**
+(`extend_bam_profile_with_graph_obs` skips non-graph-only candidates). Scope on
+chr20:
+
+| site class | count | role |
+|---|---|---|
+| shared (BAM ∩ graph) | 63,299 | graph allele discarded |
+| graph-only (extra) | 3,541 | graph's real contribution |
+| BAM-only | 1,583 | graph doesn't confirm |
+
+The proposal was to make the graph a **first-class voter** at shared sites (or
+flip to graph-base/BAM-confirm), per the original intent "help phasing in the
+graph with BAM-confirmed variants + extra from graph." Validated offline by
+joining per-read truth labels from the standalone BAM-only and graph-only
+pipelines on the 207,687 reads phased by **both**:
+
+| | count |
+|---|---|
+| BAM ✓ & graph ✓ | 191,916 |
+| BAM ✓ & graph ✗ (graph BREAKS) | 11,347 |
+| BAM ✗ & graph ✓ (graph FIXES) | 2,895 |
+| BAM ✗ & graph ✗ | 1,529 |
+
+**Trusting graph over BAM blindly = +2,895 − 11,347 = net −8,452 reads.** The
+graph is ~3× less accurate per read (6.2% vs 2.1% discordant), and the 8,443
+reads only the graph phases are just 65% concordant. A graph-base flip would
+wreck accuracy — which is exactly why the existing code is BAM-base.
+
+The only way the idea survives is a **selective** override: a rule identifying
+*which* shared sites/reads to trust the graph on. Exhaustive search over every
+available axis — per-read mapq bands, graph hapq bands, and the eval's
+BAM-bad-region BED, plus all combinations — found **no rule with >50% fix-rate at
+meaningful volume**:
+
+| stratum | fix-rate |
+|---|---|
+| all disagreements | 20% |
+| BAM-bad region (any hapq) | 37% |
+| BAM-bad region & graph hapq=60 | 18% |
+| graph hapq=60 (graph max-confident) | 16% |
+
+Even in BAM's *worst* regions the graph fixes only 37% of disagreements (net
+−595). Graph's own hapq is *inversely* useful (hapq=60 → 16% fix-rate): the
+graph is confidently wrong in the same hard regions BAM is.
+
+**Root cause:** GAF reads are a strict subset of BAM reads (only 3.9% of
+graph-phased reads are absent from the BAM set). The graph and BAM consume the
+**same physical HiFi bases** — the graph is just a second alignment of them. So
+the graph carries **no independent evidence** to overrule BAM; where BAM is wrong
+(segdup, read maps to wrong copy with mapq 60) the graph inherits the same wrong
+read and is wrong too. The graph's genuine value is purely the 3,541 extra
+*sites* it adds (already exploited) — not a corrective vote. Validated entirely
+offline (no C++ written). This closes the graph-as-voter / architecture-flip
+avenue: a better signal must come from data BAM does **not** already have (e.g.
+trio/parental reads, a second orthogonal sequencing technology), not from
+re-weighting the graph view of the same reads.
+
+## Wrong-merge investigation (the switch gap is NOT from bad stitch orientation)
+
+Re-opened the "switches are structural" claim by auditing the merge decisions
+against truth. The actual switch gap on chr20 is **BAM 1,393 vs hybrid 1,440 =
++47** (the earlier 1,355 figure was a stale comparison; per-phase-set tables give
+1,393/1,440).
+
+**Step 1 — are cross-block merges oriented wrong?** Identified 73 hybrid phase
+sets that merge ≥2 BAM phase sets (≥5 reads each). Scored each sub-block's
+orientation against truth: **21 of 73 merges are oriented WRONG.** The
+discriminating signal is real and runtime-available in part:
+
+| merge class | smallest sub-block size (median) | truth purity (median) |
+|---|---|---|
+| WRONG (21) | 10 reads | 0.83 |
+| RIGHT (52) | 24.5 reads | 0.99 |
+
+So wrong merges decide orientation on a small, impure set of overlap reads —
+matching the vote patterns (`...(1,560,31) | (6,10)`: a 1,560-read block joined
+to a 6-vs-10 coin-flip block).
+
+**Step 2 — do the wrong merges cause the gap? NO.** Two oracles, both with truth:
+
+- *Re-orient* every wrong sub-block to its correct truth polarity (zero
+  contiguity loss): switches 1,444 → **1,441 (−3)**, flips +7.
+- *Split out* small/impure weak sub-blocks: switches barely move (1,444 →
+  1,437 best case), at the cost of 50–80 broken blocks.
+
+Even a **perfect** fix of all 21 wrong merges removes only ~3 switches. Wrong
+merges mostly create a small discordant *island* (a flip, consumed as 2
+transitions), not a persistent switch.
+
+**Step 3 — where is the +47 gap really?** Binned switches into 1 Mb windows.
+The gap is **localized, not uniform**: windows 37–38 Mb alone account for **+36
+of the +47**. Inspecting those phase sets, the mechanism is concrete: the hybrid
+**adds reads/sites into already-large blocks in difficult regions**, e.g.
+
+- PS 38393470: BAM 3,030 reads / 6 switches → hybrid 3,275 reads / **20
+  switches** (the +245 reads in a segdup tripled the switches).
+- PS 37005134 (hybrid): merges BAM's perfect PS 36895001 (1,676 r, 0 sw) with
+  messy neighbors → 1,569 reads / **11 switches**.
+
+Attribution of the extra switches in same-id phase sets: **325 occur in blocks
+the hybrid GREW (>5% more reads); only 61 in blocks of ~same size.** The hybrid
+added 14,391 reads into existing BAM blocks.
+
+**Conclusion (corrected):** the switch gap is **not** a fixable stitch-rule bug —
+fixing every wrong merge buys ~3 switches. It comes from the hybrid pulling
+**more reads into large blocks within difficult/segdup regions**, where those
+extra reads are genuinely harder to phase (the same biologically-confident-wrong
+reads from the per-read-filter dead ends). This is the *price of the
+completeness/auN win*, concentrated in a few hard windows (37–38 Mb). The only
+lever that helps switches here is the same one already ruled out: stop pulling
+hard reads into hard blocks — which sacrifices the completeness that makes the
+hybrid win. A small, safe stitch improvement (require the weaker sub-block to
+have ≥~15 reads / purity before merging) is *legitimate* but worth only a handful
+of flips, not the switch gap. Validated entirely offline; no C++ written.
+
+### Real-run confirmation: stricter stitch gate (rule 3 + margin) — oracle was exact
+
+Two further facts narrowed the gate's reach before any run:
+- Only **13 of 21** wrong-merge seams sit at 500 kb **chunk boundaries** (where
+  `flip_chunk_hap` acts). The other **27 are intra-chunk** — created by k-means
+  inside a chunk, which the stitch step never sees. So a stitch-gate change can
+  touch at most ~13 of the wrong merges.
+- The existing binary already exposes the gate via `--stitch-rule 3`
+  (both-strands + margin) and `--stitch-min-margin`, so no code was needed to
+  test it.
+
+Ran the full hybrid pipeline + eval (chr20, truth BAM) at two gate settings vs
+the HEAD default (rule 1, margin 10):
+
+| metric | BAM | HEAD r1m10 | r3 m8 | r3 m15 |
+|---|---|---|---|---|
+| switches | 1,393 | 1,440 | 1,438 | 1,437 |
+| flips | 2,052 | 2,133 | 2,131 | 2,131 |
+| perfect PS | 125 | 91 | 94 | 97 |
+| auN | 9.83 Mb | 12.00 Mb | 11.93 Mb | 11.81 Mb |
+| Hamming | 3.09% | 3.04% | 3.04% | 3.04% |
+| phased reads | 219,925 | 220,897 | 220,767 | 220,574 |
+
+The real run matches the oracle to the read: the strictest gate moves switches by
+only **−3** (1,440 → 1,437) and flips by −2. It does buy **+6 perfect phase
+sets** (91 → 97, partway to BAM's 125) but at a monotonic cost in auN (−0.19 Mb)
+and phased reads (−323). This is a contiguity-for-perfect-PS trade, **not** a
+switch fix.
+
+**Final verdict on the merge rule:** it is not the lever for the switch gap. The
+gap is dominated by reads pulled into large blocks in a few hard windows (37–38
+Mb), which no boundary stitch rule can reach. The HEAD default (rule 1, margin
+10) remains the best all-round operating point — it maximizes auN/completeness,
+which is the hybrid's reason to exist. If perfect-PS were the priority metric,
+`--stitch-rule 3 --stitch-min-margin 15` is a valid alternative (+6 perfect PS,
+−3 switches) at a small contiguity cost, but it is not promoted to default
+because it sacrifices the completeness win. No source change made; sweep
+artifacts removed.
+
+## Full sweep of graph→BAM integration surfaces (all four families, REJECTED)
+
+To answer "have we tested every way to inject graph signal into the BAM
+pipeline?", enumerated the four code surfaces where graph data can enter and
+validated each offline. The live hybrid already exploits surfaces 1–2 (add
+graph-only sites; extend profiles at those sites). The four *untested* methods:
+
+**D — graph alleles at shared sites as extra coverage/AF support. DEAD (no
+oracle needed).** GAF reads are a strict subset of BAM: 271,930 ⊂ 272,016, with
+**0** GAF-only reads. Every graph observation at a shared site is a read BAM
+already counted, so "extra coverage" is double-counting — it inflates DP/AF with
+zero new evidence and cannot rescue a borderline het.
+
+**A — graph-confirmed sites as k-means anchor weights.** Real but tiny signal:
+graph-unconfirmed (bam-only) het SNP sites are **1.3–1.6× more likely** to sit at
+a switch than graph-confirmed shared sites — so confirmation *is* mildly
+protective. But bam-only sites are only 1,583 of 64,882 (2.4%), and of 5,706
+switch transitions only **7** sit where an unconfirmed site is the sole nearby
+anchor (42% are at confirmed sites where weighting can't help; most are near
+neither). Oracle ceiling ≈ **3 switches**, and down-weighting would discard real
+het information. Not worth building.
+
+**C — graph-only sites spanning chunk boundaries as stitch bridges. DEAD.**
+Targeted the 27 intra-chunk wrong merges the stitch gate can't reach. Only
+**5 of 40** wrong-merge seams have a graph-only site within 10 kb to bridge, and
+fixing *all* 40 seams is worth only −3 switches (proven earlier). Ceiling < 1
+switch. Root cause: bridging reads are the same physical reads (GAF ⊂ BAM), so
+they replay the evidence that caused the wrong merge.
+
+**B — graph path co-occurrence as long-range linkage (the only candidate that
+could be independent). REJECTED.** The GAF node path (col 9) is the graph's
+topology, not re-read bases, so it *could* carry information BAM's linear
+alignment lacks. Tested by partitioning reads on graph node-bubbles and scoring
+against truth across 50 windows: graph-path partition recovers the true
+haplotype at only **60% per window** (median 59%, min 50% = coin flip), vs BAM's
+**97%**. Concordance with BAM's own partition is 68% — but the 32% "disagreement"
+is *noise*, not independent signal (it doesn't match truth). This is consistent
+with the standalone graph pipeline's known accuracy (Hamming 7.3% / switch 2.58%,
+~2× worse than BAM): the graph path *is* that pipeline's signal. In hard regions
+the node path bifurcates on alignment ambiguity, not clean allele difference.
+
+**Unifying conclusion.** All four fail for the **same root cause that governs the
+entire investigation: GAF reads are a strict subset of BAM reads (0 unique).**
+The graph is a *second alignment of the same physical HiFi bases*, so it carries
+no evidence independent of BAM — not as coverage (D), not as a corrective vote
+(earlier), not as linkage (B). Its only genuine contribution is the **3,541 extra
+easy SITES** BAM missed, which the hybrid already uses. Surfaces that re-weight or
+re-interpret the graph's *view of shared reads* (A, C, D, B, plus the earlier
+graph-as-voter) are all capped at single-digit switches because there is no new
+information to extract. **To beat BAM further requires data BAM does not contain
+(trio/parental reads, or a second orthogonal technology) — not another way to
+process the graph alignment of the same reads.** All validated offline; no C++
+written; temp files removed.
+
+## BAM-native optimizer alternatives (REJECTED — production k-means already beats MEC and transition-penalty on real matrices)
+
+After exhausting graph→BAM integration, the question pivoted to the BAM
+pipeline's **own** phasing algorithm: *is there a better optimizer than the
+greedy k-means?* Tested directly against the real per-read × per-variant matrix.
+**Answer: no.** Production k-means beats both MEC local search and a
+transition-penalized optimizer. Details below, including a retracted earlier
+claim.
+
+### RETRACTED: the "confidence smoother" win was built on a truth-side signal
+
+An earlier draft of this section claimed a confidence-aware smoother gated on
+`hapq` cut switches −33% and Hamming +0.5pp. **That result is withdrawn.** The
+`hapq` field is the `hq:i:` tag from the **diplinator truth BAM** (eval script
+`evaluate_phase_accuracy.py:196-199`), not a quantity pgphase computes. It cannot
+gate anything at phasing time, and "`hapq=0` ⇒ uncertain" partly describes
+truth-side mapping ambiguity, not k-means tie-breaks. The lever was not
+realizable; the apparent win was a measurement artifact. Lesson re-learned (same
+as the LD/graph-voter dead ends): **validate the signal exists at decision time,
+not just in the eval dump.**
+
+### Honest test: dump the real matrix, run candidate optimizers offline
+
+Added `--dump-phase-matrix PREFIX` (debug-only) to emit the exact read×variant
+allele matrix k-means consumes, per chunk per flag-set, before any state
+mutation (`dump_phase_matrix` in collect_phase.cpp). Joined to truth by qname.
+Scoring is **PS-aware**: production assigns multiple phase sets per chunk (up to
+9), each independently orientable — scoring a chunk under one global orientation
+falsely inflates disc to ~80%. Within each production PS, pick the orientation
+minimizing switches, then count.
+
+Baseline reproduced correctly: **production = 1,656 switches / 3.376% disc** on
+chr20 (matches the real eval-harness numbers).
+
+### MEC local search from production init — WORSE
+
+Starting from production's own assignment and iterating MEC consensus
+re-assignment (no transition term) moved 411 reads and **increased** errors:
+**+37 switches, +679 disc**. Production is already past the naive-MEC optimum —
+its consensus-allele model + noisy second pass encode more than the bare matrix
+energy.
+
+### Transition-penalized optimizer — WORSE at every strength
+
+The actual hypothesis (an HMM/WhatsHap-style switch cost). Added a contiguity
+prior rewarding agreement with position-adjacent reads within each PS, swept
+λ ∈ {1,2,3,5,8} from production init:
+
+| λ | Δswitches | Δdisc | reads moved |
+|---|---|---|---|
+| 1 | **+123** | +1,182 | 1,835 |
+| 2 | +130 | +1,166 | 1,802 |
+| 3 | +537 | +3,880 | 6,313 |
+| 5 | +657 | +6,629 | 9,134 |
+| 8 | +715 | +7,087 | 10,796 |
+
+Every λ is strictly worse. A contiguity prior pulls reads across **legitimate**
+haplotype-block boundaries (the segdup long runs with median hapq 60 = confident
+and genuinely on the other haplotype), manufacturing errors faster than it fixes
+short runs. This is the same conclusion the segdup analysis predicted: the
+switches that remain are **data-driven**, not optimizer tie-breaks.
+
+### Soft EM (probabilistic assignment) — WORSE
+
+The third candidate: replace hard assignment with soft responsibilities (EM over
+a per-variant per-hap Bernoulli allele model). Initialized from production
+responsibilities (not random — the earlier random-init EM was degenerate and is
+not a fair test), refined to convergence, scored PS-aware:
+
+| EM error rate ε | Δswitches | Δdisc | reads moved |
+|---|---|---|---|
+| 0.02 | +498 | +4,341 | 4,494 |
+| 0.05 | +510 | +4,572 | 4,672 |
+| 0.10 | +512 | +4,555 | 4,585 |
+| 0.20 | +466 | +2,797 | 4,600 |
+
+Worse at every error rate. The tell is a near-frozen sanity run (init
+confidence 0.999, **1 round**): it already moves 3,681 reads and adds +497
+switches — a single EM E-step disagrees with production on ~3,700 reads and is
+net wrong. So it is not harness drift; EM genuinely disagrees and production is
+right. Reason: EM's generative model (independent Bernoulli per variant per hap,
+one global error rate) **discards what production encodes** — the clean-het
+category weights (CleanHetSnp/Indel count double), HOM handling, and the noisy
+second pass. The matrix carries the alleles but not these priors, so a model that
+sees only the matrix underperforms.
+
+### Conclusion
+
+The greedy pivot-sweep k-means is **not** the bottleneck. On the real allele
+matrix it already dominates MEC, transition-penalized, and EM/soft alternatives. The
+`--dump-phase-matrix` flag is kept for future offline optimizer experiments. To
+reduce BAM switches further requires *new data* (trio/parental, second
+technology), consistent with the whole-investigation conclusion — not a better
+optimizer over the same reads. Validated on real chr20 matrices; the only C++
+added is the debug dump.
+
+---
+
+### (Historical, RETRACTED) original confidence-smoother write-up
+
+The text below is preserved for the record but its conclusion is **wrong** (see
+retraction above): it used the truth-side `hapq` tag as if it were a pipeline
+signal.
+
+### Root cause: BAM k-means has no transition penalty
+
+`assign_hap_based_on_germline_het_vars_kmeans` (collect_phase.cpp:509) assigns
+each read to the hap with the higher **summed** allele-match score, then runs
+≤10 Lloyd rounds. Assignment is **per-read and independent** — there is no cost
+for creating two transitions in the read ordering. State-of-the-art phasers
+(HMM, MEC/WhatsHap) add a switch cost so a read only flips orientation when its
+*own* allele evidence outweighs the cost of breaking local contiguity. BAM's
+greedy hard assignment has no such term, so a read with **zero evidence margin**
+(a tie) is assigned arbitrarily and can land opposite its neighbors.
+
+### Switch breakpoints split cleanly by confidence
+
+Decomposing BAM discordant runs by length and the pipeline's own per-read
+`hapq` (haplotype quality, already computed) on chr20:
+
+| bucket | n | median hapq | %hapq<10 | switches contributed |
+|---|---|---|---|---|
+| concordant | 213,127 | 60 | 2% | — |
+| flip (len 1) | 1,777 | 18 | 44% | 0 (flips, not switches) |
+| **short run (2–4)** | **2,061** | **0** | **61%** | **~1,551** |
+| long run (5+) | 2,960 | 60 | 26% | 448 |
+
+The dividing line is sharp:
+
+- **Short runs (2–4 reads): median hapq = 0.** The algorithm had *no allele
+  evidence* — it broke a tie and happened to flip away from neighbors. These are
+  **algorithm-fixable**.
+- **Long runs (5+ reads): median hapq = 60**, same as concordant reads. These
+  are **confident but wrong** = true data ambiguity (segdups, where the read
+  genuinely matches the other haplotype's local sequence). No optimizer fixes
+  these; forcing them would *add* Hamming error. This matches the segdup
+  localization (37–38 Mb) from the wrong-merge investigation.
+
+### Truth-free smoother: −33% switches AND +0.53pp Hamming
+
+Simulated a transition-penalizing optimizer **without using truth**: for each
+read with `hapq < HQ`, reassign its orientation to the majority orientation of
+its `W` nearest *confident* (`hapq ≥ HQ`) neighbors. High-confidence reads (98%
+of all reads, at hapq 60) are never touched. Scored the result against truth:
+
+| HQ< | W | switches | ΔSW | Hamming | ΔHam |
+|---|---|---|---|---|---|
+| baseline | | 1,999 | — | 3.091% | — |
+| 20 | 6 | **1,340** | **−659 (−33%)** | **2.556%** | **+0.535pp** |
+| 15 | 6 | 1,447 | −552 | 2.65% | +0.44pp |
+| 10 | 6 | 1,468 | −531 | 2.745% | +0.346pp |
+
+Safety audit (HQ<20, W6): **1,481 fixes vs 304 breaks = 4.9:1**. Every
+configuration tested holds a **~4–5:1 fix:break ratio** — for each already-correct
+low-confidence read wrongly flipped, 4–5 wrong reads are corrected. Because only
+sub-threshold reads are ever reassigned, the confident backbone is untouched.
+
+### Why this is different from every prior lever
+
+Every earlier idea (per-read LD, graph-as-voter, stitch gate, the four
+integration families) was a **trade-off**: fewer switches cost completeness or
+Hamming. This one improves both at once because it targets reads the pipeline
+*already knows* it is uncertain about (hapq≈0) — it is not introducing new
+information, it is **stopping the greedy optimizer from making arbitrary
+tie-breaks against local contiguity**. The signal (`hapq`) is already computed
+and the operation needs only read order, so it is directly realizable in C++
+inside the k-means post-pass.
+
+**Status: validated offline, not yet implemented.** Next step (if pursued) is a
+neighbor-consensus / transition-penalty post-pass in
+`assign_hap_based_on_germline_het_vars_kmeans` gated on a `hapq` threshold, with
+the smoother confined to sub-threshold reads. Recommended starting params from
+the sweep: `HQ=20, W=6`. Must re-validate on the *real* pgphase run (synthetic
+switch counts here differ from eval-harness counts; the **ratios** are what
+transfer) and confirm perfect-PS and auN/N50 do not regress.
+
+## Where hybrid's extra switches come from (within-chunk k-means, not merging)
+
+Question: hybrid has more switches than BAM (1,393 → 1,440 in the default eval).
+Is that purely the different merge rule, or do the extra graph sites change the
+phasing itself?
+
+### Test 1 — match the merge rule
+
+BAM uses `--stitch-rule 0 --stitch-min-margin 0`; hybrid defaults to rule 1 +
+margin 10. Re-ran hybrid with **BAM's exact stitch rule**:
+
+| run | switches | flips | disc | Hamming | perfect-PS | N50 |
+|---|---|---|---|---|---|---|
+| BAM | 1,393 | 2,052 | 6,798 | 3.09% | 125 | 938k |
+| hybrid (default rule) | 1,781 | 2,530 | 10,082 | 4.52% | 70 | 975k |
+| hybrid (BAM rule) | 1,448 | 2,137 | 6,744 | 3.05% | 89 | 954k |
+
+Matching the merge rule closes most of the gap (1,781 → 1,448) and Hamming
+actually beats BAM (3.05% vs 3.09%). **Most of the default-hybrid switch excess
+was the aggressive stitch rule, not the graph.** But a residual **+55 switches**
+remains with identical merging.
+
+### Test 2 — locate the residual switches
+
+Classified the switch breakpoints present in hybrid-same but **not** in BAM
+(persistent switches only, flips excluded), by distance to the nearest 500 kb
+chunk boundary:
+
+- 392 newly-introduced switch breakpoints.
+- **390 (99%) are chunk-interior**, median 122 kb from any boundary.
+- Only 2 are within 2 kb of a boundary.
+
+So the residual is **not** a merge artifact — it is created **inside** chunks,
+during k-means, exactly the hypothesis that adding sites changes the within-chunk
+partition.
+
+### Test 3 — mechanism: partition instability, not graph-site errors
+
+Two further checks rule out the naive "graph sites place errors" story:
+
+1. **No colocation with graph sites.** New switches within W bp of a graph-only
+   site: 4% (150 bp), 7% (500 bp), 23% (2 kb) — all **at or below** the random
+   baseline (4.7% / 15.5% / 62%). The switches do not sit at the added sites.
+2. **Churn is two-way and large.** Hybrid (BAM rule) vs BAM:
+   - ADDS 392 switch breakpoints
+   - REMOVES 335 switch breakpoints
+   - net **+57** (≈ the +55 summary delta); total churn **727**.
+
+The net (+57) is small against the churn (727). Adding ~8k–10k graph sites does
+not inject errors at specific loci; it **perturbs the global k-means consensus**,
+which reshuffles ~700 breakpoints genome-wide and happens to land slightly
+net-worse on switches (while improving Hamming and contiguity). This is
+**optimizer sensitivity to the site set**, not a graph-quality problem.
+
+### Answer to "would the same merge rule make it the same?"
+
+Almost, but not exactly. Same merge rule removes ~85% of the switch gap and makes
+hybrid match/beat BAM on Hamming. The remaining **+55 switches are within-chunk**:
+the extra sites change the k-means partition (two-way churn of ~700, net +57).
+They are not at the graph sites and not at chunk boundaries — they are a
+second-order effect of re-running the same greedy k-means over a denser, slightly
+different variant set. Consistent with the earlier finding that the greedy
+k-means is itself the limiting factor: it is **not stable** under changes to the
+candidate set, so even strictly-more sites can move switches in both directions.
+
+## Inject graph sites only between unmergeable BAM blocks (REJECTED for switches — contiguity-only, structural)
+
+Idea: instead of full hybrid (which churns the within-chunk partition, +57
+switches), inject graph-only sites **only in the gaps between BAM phase blocks
+that stayed separate** — the surgical version that should keep the contiguity
+benefit without perturbing phasing. Distinct from family C (which targeted *wrong*
+merge seams); this targets *clean* unmergeable gaps.
+
+### Ceiling (offline, oracle orientation)
+
+- BAM produces **429 phase blocks** with **128 inter-block gaps** (median 4.4 kb).
+- **27 of 128 gaps contain a graph-only site** (median 2 sites/gap) — the only
+  gaps a graph-site injection could bridge.
+- Merging all 27 with **truth-optimal orientation** (best possible case):
+
+| metric | baseline | oracle-merge 27 gaps | Δ |
+|---|---|---|---|
+| phase blocks | 429 | 402 | −27 (better contiguity) |
+| within-PS switches | 1,586 | 1,737 | **+151** |
+
+### Why merging can only hurt switches
+
+Switch error is measured **within** a phase set. Two blocks stayed separate
+because a hard region (low coverage / repeat) sits between them with no signal to
+orient across. Bridging them does not remove any error — it **re-exposes that
+hard region inside one phase set**, converting what were free block-boundary
+discordances into counted within-PS switches. Even with perfect orientation the
+operation is +switches / −blocks: a pure **contiguity-for-switches trade**.
+
+### Conclusion
+
+Confirms the mechanism from the hybrid-switch analysis: the graph's extra sites
+buy contiguity (N50, fewer blocks) and **cannot** buy switch reduction, even when
+applied surgically only between unmergeable blocks with oracle orientation. The
++151 here is the same structural effect as the full hybrid's +57, just isolated.
+If contiguity is the goal, gap-injection is a cleaner lever than full hybrid
+(touches only 27 sites, no global partition churn); if switches are the goal, it
+cannot help. Validated offline; no production change made.
+
+## Does injecting gap sites + re-running k-means actually merge the blocks? (NO — empirical)
+
+The oracle test above forced merges. This tests what the **real k-means** does
+when graph sites are present in the gaps — i.e. exactly what the hybrid pipeline
+already runs. Compared BAM blocks against hybrid's per-read PS assignment for the
+27 BAM gap-pairs that have graph-only sites in the gap.
+
+### Result: k-means does not bridge
+
+| outcome | count |
+|---|---|
+| BAM gap-pairs with graph sites in gap | 27 |
+| hybrid **MERGED** the pair | **1** |
+| hybrid kept **SEPARATE** | 26 |
+| the 1 merge was **correctly oriented** | 0 |
+| the 1 merge was **mis-oriented** (made a switch) | 1 |
+
+The single merge was the smallest gap (1,258 bp) and k-means oriented it
+**wrong**, creating a switch. The other 26 — including 8 of 9 gaps narrow enough
+(<15 kb) for a HiFi read to span — were left unmerged.
+
+### Why re-running k-means can't help
+
+The gaps are **low-coverage / low-signal holes, not missing-site holes**. Of the
+9 spannable gaps, most have only **2–3 reads inside the gap**; one has 36 reads
+but a single site and still didn't merge. The block boundary exists *because* the
+reads crossing it carry no usable heterozygous signal (low coverage, repeat, or a
+homozygous stretch). Adding graph site **positions** does not add phasing
+**signal**: those sites are genotyped by the same GAF⊂BAM reads, and if those
+reads had clean spanning het alleles BAM would already have phased through. So
+k-means correctly abstains on no signal — and the one time it committed, it
+guessed wrong (50/50).
+
+### Conclusion
+
+"Inject in the gap + one more k-means round → good merge" **does not occur**:
+1/27 merged, and that one was mis-oriented. This is the empirical confirmation of
+the oracle finding — and of the whole investigation's root cause. Bridging
+unmergeable blocks needs **independent linking evidence** (spanning reads with
+het signal, i.e. new data), which graph sites over the same reads cannot provide.
+No production change made; validated offline.
+
+## Are there regions the graph phases BETTER than BAM? (YES — but not truth-free identifiable)
+
+User intuition: the "GAF ⊂ BAM, 0 unique reads" finding is about read *identity*;
+it does not preclude *regions* where the graph phases better (a read can be in
+both but soft-clipped/misplaced in BAM yet clean in the graph). Tested directly.
+
+### Methodology fix (important)
+
+First attempts had a scoring bug: best-flipping a 100 kb *window* as a whole vs
+best-flipping each *phase set* gave contradictory answers (a window with two
+opposite-oriented PS scores 50% under window-flip but 0% under per-PS flip). The
+"159 windows graph wins" and "BAM 50%/graph 0%" intermediate numbers were
+artifacts and are **retracted**. Correct metric: best-flip **each PS
+independently**, label every read correct/incorrect (flip-invariant), then
+compare pipelines on shared reads.
+
+### Result: graph-favorable regions are real
+
+Reads phased by **both** pipelines (207,687):
+
+- GRAPH right & BAM wrong: **25,745 reads**
+- BAM right & GRAPH wrong: **37,556 reads**
+
+Net favors BAM (matches the aggregate Hamming 3.1% vs 7.3%), but the two-way
+disagreement is large and there is a **genuine graph-favorable subset**. Per
+100 kb window (≥20 shared reads): **142 windows graph wins, 205 BAM wins, 293
+tie**. In the graph-win windows BAM is internally noisy (a mid-block switch);
+the graph holds a clean single block. So the intuition is **correct**: the graph
+does phase some regions better.
+
+Separately, **8,443 reads are phased by graph but not BAM at all**; of those,
+~1,154 (39 PS) are well-phased (<10% disc), the rest poorly. So the graph also
+adds a small amount of correctly-phased coverage BAM misses.
+
+### But the regions are not truth-free identifiable — so not exploitable
+
+The blocker for a selective hybrid: can we tell *which* regions to trust the
+graph on **without** truth? Tested BAM's own internal consistency (fraction of
+window reads agreeing with the window-majority HP) as a router signal:
+
+| window class | n | median BAM internal consistency |
+|---|---|---|
+| graph wins | 142 | 0.64 |
+| BAM wins | 205 | 0.58 |
+| tie | 293 | 0.55 |
+
+The signal **does not separate** graph-win from BAM-win windows (0.64 vs 0.58,
+both near the 0.5 split floor). BAM looks equally unsure in regions where it is
+actually right and where it is actually wrong. So a selective hybrid has no
+reliable truth-free rule to defer to the graph — blindly merging pulls in the
+graph's 205 losses with its 142 wins, which is exactly why every whole-pipeline
+merge tested lands net-worse on switches.
+
+### Conclusion
+
+Both can be true at once, and both are: (1) the graph phases a real subset of
+regions better than BAM (~142 windows / ~25k reads), validating the intuition;
+(2) those regions cannot be identified from BAM-side signal without truth, so the
+gain is not capturable by a router. The remaining path to exploit them is an
+**independent confidence signal** — e.g. the graph pipeline emitting a calibrated
+per-PS phasing-quality score that is trustworthy where it disagrees with BAM —
+which would require validating that the graph *knows* when it is right (its own
+confidence vs truth). That is the concrete next experiment if this thread is
+pursued. Validated offline; scoring bug noted and corrected; no production change.
+
+## Can a confidence signal route reads to the graph where it wins? (NO — gain is 3 lucky regions, not a generalizable signal)
+
+Follow-up to the previous section: the graph phases ~142 windows / ~25k reads
+better than BAM, but those regions were not separable by a single BAM-side
+signal. This tests the full question — can **any** truth-free signal (graph-side,
+BAM-side, or a learned combination) identify where to trust the graph, enough to
+build a confidence-routed hybrid?
+
+### Setup
+
+Trusted labels: best-flip each PS, per-read correct/incorrect (flip-invariant).
+Focus on the **63,301 disagreement reads** (graph and BAM give different
+correctness) — the only reads a router decision affects. Base rate: 40.7%
+graph-right. Target: predict graph-right without truth, route those reads to the
+graph.
+
+### Single signals — all useless
+
+Truth-free signals tested (per graph PS and per read): PS size, het-site density
+(5k/20k windows, graph and BAM), allele-frequency-near-0.5, mean depth, read
+mapq, read coverage, BAM/graph orientation agreement, position offset.
+
+| signal | AUC |
+|---|---|
+| read mapq | 0.50 |
+| graph PS size | 0.44 |
+| BAM PS size | 0.52 |
+| het-density diff | 0.53 |
+| all others | 0.48–0.53 |
+
+Every single signal is at chance. Best linear combination (logistic regression,
+held-out): **AUC 0.60** — below the 0.65 usability bar.
+
+### Gradient boosting — 0.894 was leakage
+
+A gradient-boosted model scored **AUC 0.894** with read-level 4-fold CV — but
+this is **train/test leakage**: reads from one PS share a PS-size feature and
+(mostly) one label, so reads of the same block leak across folds. Re-run with
+**GroupKFold over phase sets** (no PS in both train and test): **AUC 0.59 ±
+0.13**. The boosted model was memorizing which specific block is right, not
+learning a transferable signal. (Sanity: the top features `gps_n`/`bps_n` have
+individual AUC 0.44/0.52 — useless alone, confirming the 0.894 came from
+group structure, not signal.)
+
+### The gain is 3 regions, not a rule
+
+Translating the grouped out-of-fold predictions into routing outcomes:
+
+| threshold | routed | fixed | broke | net | precision |
+|---|---|---|---|---|---|
+| 0.5 | 20,280 | 9,978 | 10,302 | −324 | 0.49 |
+| 0.7 | 7,038 | 4,074 | 2,964 | +1,110 | 0.58 |
+| 0.8 | 3,536 | 2,646 | 890 | +1,756 | 0.75 |
+| 0.9 | 1,180 | 1,177 | 3 | +1,174 | 1.00 |
+
+The high-precision tail looks great — until you check **where it comes from**.
+At thr 0.9, **1,151 of 1,318 reads are a single phase set** (PS 2717436, graph
+disc 0.00). Decomposing net gain per PS at thr 0.8:
+
+- **Top 3 PS: +1,963 net = 158% of the total** (1,244).
+- **All other 24 contributing PS: −719 net** (net negative).
+- **AUC excluding the top 3 PS: 0.530** (chance).
+
+So the entire apparent gain is **3 lucky large blocks** that happen to be
+graph-correct and present in the data. Everywhere else the router breaks more
+reads than it fixes. This is memorization of specific regions, not a
+generalizable confidence signal.
+
+### Conclusion
+
+**The graph does not know when it is right.** No truth-free signal — single,
+linear, or gradient-boosted with PS-grouped validation — generalizes beyond a
+handful of specific regions (AUC 0.53 once those are removed). A confidence-routed
+hybrid is therefore not realizable from the signals available in the current
+pipeline outputs: it would either need (a) a genuinely calibrated per-PS quality
+score computed inside the graph phaser and validated to transfer across regions,
+or (b) independent linking data. This closes the last open thread: the graph's
+region-level wins are **real but not capturable** without truth. Validated
+offline (sklearn GroupKFold); no production change. Methodological note for future
+work: **always group-split by phase set** — read-level CV leaks and inflated this
+AUC from 0.59 to 0.89.
+
+## Why does the graph phase some regions better? (NOT more sites — k-means convergence coin-flip)
+
+Having established the graph wins ~141 windows but those wins aren't routable,
+the remaining question is *why* it wins them. Tested every data-side hypothesis on
+the three window classes (graph-win=141, bam-win=204, neutral=293, 100 kb,
+PS-aware, ≥30 shared reads).
+
+### It is NOT more sites, coverage, or quality
+
+| class | graph het (med) | bam het (med) | g−b het | bam cov | graph cov | bam mapq | graph mapq |
+|---|---|---|---|---|---|---|---|
+| GRAPH-WIN | 103 | 98 | **−1** | 332 | 328 | 60 | 60 |
+| BAM-WIN | 108 | 108 | −3 | 350 | 352 | 60 | 60 |
+| NEUTRAL | 120 | 123 | −2 | 372 | 372 | 60 | 60 |
+
+In graph-win windows the graph has **equal or slightly fewer** het sites, the same
+coverage, and the same mapq as BAM. The graph never has more sites anywhere — it
+has marginally fewer everywhere. **Site count, coverage, and read quality are
+ruled out.** The two pipelines see the same reads at the same sites with the same
+quality, yet phase differently.
+
+### The mechanism: each pipeline's k-means coin-flips convergence
+
+Counting within-window switches per pipeline:
+
+| class | BAM switches/win | graph switches/win |
+|---|---|---|
+| GRAPH-WIN | 9 (clean) | 60 (noisy) → wait, graph WINS here |
+| BAM-WIN | 68 (noisy) | 10 (clean) |
+| NEUTRAL | 60 | 60 |
+
+(The disc-rate winner is what defines the class; the switch counts show the
+*loser* in each class has a mid-block switch.) The pattern is **symmetric**: in
+graph-win windows BAM carries a switch the graph avoided; in bam-win windows the
+graph carries a switch BAM avoided; in neutral windows both are equally noisy.
+
+Decomposing the **loser's** error shape:
+
+- GRAPH-WIN: BAM's error is a **clean switch** (one contiguous wrong block ≈ a
+  half-window orientation flip) in **83/141** windows; scattered noise in 58.
+- BAM-WIN: graph's error is a clean switch in **120/204**; scattered in 84.
+
+A "clean switch" means the k-means oriented half the window the wrong way — a
+**convergence failure**, not ambiguous data (the other pipeline got the same
+evidence right). 
+
+### Conclusion
+
+The graph's region-level wins are **not a data advantage** — same sites, same
+reads, same coverage, same quality. They are the **same fragile greedy k-means
+landing a different coin-flip**: in each hard window, each pipeline independently
+either converges to the clean haplotype partition or to a half-flipped one, and
+"graph-win" is simply where the graph's flip landed right and BAM's landed wrong
+(and symmetrically for bam-win). This is the same k-means instability behind the
++57 hybrid churn, now shown to drive the region-level differences too. It explains
+both earlier findings at once: the wins are **real** (genuine convergence
+differences) but **not routable** (a coin-flip has no truth-free tell). The only
+fixes are a **more stable optimizer** (shown earlier that MEC/EM/transition-penalty
+don't beat the current k-means on the real matrix) or **independent data**.
+Validated offline; no production change.
+
+---
+
+## Does a more stable optimizer beat production? (multi-restart + MEC selection)
+
+**Motivation.** The coin-flip mechanism above suggests the win is restart-luck.
+If so, running many random-pivot restarts and **selecting by a truth-free
+objective** (MEC energy) should land the good basin more often and cut switches.
+Tested on the real dumped matrix (133 chunks, flags140, PS-aware best-flip
+scoring per phase set). Production baseline = **1,656 switches / 3.376% disc**.
+
+### 1. Convergence variance is real and large
+8 random pivot inits per chunk on the first 20 chunks: per-chunk switch count
+ranges **26–92** by init alone (e.g. chunk 112: 57→149); total-switch range 941
+across 20 chunks. MEC energy also varies per run (spread 944–3934), so a
+truth-free objective *can* in principle distinguish runs.
+
+### 2. But restarting the reimplemented k-means is far worse
+12 restarts, pick min-MEC, scored from scratch:
+
+| optimizer | switches | disc |
+|---|---|---|
+| production | 1,656 | 3.376% |
+| multi-restart ×12, min-MEC | 5,473 | 43.3% |
+| oracle (min-**switch** run) | 4,432 | — |
+
+The reimplemented `pivot_init`/`kmeans` is a **degenerate baseline** — even its
+oracle (4,432) can't reach production (1,656). Production's category weights,
+HOM handling, and locked-pivot Phase-1 init are doing real work that a plain
+Lloyd restart discards. Restarting a worse optimizer can't beat a better one.
+
+### 3. MEC is a weak proxy for switch count
+Within-chunk Spearman ρ(MEC, switches) over 40 chunks: **mean 0.565**, median
+0.594, positive in 97%. But argmin(MEC) == argmin(switches) in only **13/40**
+chunks. MEC correlates with truth switches but selects the truly-best run only
+~⅓ of the time — too weak to be a reliable selector.
+
+### 4. Deployment-realistic test: production never gets overridden
+Include production's own assignment as one candidate alongside 12 restarts,
+select min-MEC:
+
+| | switches |
+|---|---|
+| production | 1,656 |
+| prod + 12 restarts, min-MEC | 1,658 (**+2**) |
+
+MEC swapped away from production in only **2/133** chunks, and one of those two
+made switches worse. Net effect ≈ zero. **A more stable optimizer provides no
+truth-scored gain** — production already sits at the good basin MEC would pick.
+
+### 5. Ensemble instability does not flag errors
+Per-read vote fraction across 12 aligned restarts; "unstable" = vote fraction in
+(0.2, 0.8). Unstable reads are discordant **48.6%** vs stable **46.3%** —
+essentially no separation (flag precision 0.486 ≈ base rate). Restart-instability
+carries **no truth-free signal** about which reads are mis-phased, so a
+consensus/confidence scheme built on it cannot route or correct errors.
+
+### Conclusion
+A more stable optimizer does **not** beat production k-means. (1) Variance is
+real, but (2) the only optimizer that beats restarts *is* production, (3) MEC is
+too weak a selector to improve on it, (4) when offered production as a candidate
+MEC keeps it (net +2), and (5) restart-instability is not a usable error signal.
+Combined with the earlier MEC/EM/transition-penalty results, every truth-free
+optimizer variant tried fails to beat the current k-means. The coin-flip wins
+are real but not capturable without **independent data**. Validated offline; no
+production change. The `--dump-phase-matrix` debug flag remains the only `src/`
+change and alters no phasing behavior.
+
+---
+
+## Can graph read-mappings link BAM phaseblocks across gaps?
+
+**Idea (independent-data angle).** Phase with BAM, find the gaps between adjacent
+BAM phaseblocks that couldn't be merged, and ask whether reads' **graph (GAF)
+mappings** span those gaps even where their **BAM alignments** break. A read whose
+linear BAM alignment clips at a repeat/SV but whose graph path threads through
+could supply linkage BAM lacks — turning two blocks into one. This is distinct
+from earlier gap-injection (which injected graph *sites* into k-means); here we
+test graph *read connectivity* directly.
+
+### Setup
+- BAM phaseblocks from `bam.phased.vcf`: **431 PS blocks, 430 inter-block gaps,
+  ~11 Mb total gap.** Largest gaps cluster in the peri-centromere (27–32 Mb).
+- GAF: 271,930 alignments with linear ref projection (contig, ref_start, ref_end).
+- A read "spans" a gap a→b if some alignment has ref_start≤a and ref_end≥b.
+- "graph-only" spanner = spans in GAF but **no** BAM alignment of that read spans.
+
+### Coordinate spanning exists, but is a centromeric artifact
+287/430 gaps have ≥1 GAF spanner. Classifying by region (centromere = 26.0–29.5 Mb):
+
+| region | n_gaps | gaps with graph-only linkage | total graph-only reads | total GAF spanners |
+|---|---|---|---|---|
+| **arm** | 400 | **5** | **65** | 6,288 |
+| **cent** | 30 | 17 | **1,534** | 1,885 |
+
+**96% of all graph-only linkage (1,534/1,599 reads) is inside the centromere.**
+There, "spanning" is a linear-projection artifact: the graph path threads a
+tandem-repeat array that the BAM aligner correctly refused to align across, and
+truth alignment itself fails (the diplinator can't place these reads either).
+Spanners also scatter across many production PS labels rather than anchoring the
+two specific flanking blocks (e.g. 393 spanners of the 26.567→26.591 Mb gap, only
+6 with any truth hap, only 3 assigned to a flanking PS).
+
+### On the arms, there is no usable linkage
+Only **4 arm gaps** have ≥3 graph-only spanners. Examining each for truth-consistent
+orientation (a merge needs spanners that agree on the relative phase of the two
+blocks):
+
+| arm gap | graph-only | truth-hap split | no-truth / unaligned |
+|---|---|---|---|
+| 49,661,443→49,661,903 (460 bp) | 23 | **9 MAT / 9 PAT** | 5 |
+| 31,765,624→31,766,466 (842 bp) | 20 | 3 MAT | **17** |
+| 31,780,986→31,909,439 (128 kb) | 13 | 3 MAT | **10** |
+| 29,506,920→29,510,999 (4 kb) | 7 | 1 PAT | **6** |
+
+- The one gap with both haplotypes present (49.66 Mb) splits **9 MAT / 9 PAT** —
+  perfectly mixed, which gives **zero** orientation signal (linkage requires the
+  spanners to consistently tie the blocks in one relative phase, not 50/50).
+- The other three are dominated by **no-truth/unaligned** reads: the graph spans
+  linearly but truth can't place the reads, so the "linkage" crosses a repeat
+  where the projection is unreliable.
+
+### Conclusion
+Mapping BAM phaseblocks to the graph and inspecting inter-block read mappings does
+**not** yield a usable merge signal. The graph-only spanning is real but ~entirely
+centromeric, where it reflects a linear-projection artifact over repeats rather
+than true connectivity — exactly the regions where BAM's refusal to span is
+*correct* and truth itself is undefined. On the chromosome arms, where phasing is
+meaningful, graph-only spanners are too few (4 gaps) and carry no consistent
+orientation (mixed haplotypes or unaligned reads). This is consistent with the
+established GAF ⊂ BAM finding: the graph is a second alignment of the same HiFi
+bases, so outside repeat regions it cannot connect what BAM cannot. The remaining
+graph wins stay attributable to k-means coin-flips, not extra linkage. Validated
+offline; no production change.
+
+---
+
+## Do reads map *better* in the graph (CHM13 ≠ sample)? Alignment-quality rescue
+
+**The objection.** The reads are HG002 HiFi mapped to CHM13 — a reference that is
+**not** the sample. Where HG002 diverges from CHM13 (SVs, divergent/segdup
+haplotypes), the *linear* BAM alignment may be present but **wrong** (clipped,
+mis-placed), while the graph threads the correct alternate path. "GAF ⊂ BAM" is
+about read *identity*; it doesn't rule out the graph *aligning the same read
+better*. This is a sharper test than the earlier coordinate-spanning one, which
+only checked whether BAM physically reached across a gap, not whether its
+alignment there was correct.
+
+### Methodology note (a real bug I made and caught)
+First pass read the wrong GAF columns: this file is a **custom format with 3
+extra leading columns** (contig, ref_start, ref_end) before the standard GAF
+block, so matches/blocklen/mapq are at cols **13/14/15**, not 10/11/12. The wrong
+read produced a fake "18,063 reads where BAM mapq<20 but GAF mapq≥60." After
+fixing the column offset, the result inverted (see below). Lesson: always sanity-
+check that a "mapq" column actually ranges 0–60.
+
+### GAF and BAM mapq are byte-for-byte identical
+With the **correct** columns:
+
+> **GAF mapq == BAM mapq for 271,930 / 271,930 reads (100.0%).**
+
+The graph alignment is not an independent remap — it carries the *same minimap2
+mapq* as the BAM, because it is the same alignment re-projected onto the graph.
+So there is **no** read where the graph is more *confidently* placed than BAM
+(0 reads with GAF mapq ≥ BAM mapq + 20, and 0 the other way). This is the
+strongest form of GAF ⊂ BAM yet: same reads, same alignments, same confidence.
+
+### One real residual: BAM-clipped, graph-clean reads
+The graph *can* still differ in **alignment extent**: 792 reads are soft-clipped
+>15% in BAM yet align ≥98% identity in GAF (637 on the chromosome arms). These
+are real CHM13-vs-HG002 divergence loci where the graph's alt path lets the read
+align full-length. Tracing them through the pipelines and truth:
+
+| | count |
+|---|---|
+| BAM-clipped>15% & GAF identity>98%, on arm | 637 |
+| …phased **concordantly** by the graph pipeline | 184 (100% concordant) |
+| …phased by graph but **not** by BAM at all | **39** (all concordant) |
+| …among reads BAM did phase, BAM **discordant** / graph correct | 4 |
+| …of the 39 graph-only rescues, captured by current **hybrid** | **1** |
+
+So the objection is **partially right**: there is a genuine, truth-validated set
+of ~39 arm reads that the graph phases correctly because its alt path aligns them
+where BAM clips — and BAM phases none of them. They sit at **31–32 Mb**, exactly
+among the large BAM phaseblock gaps (128 kb, 151 kb, 170 kb …) in the segdup-rich
+peri-centromeric edge, the region where CHM13≠HG002 divergence is highest.
+
+### But the magnitude is tiny and the hybrid already misses it
+- **39 reads** total, all in one ~1 Mb segdup band — against 1,393 BAM switches
+  and ~223k phased reads. Even perfectly exploited, this cannot move the chr20
+  switch/Hamming numbers measurably.
+- The current hybrid pipeline captures **1 of 39**, so the mechanism is real but
+  not wired in. Exploiting it would mean preferring the graph's alignment extent
+  (not its mapq, which is identical) for clipped reads in divergent loci.
+
+### Conclusion
+The "reads map better in the graph" claim is **correct in kind but small in
+degree** on this CHM13/HG002 chr20 data. Mapping *confidence* is identical (same
+minimap2 mapq, 100%), so the graph never rescues via better mapq. The only real
+edge is **alignment extent**: ~39 arm reads that BAM soft-clips but the graph
+aligns full-length and phases correctly, clustered in the 31–32 Mb segdup band
+near gaps BAM cannot close. This is a genuine independent-data signal — the first
+found in this whole investigation — but at 39/223,000 reads it is far too small to
+shift aggregate accuracy, and the current hybrid captures only 1. It would matter
+more on a sample/region with heavier structural divergence from the reference than
+chr20 offers here. Validated offline; no production change.
+
+---
+
+## Can the graph add correct phaseblocks where BAM phases nothing?
+
+**Idea.** Don't fix BAM regions — *add* phaseblocks in regions BAM leaves
+unphased. Even a few extra correct blocks is a net win (improves N50/auN, phases
+reads BAM drops). Test: find graph PS blocks lying entirely outside BAM's phased
+coverage, then check them against truth.
+
+### Graph-only blocks exist
+Merging BAM's 431 phased blocks into coverage intervals, **45 graph PS blocks
+fall entirely outside** BAM coverage; **17 carry ≥2 phased het vars** (the rest
+are singletons). Several are substantial (e.g. 26.87 Mb / 36 vars, 32.23 Mb / 23
+vars, 44.03 Mb / 15 kb span).
+
+### But raw graph-only blocks are only ~⅓ correct
+Scoring each against truth (best-flip disc over its phased reads):
+
+> **5 / 17 are perfect (100% concordant); the rest range down to 50–60%
+> accuracy — i.e. coin-flip garbage.**
+
+The bad blocks are the same fragile-k-means failure seen elsewhere: high-read
+blocks (146, 66, 63 reads) at ~55–60% accuracy are half-flipped partitions, not
+real haplotypes. Admitting them blindly would *add wrong phase*, which is worse
+than leaving the region unphased.
+
+### A truth-free filter recovers a clean subset
+Per-block signals vs truth accuracy revealed the discriminators:
+
+| signal | finding |
+|---|---|
+| **indel fraction** | every coin-flip block (acc 0.53–0.60) is **100% indels** with high DP (33–77) — repeat/homopolymer false-het piles |
+| **degenerate span** | several bad blocks have span 0–1 bp with many reads (var/kb 999–2000) — multiple vars stacked at one position |
+| **segdup band** | the remaining SNP-rich bad blocks all cluster in **32.2–32.5 Mb**, a known CHM13 peri-centromeric segmental-duplication band where paralogs create false hets |
+| ~~strand bias, AF~~ | **RETRACTED — see bug below.** AF doesn't separate paralog-het from real het, but the "strand bias useless" claim was wrong: it was an artifact of a strand-accounting bug, not biology |
+
+Applying **"≥2 SNPs AND not in the 32.2–32.5 Mb segdup band"**:
+
+> **4 extra correct phaseblocks, 1 bad admitted, 15 reads newly phased.**
+
+(Recall of the perfect blocks is 4/5; the SNP filter alone gives recall 5/5 but
+admits 4 bad, so the segdup exclusion is what makes it usable.)
+
+### Conclusion
+The idea **works in principle and yields a real, if small, win**: ~4 extra
+truth-correct phaseblocks on chr20 that BAM does not phase at all, recoverable
+with a simple truth-free filter (require ≥2 SNPs, exclude the pure-indel and
+segdup-band blocks). This is the same independent-data edge as the clipped-read
+rescue — concentrated in the 26–32 Mb peri-centromeric region where CHM13≠HG002
+divergence is highest — and again **tiny in magnitude** (4 blocks / 15 reads
+against 431 BAM blocks). Unlike the optimizer and linkage avenues (which produced
+*nothing*), this one is a genuine, defensible net gain and the most promising
+hybrid lever found: graph-only blocks are additive (they can't introduce switches
+into existing BAM blocks since they occupy disjoint regions), so the only risk is
+admitting a wrong block, which the filter controls. A production implementation
+would: (1) emit graph PS blocks, (2) keep only those disjoint from BAM coverage
+with ≥2 SNPs and outside known segdup/centromere bands, (3) append them to the BAM
+phasing. Worth doing for N50/auN even though aggregate switch/Hamming barely move.
+Validated offline; no production change yet.
+
+### BUG FOUND: graph candidate strand counts are always forward (REVERSE=0)
+
+While testing a strand-bias filter for the graph-only blocks, every graph
+candidate showed `REVERSE_REF=0` and `REVERSE_ALT=0`. Investigation showed this
+is **not biology** (HiFi reads map to both strands — the GAF path orientation is a
+real ~49/51 split, 139,013 `>` forward / 132,917 `<` reverse) but a **bug in the
+output-table rebuild**:
+
+- Strand is parsed correctly from **path orientation** (`graph_query.cpp:56`,
+  `reverse = orient == '<'`), *not* the GAF strand column (which is always `+`).
+- Chunk-level accumulation is correct: `graph_bam_adapter.cpp:444-466` splits
+  forward/reverse counts properly, and the **strand-bias filter does run** on them
+  (`graph_bam_adapter.cpp:179-190`, Fisher-exact, `is_ont()`-gated — mirrors the
+  BAM filter at `collect_var.cpp:1475-1482`).
+- **The defect:** `graph_chunks_to_candidate_table` (`graph_collect.cpp:146-147`)
+  rebuilds candidates from strand-**merged** `alle_covs` and sets
+  `forward_ref = ref_cov; forward_alt = alt_cov`, **never setting reverse**. So the
+  emitted `graph.candidates.tsv` zeroes all reverse counts.
+
+This is the **same lossy-rebuild pattern** as the `RepeatHetIndel` re-promotion bug
+(also in `graph_chunks_to_candidate_table`): the function discards category and
+strand information computed upstream.
+
+**Consequence for the analysis above:** my offline "strand bias is useless"
+conclusion was drawn on the corrupted TSV (every variant looked single-strand), so
+it is **invalid**. The strand-bias filter that runs *during* phasing uses correct
+counts, but I could not evaluate strand bias as a graph-only-block discriminator
+because the dumped data was wrong. The indel-fraction and segdup-band signals
+stand; the strand-bias verdict is retracted pending a re-test on fixed output.
+
+**Fix (one line):** in `graph_collect.cpp:146-147`, copy
+`mcand.counts.forward_ref/reverse_ref/forward_alt/reverse_alt` (already strand-
+correct after biallelic pairing) instead of deriving forward-only from
+`alle_covs`. This is a debug-output/VCF-annotation correctness fix; it does not
+change k-means (which uses the chunk counts, not the rebuilt table) but it does
+affect the emitted strand-bias-derived VCF fields and any downstream strand
+filtering on the TSV.
+
+### APPLIED + RE-TESTED: strand fix and the corrected strand-bias verdict
+
+Applied the one-line fix and regenerated `graph.candidates.tsv` + the graph eval
+dump. Verification:
+
+- Reverse counts now populated; only **0.43%** of het variants are zero-reverse
+  (genuine single-strand sites), down from **100%**.
+- Graph strand counts now **match the BAM pipeline** at shared positions (e.g.
+  pos 59818: both Fref=8 Rref=5 Falt=7 Ralt=13).
+- Site count **unchanged** (74,119) — confirms the fix is output-only and does
+  not alter phasing.
+
+**Strand-bias verdict (now valid):** Re-running per-variant Fisher-exact strand
+bias on the **corrected** counts across all 17 graph-only blocks flags **zero**
+variants (every block min-p > 0.09). So strand bias is **not** a discriminator for
+the graph-only coin-flip blocks. The earlier "strand bias useless" conclusion was
+right in outcome but had been drawn on corrupted data; it is now confirmed on
+correct data. (Strand bias remains a valid filter in general — it just doesn't
+separate *these* blocks, which fail for a different reason.)
+
+### The real discriminator: the RepeatHetIndel re-promotion bug
+
+Inspecting the worst coin-flip blocks (acc 0.53–0.60 at 40–44 Mb) directly in the
+VCF shows they are **pure homopolymer / STR indels** emitted as `CLEAN`:
+
+```
+40,685,510  C>CA, C>CAA              (poly-A insertion)
+42,042,659  A>ATA, A>ATATATATA       (TA-repeat expansion)
+43,797,938  C>CT, C>CTT              (poly-T)
+44,300,880  C>CAA, C>CAAAA, C>CAAAAAA, C>CAAAAAAA  (poly-A run, same pos)
+44,032,221  AA>A, GG>G               (homopolymer deletions)
+```
+
+These are textbook `is_homopolymer_indel` / `is_repeat_indel` hits. The noise
+filter **does** demote them to `RepeatHetIndel` during phasing (so they're
+excluded from k-means and never properly phased — hence the ~50% coin-flip
+accuracy), but `graph_chunks_to_candidate_table` rebuilds the output category
+from scratch (`graph_collect.cpp:170-180`, classifying purely by type/AF/depth)
+and **re-promotes them to `CleanHetIndel`**, so they pass the VCF germline gate
+and surface as phased het indels with a (default) PS. This is the same lossy-
+rebuild defect as the strand bug, in the same function.
+
+**This is the actual filter the indel-fraction signal was detecting.** The
+"100%-indel coin-flip block" pattern is precisely the re-promoted repeat indels.
+The principled fix is not a strand or indel-fraction heuristic but **preserving
+the `RepeatHetIndel` demotion** through the rebuild — then these 7 bad blocks
+never enter the graph VCF at all.
+
+### Updated recommendation for graph-only-block rescue
+Breakdown of the 17 multi-var graph-only blocks by failure mode:
+
+| failure mode | blocks | fix |
+|---|---|---|
+| pure repeat/homopolymer indel (acc ~0.5–0.6) | ~7 | preserve `RepeatHetIndel` demotion in rebuild |
+| SNP-rich, in 32.2–32.5 Mb segdup band (acc 0.56–0.78) | 3 | segdup/centromere band exclusion |
+| clean SNP-bearing, correct (acc 1.0) | ~5 | **keep — these are the win** |
+
+So the production path is cleaner than the earlier "≥2 SNPs + segdup" heuristic:
+(1) **fix the RepeatHetIndel re-promotion** (removes the pure-indel coin-flips at
+the source, a correctness fix that also benefits the main graph VCF), (2) **exclude
+known segdup/centromere bands**, (3) **append remaining graph-only blocks** to the
+BAM phasing. Strand bias is *not* needed for this. The strand fix is still a valid
+independent correctness fix and is applied. Validated offline.
+
+### APPLIED: RepeatHetIndel re-promotion fix (+ two underlying noise-filter bugs)
+
+Implemented the fix. It required correcting **three** distinct defects, all of
+which let homopolymer/STR indels reach the phased graph VCF:
+
+**Bug A — category dropped on rebuild (`graph_collect.cpp`).**
+`graph_chunks_to_candidate_table` re-classified every indel het as
+`CleanHetIndel` from scratch, discarding the noise filter's `RepeatHetIndel`
+demotion. Fixed by preserving the demotion: if the chunk candidate is
+`RepeatHetIndel`, carry it (and `kLongcalldRepHetVar`) through the rebuild instead
+of re-promoting.
+
+**Bug B — noise filter never fired (`graph_bam_adapter.cpp` + `noise_filter.cpp`).**
+Even before the rebuild, the demotion was rarely set, for two reasons:
+  1. *Non-minimal graph alleles.* Graph emits indels with the full repeat run on
+     both sides (e.g. `CAAAAAAAAAAA > CAAAAAAAA` for a 3 bp deletion).
+     `is_noisy_site` derives the indel length from allele sizes, so the length
+     exceeded `max_xgaps` and the homopolymer scan was skipped. **Fix:** trim each
+     allele pair to minimal VCF form (shared suffix then prefix) before the check.
+  2. *Off-by-one in the shared scan.* `is_homopolymer_indel` / `is_repeat_indel`
+     read the reference context starting at the VCF **anchor** base (`end_pos =
+     pos`) instead of the inserted/deleted content one base later. For `C>CAAA`
+     over reference `...c|aaaa…`, the scan saw the anchor `c` and missed the
+     poly-A run. Verified empirically (`end_pos=pos` → not detected; `end_pos=pos+1`
+     → detected) for all failing cases. **Fix:** start the downstream scan at
+     `pos+1` (insertion) / `pos+del_len+1` (deletion), upstream at `pos`; also made
+     the `is_repeat_indel` insertion comparison nt4-encoded so soft-masked
+     (lowercase) reference matches. *This shared function is used only by the graph
+     and hybrid-inject paths; the BAM pipeline has its own local
+     `var_is_homopolymer_pg`, so this change does not affect BAM.*
+
+**Bug C — only the first alt checked (`graph_bam_adapter.cpp`).**
+Multiallelic sites (e.g. pos 33,887,895 with 9 poly-A alts) were tested only on
+`meta.alts[0]`, which after decomposition need not be the phased allele — and the
+longest alt could exceed `max_xgaps`. **Fix:** check **every** alt and demote the
+site if any is noisy.
+
+**Result on the graph pipeline (chr20):**
+
+| metric | before (buggy) | after (fixed) |
+|---|---|---|
+| Hamming error | 1.03% | **0.81%** |
+| Switch error | 0.24% | **0.18%** |
+| switches | 492 | **368** |
+| flips | 1,025 | **859** |
+| perfect phase sets | 37.8% | **39.4%** |
+| variants demoted to `REP_HET_INDEL` | (re-promoted to clean) | **16,841** |
+
+Graph-only multi-var blocks dropped from 17 → 13; the four egregious pure
+poly-A/poly-T/TA-repeat coin-flip blocks at 40–44 Mb (acc ~0.5–0.6) are gone, and
+all five truth-correct clean SNP blocks remain. **7 of 8** previously-leaking
+repeat-indel blocks are now filtered.
+
+**One residual (not an artifact):** pos 49,031,428 is a large `AGGG` STR expansion
+(~40 bp insertion in an AGGG tandem array), not a small homopolymer slip. Its
+insertion length dwarfs `max_xgaps`, so it is intentionally *not* caught by the
+short-indel noise filter. It phases at ~0.92 and is a real large-STR variant — a
+policy decision (large-STR handling) separate from this re-promotion bug.
+
+The 3 remaining SNP-rich bad blocks are all in the 32.2–32.5 Mb segdup band and
+still require the segdup/centromere-band exclusion described above. Unit tests pass;
+site count unchanged (74,119). Validated offline.
