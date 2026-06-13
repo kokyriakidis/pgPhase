@@ -1078,6 +1078,45 @@ project's measure-first track record):**
 **Status:** not yet started — awaiting decision on probe-first (recommended) vs
 build-first. This is the live thread to resume.
 
+### Probe results: graph-core + BAM-gap-fill (the narrower strategy)
+
+Refined goal (user): keep graph's phased core untouched; for reads graph leaves
+**unphased**, phase them using BAM-validated sites the graph lacks. Purely additive
+gap-fill — no merging/re-orienting of graph's clean blocks (avoids the short-block
+confound). Both probes run offline on the post-fix per-read results:
+
+**Probe 1 — reachability (PASS).** Gap-fill candidate set = reads BAM phases but
+graph does not = **18,723 reads**. Of these, **18,668 (99.7%) are present in the
+GAF** — graph sees the reads, it just has no phasing sites there. Only 55 are
+unreachable. So the strategy is mechanically feasible.
+
+**Probe 2 — accuracy ceiling (the catch).** The fill reads error at **20.84%**
+under BAM, because graph lacks sites there *precisely because they are the hard
+regions* (segdups / low-complexity; concentrated in 45–46, 21–22, 44–45, 13–14,
+36–37 Mb windows). Projected combined:
+
+| Method | Reads | Hamming |
+|---|---:|---:|
+| Graph (core only) | 203,715 | 0.80% |
+| **Graph + BAM-fill (optimistic)** | **222,438** | **2.49%** |
+| BAM | 219,925 | 3.09% |
+| Hybrid (current) | 220,708 | 3.22% |
+
+**Conclusion:** the strategy *works* and gives the best accuracy/coverage combo of
+any method — **~2.49% Hamming at 222k reads** (beats BAM 3.09% and current hybrid
+3.22%, at higher coverage). BUT it does **not** preserve graph's 0.80%: the gap
+reads are intrinsically the hardest, so adding them at ~21% error drags the
+combined rate up ~3×. Graph's advantage is *diluted, not inherited*. And 2.49% is
+the **optimistic ceiling** — it assumes fill reads phase at full BAM accuracy and
+that seam-stitching graph blocks via BAM sites injects no new switches (the
+dominant real-world failure in the rejected-lever ledger). Realistic outcome sits
+between 2.49% and current hybrid's 3.22%.
+
+**Recommendation:** worth building IF the target metric rewards
+accuracy-at-high-coverage (2.49% < 3.09% BAM is a real gain). NOT worth it if the
+goal is graph's headline 0.80% — that is unreachable at full coverage by
+construction, because the missing reads are the hard ones. Decision pending.
+
 ---
 
 ## Graph Het-Indel AF Gate (resolves hybrid accuracy/contiguity regression)
