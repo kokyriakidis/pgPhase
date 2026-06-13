@@ -7,7 +7,6 @@
 /test_graph_bam_adapter
 /test_hybrid_inject
 /test_noise_filter
-/test_region_exclude
 /dist/
 /release/
 *.tar

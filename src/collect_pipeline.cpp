@@ -16,7 +16,6 @@
 #include "collect_phase.hpp"
 #include "collect_phase_pgbam.hpp"
 #include "collect_var.hpp"
-#include "region_excludes.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -151,19 +150,6 @@ static std::vector<RegionChunk> split_region(int tid,
 }
 
 /**
- * @brief Tiles `[beg, end]` into chunks, skipping any sub-ranges in @p excludes.
- */
-static void tile_with_excludes(int tid, const std::string& chrom,
-                               hts_pos_t beg, hts_pos_t end, hts_pos_t chunk_size,
-                               const std::vector<RegionFilter>& excludes,
-                               std::vector<RegionChunk>& chunks) {
-    for (const auto& sub : subtract_excludes(chrom, beg, end, excludes)) {
-        auto sub_chunks = split_region(tid, sub.first, sub.second, chunk_size);
-        chunks.insert(chunks.end(), sub_chunks.begin(), sub_chunks.end());
-    }
-}
-
-/**
  * @brief Sorts chunks and fills ids used for batching and boundary overlap logic.
  *
  * Assigns `chunk_id`, per-contig `reg_chunk_i` and `reg_i`, and `prev_*` / `next_*` neighbor
@@ -210,24 +196,21 @@ static void annotate_chunk_neighbors(std::vector<RegionChunk>& chunks) {
 }
 
 /**
- * @brief Appends `RegionChunk` tiles for one filter to `chunks`, minus excludes.
+ * @brief Appends `RegionChunk` tiles for one filter to `chunks`.
  *
  * Clips `filter.end` to the contig length when `end == -1` (full contig). Validates that the
- * contig exists in both BAM header and FASTA index. Sub-ranges covered by @p excludes are
- * not tiled (base-pair precision via `tile_with_excludes`).
+ * contig exists in both BAM header and FASTA index.
  *
  * @param region Enabled filter with `chrom` and 1-based bounds.
  * @param header BAM header for contig lengths and name resolution.
  * @param fai Reference index for `faidx_has_seq`.
  * @param chunk_size Passed to `split_region`.
- * @param excludes Intervals to remove (may be empty).
  * @param chunks Destination vector.
  */
 static void add_filter_chunks(const RegionFilter& region,
                               const bam_hdr_t* header,
                               const faidx_t* fai,
                               hts_pos_t chunk_size,
-                              const std::vector<RegionFilter>& excludes,
                               std::vector<RegionChunk>& chunks) {
     if (!region.enabled) return;
     const int tid = tid_for_name(header, region.chrom);
@@ -239,7 +222,8 @@ static void add_filter_chunks(const RegionFilter& region,
     const hts_pos_t contig_end = static_cast<hts_pos_t>(header->target_len[tid]);
     const hts_pos_t end = region.end < 0 ? contig_end : std::min(region.end, contig_end);
     if (region.beg > end) return;
-    tile_with_excludes(tid, region.chrom, region.beg, end, chunk_size, excludes, chunks);
+    auto region_chunks = split_region(tid, region.beg, end, chunk_size);
+    chunks.insert(chunks.end(), region_chunks.begin(), region_chunks.end());
 }
 
 /**
@@ -279,41 +263,13 @@ static std::vector<RegionFilter> collect_region_filters(const Options& opts,
     return filters;
 }
 
-// Shared tiling core for all build_region_chunks overloads: tile the include
-// filters (or the whole genome when none) minus the exclude intervals. Always
-// ends with annotate_chunk_neighbors.
-static std::vector<RegionChunk> build_region_chunks_impl(
-    const Options& opts, const bam_hdr_t* header, const faidx_t* fai,
-    const std::vector<RegionFilter>& filters,
-    const std::vector<RegionFilter>& excludes) {
-    std::vector<RegionChunk> chunks;
-    if (!filters.empty()) {
-        for (const RegionFilter& filter : filters) {
-            add_filter_chunks(filter, header, fai, opts.chunk_size, excludes, chunks);
-        }
-        annotate_chunk_neighbors(chunks);
-        return chunks;
-    }
-    for (int tid = 0; tid < header->n_targets; ++tid) {
-        const char* name = header->target_name[tid];
-        if (!faidx_has_seq(fai, name)) continue;
-        const hts_pos_t contig_end = static_cast<hts_pos_t>(header->target_len[tid]);
-        if (contig_end <= 0) continue;
-        tile_with_excludes(tid, name, 1, contig_end, opts.chunk_size, excludes, chunks);
-    }
-    annotate_chunk_neighbors(chunks);
-    return chunks;
-}
-
 /**
  * @brief Produces all `RegionChunk` tiles for the run.
  *
- * If any region filter is present (`-r`/`--region-file`/`--autosome`), only those intervals
- * are tiled; otherwise every BAM contig that exists in the FASTA index is split. Intervals in
- * `--exclude-bed` are subtracted at base-pair precision. Always ends with
- * `annotate_chunk_neighbors`.
+ * If any filter is present, only those intervals are tiled; otherwise every BAM contig that
+ * exists in the FASTA index is split. Always ends with `annotate_chunk_neighbors`.
  *
- * @param opts Chunk size, region, and exclude inputs.
+ * @param opts Chunk size and region inputs.
  * @param header BAM header.
  * @param fai Reference index.
  * @return Sorted, annotated chunk list (may be empty if no valid contigs).
@@ -322,26 +278,49 @@ std::vector<RegionChunk> build_region_chunks(const Options& opts,
                                              const bam_hdr_t* header,
                                              const faidx_t* fai) {
     const std::vector<RegionFilter> filters = collect_region_filters(opts, header, fai);
-    std::vector<RegionFilter> excludes;
-    if (!opts.exclude_bed.empty()) excludes = load_bed_regions(opts.exclude_bed);
-    return build_region_chunks_impl(opts, header, fai, filters, excludes);
+    std::vector<RegionChunk> chunks;
+
+    if (!filters.empty()) {
+        for (const RegionFilter& filter : filters) {
+            add_filter_chunks(filter, header, fai, opts.chunk_size, chunks);
+        }
+        annotate_chunk_neighbors(chunks);
+        return chunks;
+    }
+
+    for (int tid = 0; tid < header->n_targets; ++tid) {
+        if (!faidx_has_seq(fai, header->target_name[tid])) continue;
+        const hts_pos_t contig_end = static_cast<hts_pos_t>(header->target_len[tid]);
+        if (contig_end <= 0) continue;
+        auto contig_chunks = split_region(tid, 1, contig_end, opts.chunk_size);
+        chunks.insert(chunks.end(), contig_chunks.begin(), contig_chunks.end());
+    }
+
+    annotate_chunk_neighbors(chunks);
+    return chunks;
 }
 
 std::vector<RegionChunk> build_region_chunks(const Options& opts,
                                              const bam_hdr_t* header,
                                              const faidx_t* fai,
                                              const std::vector<RegionFilter>& filters) {
-    std::vector<RegionFilter> excludes;
-    if (!opts.exclude_bed.empty()) excludes = load_bed_regions(opts.exclude_bed);
-    return build_region_chunks_impl(opts, header, fai, filters, excludes);
-}
-
-std::vector<RegionChunk> build_region_chunks(const Options& opts,
-                                             const bam_hdr_t* header,
-                                             const faidx_t* fai,
-                                             const std::vector<RegionFilter>& filters,
-                                             const std::vector<RegionFilter>& excludes) {
-    return build_region_chunks_impl(opts, header, fai, filters, excludes);
+    std::vector<RegionChunk> chunks;
+    if (!filters.empty()) {
+        for (const RegionFilter& filter : filters) {
+            add_filter_chunks(filter, header, fai, opts.chunk_size, chunks);
+        }
+        annotate_chunk_neighbors(chunks);
+        return chunks;
+    }
+    for (int tid = 0; tid < header->n_targets; ++tid) {
+        if (!faidx_has_seq(fai, header->target_name[tid])) continue;
+        const hts_pos_t contig_end = static_cast<hts_pos_t>(header->target_len[tid]);
+        if (contig_end <= 0) continue;
+        auto contig_chunks = split_region(tid, 1, contig_end, opts.chunk_size);
+        chunks.insert(chunks.end(), contig_chunks.begin(), contig_chunks.end());
+    }
+    annotate_chunk_neighbors(chunks);
+    return chunks;
 }
 
 /**
@@ -1011,7 +990,6 @@ enum LongOption {
     kRefOption,
     kBamOption,
     kPhaseMatrixDumpOption,
-    kExcludeBedOption,
 
 };
 
@@ -1062,7 +1040,6 @@ static void print_collect_help() {
         << "      --max-af FLOAT            Maximum allele fraction for clean het candidates [0.80]\n"
         << "  -r, --region STR              Optional region; may be repeated\n"
         << "      --region-file FILE        BED file of regions to process\n"
-        << "      --exclude-bed FILE        BED file of regions to exclude from processing\n"
         << "      --autosome                Process chr1-22 / 1-22 only\n"
         << "  -j, --max-var-ratio FLOAT     Skip reads above this variant/ref-span ratio [0.05]\n"
         << "      --max-noisy-frac FLOAT    Skip reads with > this fraction in noisy regions [0.5]\n"
@@ -1154,7 +1131,6 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"max-af",                    required_argument, nullptr, kMaxAfOption},
         {"region",                    required_argument, nullptr, 'r'},
         {"region-file",               required_argument, nullptr, 'R'},
-        {"exclude-bed",               required_argument, nullptr, kExcludeBedOption},
         {"autosome",                  no_argument,       nullptr, 'a'},
         {"max-var-ratio",             required_argument, nullptr, 'j'},
         {"max-noisy-frac",            required_argument, nullptr, kMaxNoisyFracOption},
@@ -1223,7 +1199,6 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kMaxAfOption:          opts.max_af = parse_double_arg(optarg, "--max-af"); break;
             case 'r': opts.regions.push_back(optarg); break;
             case 'R': opts.region_file = optarg; break;
-            case kExcludeBedOption:     opts.exclude_bed = optarg; break;
             case 'a': opts.autosome = true; break;
             case 'j': opts.max_var_ratio_per_read = parse_double_arg(optarg, "--max-var-ratio"); break;
             case kMaxNoisyFracOption:   opts.max_noisy_frac_per_read = parse_double_arg(optarg, "--max-noisy-frac"); break;

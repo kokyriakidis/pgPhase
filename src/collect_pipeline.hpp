@@ -45,21 +45,11 @@ std::vector<RegionChunk> build_region_chunks(const Options& opts,
                                              const faidx_t* fai);
 
 // Overload that uses pre-built filters instead of re-parsing opts.regions.
-// Used by the graph path to pass contig-resolved filters. Excludes from
-// opts.exclude_bed are loaded and subtracted internally.
+// Used by the graph path to pass contig-resolved filters.
 std::vector<RegionChunk> build_region_chunks(const Options& opts,
                                              const bam_hdr_t* header,
                                              const faidx_t* fai,
                                              const std::vector<RegionFilter>& filters);
-
-// Overload that takes pre-resolved exclude filters. Used by the graph path,
-// which must remap exclude contig names (e.g. "chr20" → "CHM13#0#chr20") before
-// subtraction, the same way it resolves include filters.
-std::vector<RegionChunk> build_region_chunks(const Options& opts,
-                                             const bam_hdr_t* header,
-                                             const faidx_t* fai,
-                                             const std::vector<RegionFilter>& filters,
-                                             const std::vector<RegionFilter>& excludes);
 
 /**
  * @brief Opens primary BAM + reference index and returns chunks from `build_region_chunks`.

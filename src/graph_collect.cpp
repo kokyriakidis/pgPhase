@@ -666,14 +666,6 @@ void run_collect_graph_variation(const Options& opts) {
         for (RegionFilter& f : bed) f.chrom = resolve_contig(f.chrom);
         region_filters.insert(region_filters.end(), bed.begin(), bed.end());
     }
-
-    // Exclude BED: resolve contig names the same way as include filters so a
-    // user-supplied "chr20" matches pangenome FASTA contigs ("CHM13#0#chr20").
-    std::vector<RegionFilter> exclude_filters;
-    if (!opts.exclude_bed.empty()) {
-        exclude_filters = load_bed_regions(opts.exclude_bed);
-        for (RegionFilter& f : exclude_filters) f.chrom = resolve_contig(f.chrom);
-    }
     if (opts.autosome) {
         // With pangenome FASTAs, "chr1"–"chr22" won't be found directly; resolve_contig
         // maps them to the full name (e.g. "CHM13#0#chr1").
@@ -722,7 +714,7 @@ void run_collect_graph_variation(const Options& opts) {
     // 6. Tile genome into RegionChunks using the resolved region_filters (which may have
     //    contig names like "CHM13#0#chr20" resolved from a user-supplied "chr20").
     const std::vector<RegionChunk> chunks =
-        build_region_chunks(opts, header.get(), fai.get(), region_filters, exclude_filters);
+        build_region_chunks(opts, header.get(), fai.get(), region_filters);
     if (chunks.empty()) {
         std::cerr << "No region chunks to process\n";
         return;
@@ -885,7 +877,6 @@ static void print_graph_collect_help() {
         << "      --chunk-size INT          Region chunk size in bp [500000]\n"
         << "  -r, --region STR              Restrict to region (may be repeated)\n"
         << "      --region-file FILE        BED file of regions\n"
-        << "      --exclude-bed FILE        BED file of regions to exclude from processing\n"
         << "      --autosome                Process chr1-22 / 1-22 only\n"
         << "      --sample NAME             Reference sample name for GBZ interval queries\n"
         << "                                (auto-derived from FASTA if not provided)\n"
@@ -937,7 +928,6 @@ enum GraphCollectOption {
     kGcGafFile,
     kGcGafDb,
     kGcRegionFile,
-    kGcExcludeBed,
     kGcAutosome,
     kGcSample,
     kGcOnt,
@@ -988,7 +978,6 @@ int collect_graph_variation(int argc, char* argv[]) {
         {"chunk-size",        required_argument, nullptr, kGcChunkSize},
         {"region",            required_argument, nullptr, 'r'},
         {"region-file",       required_argument, nullptr, kGcRegionFile},
-        {"exclude-bed",       required_argument, nullptr, kGcExcludeBed},
         {"autosome",          no_argument,       nullptr, kGcAutosome},
         {"gaf",               required_argument, nullptr, kGcGafFile},
         {"gaf-file",          required_argument, nullptr, kGcGafFile},
@@ -1032,7 +1021,6 @@ int collect_graph_variation(int argc, char* argv[]) {
             case kGcChunkSize:    opts.chunk_size = parse_ll_arg(optarg, "--chunk-size"); break;
             case 'r': opts.regions.push_back(optarg); break;
             case kGcRegionFile:   opts.region_file = optarg; break;
-            case kGcExcludeBed:   opts.exclude_bed = optarg; break;
             case kGcAutosome:     opts.autosome = true; break;
             case kGcGafFile:      opts.gaf_file = optarg; break;
             case kGcGbzDb:        opts.gbz_db = optarg; break;
