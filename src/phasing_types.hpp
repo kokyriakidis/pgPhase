@@ -224,6 +224,8 @@ struct Options {
     bool autosome = false;
     bool input_is_list = false;
     std::string region_file;
+    /** Optional BED of regions to exclude from processing in all pipelines (e.g. segdup/centromere bands). */
+    std::string exclude_bed;
     std::vector<std::string> regions;
     std::string ref_fasta;
     std::string bam_file;

@@ -40,6 +40,7 @@ static void print_hybrid_help() {
         << "      --max-af FLOAT            Maximum allele fraction [0.80]\n"
         << "  -r, --region STR              Region to process; may be repeated\n"
         << "      --region-file FILE        BED file of regions\n"
+        << "      --exclude-bed FILE        BED file of regions to exclude from processing\n"
         << "      --autosome                Process chr1-22 / 1-22 only\n"
         << "      --chunk-size INT          Region chunk size in bp [500000]\n"
         << "      --hifi                    HiFi mode [default]\n"
@@ -105,6 +106,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         kPgbamFileOption,
         kAutosomeOption,
         kRegionFileOption,
+        kExcludeBedOption,
         kNoisyMaxXgapsOption,
         kRefineAlnOption,
         kStitchMinMarginOption,
@@ -129,6 +131,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         {"max-af",          required_argument, nullptr, kMaxAfOption},
         {"region",          required_argument, nullptr, 'r'},
         {"region-file",     required_argument, nullptr, kRegionFileOption},
+        {"exclude-bed",     required_argument, nullptr, kExcludeBedOption},
         {"autosome",        no_argument,       nullptr, kAutosomeOption},
         {"chunk-size",      required_argument, nullptr, kChunkSizeOption},
         {"hifi",            no_argument,       nullptr, kHifiOption},
@@ -168,6 +171,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
             case kMaxAfOption:        opts.max_af = std::atof(optarg); break;
             case 'r':                 opts.regions.push_back(optarg); break;
             case kRegionFileOption:   opts.region_file = optarg; break;
+            case kExcludeBedOption:   opts.exclude_bed = optarg; break;
             case kAutosomeOption:     opts.autosome = true; break;
             case kChunkSizeOption:    opts.chunk_size = std::atoi(optarg); break;
             case kHifiOption:

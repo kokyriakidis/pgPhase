@@ -30,6 +30,7 @@ GBZ_FFI_SYSLIBS = -ldl -lrt
 
 SOURCES_CXX = src/main.cpp \
 	src/collect_pipeline.cpp \
+	src/region_excludes.cpp \
 	src/build_catalog.cpp \
 	src/graph_collect.cpp \
 	src/hybrid_collect.cpp \
@@ -63,12 +64,13 @@ all: pgphase
 check: pgphase
 	bash scripts/validate_collect_gates.sh
 
-unit-tests: test_phase_block_stitch test_graph_sites test_graph_bam_adapter test_hybrid_inject test_noise_filter
+unit-tests: test_phase_block_stitch test_graph_sites test_graph_bam_adapter test_hybrid_inject test_noise_filter test_region_exclude
 	./test_phase_block_stitch
 	./test_graph_sites
 	./test_graph_bam_adapter
 	./test_hybrid_inject
 	./test_noise_filter
+	./test_region_exclude
 
 portable-bundle: pgphase
 	bash scripts/make_portable_bundle.sh
@@ -117,6 +119,9 @@ test_phase_block_stitch: src/test_phase_block_stitch.cpp src/collect_phase.o src
 test_graph_sites: src/test_graph_sites.cpp src/graph_sites.o
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 
+test_region_exclude: src/test_region_exclude.cpp src/region_excludes.o
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
+
 test_graph_bam_adapter: src/test_graph_bam_adapter.cpp src/graph_bam_adapter.o src/noise_filter.o src/graph_sites.o src/graph_query.o src/collect_phase.o src/collect_phase_pgbam.o src/collect_output.o $(GBZ_FFI_LIB)
 	$(CXX) $(CXXFLAGS) -o $@ $^ src/cgranges.o src/kalloc.o src/sdust.o $(LDFLAGS) $(GBZ_FFI_SYSLIBS)
 
@@ -127,4 +132,4 @@ test_hybrid_inject: src/test_hybrid_inject.cpp src/hybrid_inject.o src/collect_p
 	$(CXX) $(CXXFLAGS) -o $@ $< src/hybrid_inject.o src/collect_phase.o src/collect_phase_pgbam.o src/collect_phase_noisy.o src/collect_output.o src/collect_var.o src/noise_filter.o src/align.o src/cgranges.o src/kalloc.o src/sdust.o $(EDLIB_OBJ) $(WFA2_LIB) $(ABPOA_LIB) $(LDFLAGS)
 
 clean:
-	rm -f pgphase test_phase_block_stitch test_graph_sites test_graph_bam_adapter test_hybrid_inject test_noise_filter src/*.o src/*.d
+	rm -f pgphase test_phase_block_stitch test_graph_sites test_graph_bam_adapter test_hybrid_inject test_noise_filter test_region_exclude src/*.o src/*.d
