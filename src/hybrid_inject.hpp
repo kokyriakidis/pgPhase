@@ -103,6 +103,9 @@ int inject_graph_reads(
 /// @param ref_end                1-based end of ref_seq (inclusive).
 /// @param graph_only_candidates  Set of candidate indices added by inject_graph_sites.
 /// @param max_xgaps              Maximum indel span to check.
+/// @param trim_minimal           Trim catalog alleles to minimal VCF form
+///                               (suffix+prefix) before the noise check, matching
+///                               apply_graph_noise_filter. Experimental.
 void apply_hybrid_noise_filter(
     PhasingChunk& chunk,
     const std::string& ref_seq,
@@ -110,7 +113,8 @@ void apply_hybrid_noise_filter(
     hts_pos_t ref_end,
     const std::unordered_set<int>& graph_only_candidates,
     int max_xgaps,
-    const GraphOnlyVcfAlleles* graph_only_vcf_alleles = nullptr);
+    const GraphOnlyVcfAlleles* graph_only_vcf_alleles = nullptr,
+    bool trim_minimal = false);
 
 /// Backfill allele counts on graph-only candidates from BAM read profiles.
 ///

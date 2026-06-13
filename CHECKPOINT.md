@@ -2910,3 +2910,54 @@ policy decision (large-STR handling) separate from this re-promotion bug.
 The 3 remaining SNP-rich bad blocks are all in the 32.2–32.5 Mb segdup band and
 still require the segdup/centromere-band exclusion described above. Unit tests pass;
 site count unchanged (74,119). Validated offline.
+
+## Hybrid Model — minimal-VCF trimming in apply_hybrid_noise_filter (WIN, now default)
+
+**Goal context:** the standing objective is lower Hamming + switch error on the
+hybrid pipeline. After the step-4 re-orientation fix (hybrid → 99.18% / 0.82%), the
+next lever was a normalization gap between the two noise filters.
+
+**The gap.** `apply_graph_noise_filter` (src/graph_bam_adapter.cpp) trims each
+catalog allele to **minimal VCF form** — strip the shared suffix, then the shared
+prefix — *before* calling `is_noisy_site`. `apply_hybrid_noise_filter`
+(src/hybrid_inject.cpp) did **not**: it ran `is_noisy_site` on the raw catalog
+`(ref, alt)`. Catalog (snarl) alleles carry the **full repeat run on both flanks**,
+so the derived indel length is inflated. With `max_xgaps` (default 5) bounding the
+repeat scan, a genuine 1–2 bp het indel sitting inside a long homopolymer/STR looks
+*longer than the window* and escapes detection in one direction but trips it in the
+other — the untrimmed hybrid filter **over-demoted** real het indels to
+`REP_HET_INDEL` (excluded from k-means), losing them as phasing anchors. The
+standalone graph pipeline kept the same sites as `CLEAN_HET_INDEL` because it
+trimmed first.
+
+**Fix.** Port the suffix-then-prefix trim into `apply_hybrid_noise_filter`,
+adjusting `noisy_pos` by the prefix shift, before the `is_noisy_site` call. Behind a
+toggle (`Options::exp_hybrid_trim`), defaulted **on** for hybrid
+(collect_hybrid_variation); `--no-hybrid-trim` restores the untrimmed behaviour for
+diagnostics.
+
+**Result (chr20, diplinator truth, both toggles from the same HEAD binary):**
+
+| metric | `--no-hybrid-trim` (old) | trim (new default) | Δ |
+|---|---|---|---|
+| reads evaluated | 212,465 | 212,240 | −225 |
+| accuracy | 99.181% | **99.232%** | +0.051 pp |
+| Hamming error | 0.819% | **0.768%** | −6.2% rel |
+| switch errors | 319 | **291** | −28 (−8.8%) |
+| flip errors | 953 | **906** | −47 (−4.9%) |
+| switch+flip | 1,272 | **1,197** | −75 (−5.9%) |
+| switch rate | 0.150% | **0.137%** | |
+| perfect phase sets | 114 | **115** | +1 |
+| `CLEAN_HET_INDEL` | 4,652 | **4,994** | +342 |
+| `REP_HET_INDEL` | 6,136 | **5,794** | −342 |
+
+**Mechanism.** Exactly 342 graph-only het indels that the untrimmed filter
+mislabelled `REP_HET_INDEL` are now correctly `CLEAN_HET_INDEL` — i.e. recovered as
+k-means anchors, matching the standalone graph verdict. More correct anchors →
+fewer switch/flip events. The slight read-count drop (−225) is the expected effect
+of a few sites changing category; net accuracy and all error metrics improve.
+
+This is a *correctness* fix (the two filters now agree on the same site), not a
+threshold tweak, so it generalizes rather than overfitting chr20. SNPs are still
+exempt (the existing SNP carve-out is unchanged). Unit tests pass
+(`test_hybrid_inject`, `test_noise_filter`, all suites). Validated offline.

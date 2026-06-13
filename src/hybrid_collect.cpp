@@ -54,6 +54,7 @@ static void print_hybrid_help() {
         << "      --graph-indel-af-margin F Max |AF-0.5| for graph het-indel anchor [0.11]\n"
         << "      --graph-indel-min-alt INT Min alt support for graph het-indel anchor [0]\n"
         << "      --keep-noisy-kmeans       Restore step-4 noisy-candidate k-means re-orientation (off by default)\n"
+        << "      --no-hybrid-trim          Disable minimal-VCF trimming of graph-only alleles before noise filter (on by default)\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
         << "\n"
         << "Examples:\n"
@@ -81,6 +82,13 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
     // it phased ~8k extra reads at ~65% error and poisoned the BAM-shared core.
     // --keep-noisy-kmeans restores the old behaviour. See CHECKPOINT.md.
     opts.skip_noisy_kmeans = true;
+    // Hybrid trims graph-only catalog alleles to minimal VCF form before the
+    // indel noise filter by default, matching apply_graph_noise_filter. Catalog
+    // alleles carry the full repeat run on both flanks, so the untrimmed filter
+    // over-demoted ~342 real het indels to REP_HET_INDEL (excluded from k-means);
+    // trimming recovers them as anchors and lowers hamming/switch error.
+    // --no-hybrid-trim restores the untrimmed behaviour. See CHECKPOINT.md.
+    opts.exp_hybrid_trim = true;
 
     enum HybridLongOption {
         kRefOption = 1000,
@@ -104,6 +112,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         kGraphIndelAfMarginOption,
         kGraphIndelMinAltOption,
         kKeepNoisyKmeansOption,
+        kNoHybridTrimOption,
     };
 
     static struct option long_options[] = {
@@ -135,6 +144,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         {"graph-indel-af-margin", required_argument, nullptr, kGraphIndelAfMarginOption},
         {"graph-indel-min-alt", required_argument, nullptr, kGraphIndelMinAltOption},
         {"keep-noisy-kmeans", no_argument,     nullptr, kKeepNoisyKmeansOption},
+        {"no-hybrid-trim", no_argument,        nullptr, kNoHybridTrimOption},
         {"refine-aln",      no_argument,       nullptr, kRefineAlnOption},
         {"verbose",         required_argument, nullptr, 'V'},
         {"help",            no_argument,       nullptr, 'h'},
@@ -180,6 +190,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
             case kGraphIndelAfMarginOption: opts.graph_indel_af_margin = std::atof(optarg); break;
             case kGraphIndelMinAltOption: opts.graph_indel_min_alt = std::atoi(optarg); break;
             case kKeepNoisyKmeansOption: opts.skip_noisy_kmeans = false; break;
+            case kNoHybridTrimOption: opts.exp_hybrid_trim = false; break;
             case kRefineAlnOption:    opts.refine_aln = true; break;
             case 'V':                 opts.verbose = std::atoi(optarg); break;
             case 'h':

@@ -500,7 +500,8 @@ void apply_hybrid_noise_filter(
         hts_pos_t ref_end,
         const std::unordered_set<int>& graph_only_candidates,
         int max_xgaps,
-        const GraphOnlyVcfAlleles* graph_only_vcf_alleles) {
+        const GraphOnlyVcfAlleles* graph_only_vcf_alleles,
+        bool trim_minimal) {
     if (ref_seq.empty() || graph_only_candidates.empty()) return;
 
     const std::vector<Interval> lc = find_low_complexity_intervals(ref_seq, ref_beg);
@@ -556,6 +557,29 @@ void apply_hybrid_noise_filter(
                     ref_seq[static_cast<size_t>(anchor - ref_beg)];
                 vcf_alt = std::string(1, anchor_base);
                 if (!k.alt.empty()) vcf_alt += k.alt;
+            }
+        }
+
+        // Experimental: trim to minimal VCF form before the noise check, the
+        // same normalization apply_graph_noise_filter performs. Catalog alleles
+        // carry the full repeat run on both flanks, so the derived indel can be
+        // longer than max_xgaps and escape repeat detection; trimming the shared
+        // suffix then prefix exposes the true indel span.
+        if (trim_minimal) {
+            while (vcf_ref.size() > 1 && vcf_alt.size() > 1 &&
+                   vcf_ref.back() == vcf_alt.back()) {
+                vcf_ref.pop_back();
+                vcf_alt.pop_back();
+            }
+            size_t pfx = 0;
+            while (pfx + 1 < vcf_ref.size() && pfx + 1 < vcf_alt.size() &&
+                   vcf_ref[pfx] == vcf_alt[pfx]) {
+                ++pfx;
+            }
+            if (pfx > 0) {
+                vcf_ref.erase(0, pfx);
+                vcf_alt.erase(0, pfx);
+                noisy_pos += static_cast<hts_pos_t>(pfx);
             }
         }
 

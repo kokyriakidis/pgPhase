@@ -761,7 +761,7 @@ static PhasingChunk process_chunk_hybrid(
             apply_hybrid_noise_filter(
                 chunk, chunk.ref_seq, chunk.ref_beg, chunk.ref_end,
                 graph_only_cands, opts.noisy_reg_max_xgaps,
-                &graph_only_vcf_alleles);
+                &graph_only_vcf_alleles, opts.exp_hybrid_trim);
         }
     }
 

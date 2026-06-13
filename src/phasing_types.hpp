@@ -193,6 +193,14 @@ struct Options {
     // Defaults true for hybrid (set in collect_hybrid_variation), false for the
     // BAM pipeline. See CHECKPOINT.md "Hybrid step-4 re-orientation".
     bool skip_noisy_kmeans = false;
+    // Trim graph-only catalog alleles to minimal VCF form before the hybrid
+    // indel noise filter, matching apply_graph_noise_filter. Graph catalog
+    // alleles are non-minimal (full repeat run on both flanks); trimming shrinks
+    // the derived indel length so max_xgaps-bounded repeat detection matches the
+    // standalone graph pipeline. Recovers ~342 over-demoted het indels as k-means
+    // anchors (hamming 0.819->0.768%, switch 319->291). Defaults true for hybrid
+    // (set in collect_hybrid_variation); --no-hybrid-trim disables it.
+    bool exp_hybrid_trim = false;
     // Step 4: noisy-region MSA options.
     int max_noisy_reg_len = 50000; // skip regions longer than this bp
     int max_noisy_reg_cov = 1000;  // skip regions with more overlapping reads
