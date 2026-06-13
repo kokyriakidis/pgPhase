@@ -47,6 +47,22 @@ static VarKind classify_variant(const std::string& ref, const std::string& alt) 
 // Public API
 // ────────────────────────────────────────────────────────────────────────────
 
+void trim_to_minimal_vcf(hts_pos_t& pos, std::string& ref, std::string& alt) {
+    while (ref.size() > 1 && alt.size() > 1 && ref.back() == alt.back()) {
+        ref.pop_back();
+        alt.pop_back();
+    }
+    size_t pfx = 0;
+    while (pfx + 1 < ref.size() && pfx + 1 < alt.size() && ref[pfx] == alt[pfx]) {
+        ++pfx;
+    }
+    if (pfx > 0) {
+        ref.erase(0, pfx);
+        alt.erase(0, pfx);
+        pos += static_cast<hts_pos_t>(pfx);
+    }
+}
+
 std::vector<Interval> find_low_complexity_intervals(
         const std::string& ref_seq,
         hts_pos_t ref_beg) {

@@ -2910,11 +2910,16 @@ poly-A/poly-T/TA-repeat coin-flip blocks at 40–44 Mb (acc ~0.5–0.6) are gone
 all five truth-correct clean SNP blocks remain. **7 of 8** previously-leaking
 repeat-indel blocks are now filtered.
 
-**One residual (not an artifact):** pos 49,031,428 is a large `AGGG` STR expansion
-(~40 bp insertion in an AGGG tandem array), not a small homopolymer slip. Its
-insertion length dwarfs `max_xgaps`, so it is intentionally *not* caught by the
-short-indel noise filter. It phases at ~0.92 and is a real large-STR variant — a
-policy decision (large-STR handling) separate from this re-promotion bug.
+**One residual — RE-DIAGNOSED as a normalization bug, now FIXED:** pos 49,031,428
+was previously described here as a "~40 bp AGGG STR expansion." That was wrong.
+Trimming the catalog alleles to minimal VCF form shows it is a **single het SNP**,
+`chr20:49031440 A>G` — exactly what the BAM pipeline calls. The catalog emitted it
+three times (from three overlapping snarls) wrapped in 18–49 bp of equal-length
+AGGG-repeat context. Because the `VariantKey` derivation in `graph_collect.cpp`
+only stripped a single-base prefix for ins/del and never trimmed equal-length
+alleles, padded SNPs fell into the MNP fallback with a misleading multi-bp ref/alt
+and the wrong POS, and the emitted VCF showed bogus `A→AAGG…AGGC` insertions. See
+"Graph allele normalization (padded-SNP bug)" below.
 
 The 3 remaining SNP-rich bad blocks are all in the 32.2–32.5 Mb segdup band and
 still require the segdup/centromere-band exclusion described above. Unit tests pass;
@@ -2970,3 +2975,48 @@ This is a *correctness* fix (the two filters now agree on the same site), not a
 threshold tweak, so it generalizes rather than overfitting chr20. SNPs are still
 exempt (the existing SNP carve-out is unchanged). Unit tests pass
 (`test_hybrid_inject`, `test_noise_filter`, all suites). Validated offline.
+
+## Graph allele normalization (padded-SNP bug, FIXED)
+
+**Symptom.** The "large AGGG STR" residual recorded earlier (pos 49,031,428) was
+a misdiagnosis. The graph pipeline emitted three records at 49031428 / 49031431 /
+49031439 with bizarre equal-length 18–49 bp ref/alt strings, all of which are the
+**same single het SNP** `chr20:49031440 A>G` that the BAM pipeline calls cleanly.
+The output VCF showed fake insertions like `A → AAGGAAGG…AGGC`.
+
+**Root cause.** The `VariantKey` derivation in `graph_collect.cpp` did not
+normalize catalog alleles to minimal VCF form. The ins/del branches only stripped
+a single shared **prefix** base (requiring `ref[0]==alt[0]`) and never trimmed a
+shared **suffix**; equal-length alleles fell through to the MNP fallback, which
+kept the full untrimmed ref/alt and labelled them `SNP` when lengths matched. A
+real SNP padded with equal-length repeat context (the AGGG array) therefore got
+the wrong POS, a multi-bp ref/alt, and — because the catalog wraps the same site
+in several overlapping snarls — was emitted multiple times.
+
+**Scope (chr20).** 5,320 → 1,123 non-minimal alleles after the fix (the remaining
+1,123 are genuine complex/MNP variants with differing bases on both ends that have
+no single-anchor minimal form). 3,957 of the trimmed cases were single-base SNPs
+buried in repeat padding; ~339 catalog sites were duplicate emissions of the same
+post-minimization variant.
+
+**Fix.** Normalize each `(pos, ref, alt)` to minimal VCF form (trim shared suffix,
+then shared prefix, advance pos) **before** key derivation, via a new shared helper
+`trim_to_minimal_vcf` in `noise_filter.{hpp,cpp}`. The same helper now backs the
+two pre-existing inline trims in `apply_graph_noise_filter` and
+`apply_hybrid_noise_filter` (DRY; behaviour unchanged). `site_meta` (the catalog
+form used elsewhere) is left untouched.
+
+**Impact: representation-only, zero phasing change.**
+
+| pipeline | before | after |
+|---|---|---|
+| graph accuracy / Hamming | 99.195% / 0.805% | **99.195% / 0.805%** (identical) |
+| graph switch / flip / perfect-PS | 367 / 858 / 142 | **367 / 858 / 142** (identical) |
+| hybrid accuracy / Hamming | 99.232% / 0.768% | **99.232% / 0.768%** (identical) |
+
+Accuracy is unchanged because k-means already classified these equal-length sites
+as `CleanHetSnp` (the MNP→SNP branch) and phased them correctly; the bug only
+corrupted the **emitted allele strings/POS** in the candidate TSV and VCF. The fix
+makes graph/hybrid VCF output match the BAM pipeline's canonical variant
+representation. Covered by `test_trim_to_minimal_vcf` in `test_noise_filter.cpp`.
+Validated offline.

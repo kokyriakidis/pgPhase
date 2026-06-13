@@ -249,6 +249,65 @@ static void test_graph_noise_filter() {
 // ────────────────────────────────────────────────────────────────────────────
 // Edge cases
 // ────────────────────────────────────────────────────────────────────────────
+static void test_trim_to_minimal_vcf() {
+    std::cout << "--- test_trim_to_minimal_vcf ---\n";
+
+    // Equal-length SNP padded with repeat context on both flanks (the graph
+    // catalog form of the AGGG-array SNP at chr20:49031440). Must reduce to a
+    // single-base SNP with the position advanced past the shared prefix.
+    {
+        hts_pos_t pos = 49031428;
+        std::string ref = "AAGGAAGGAAGGAAGGGAGGGAGGGAGGGAGGGAGGGAGGGAGGGAGGC";
+        std::string alt = "AAGGAAGGAAGGGAGGGAGGGAGGGAGGGAGGGAGGGAGGGAGGGAGGC";
+        trim_to_minimal_vcf(pos, ref, alt);
+        check(pos == 49031440, "padded SNP pos advances to 49031440");
+        check(ref == "A" && alt == "G", "padded SNP reduces to A>G");
+    }
+
+    // Already-minimal SNP is unchanged.
+    {
+        hts_pos_t pos = 100;
+        std::string ref = "C", alt = "T";
+        trim_to_minimal_vcf(pos, ref, alt);
+        check(pos == 100 && ref == "C" && alt == "T", "minimal SNP unchanged");
+    }
+
+    // Left-anchored insertion: shared prefix base kept, no spurious pos shift.
+    {
+        hts_pos_t pos = 50;
+        std::string ref = "A", alt = "ACGT";
+        trim_to_minimal_vcf(pos, ref, alt);
+        check(pos == 50 && ref == "A" && alt == "ACGT",
+              "left-anchored insertion unchanged");
+    }
+
+    // Insertion padded with a shared suffix: suffix trimmed, anchor retained.
+    {
+        hts_pos_t pos = 50;
+        std::string ref = "AT", alt = "ACGTT";
+        trim_to_minimal_vcf(pos, ref, alt);
+        check(pos == 50 && ref == "A" && alt == "ACGT",
+              "insertion shared suffix trimmed");
+    }
+
+    // Deletion padded on both flanks: reduces to anchored deletion.
+    {
+        hts_pos_t pos = 50;
+        std::string ref = "GAAAC", alt = "GAC";
+        trim_to_minimal_vcf(pos, ref, alt);
+        check(pos == 50 && ref == "GAA" && alt == "G",
+              "padded deletion reduces to anchored form");
+    }
+
+    // At least one base is always retained in each allele (never empties).
+    {
+        hts_pos_t pos = 7;
+        std::string ref = "AAAA", alt = "AAAA";
+        trim_to_minimal_vcf(pos, ref, alt);
+        check(!ref.empty() && !alt.empty(), "identical alleles keep one base each");
+    }
+}
+
 static void test_edge_cases() {
     std::cout << "--- test_edge_cases ---\n";
     check(!hp(5, "A", "AA", ""),  "empty ref_seq -> homopolymer false");
@@ -274,6 +333,7 @@ int main() {
     test_low_complexity();
     test_is_noisy_site();
     test_graph_noise_filter();
+    test_trim_to_minimal_vcf();
     test_edge_cases();
 
     if (g_failures == 0) {

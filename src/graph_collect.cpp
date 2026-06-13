@@ -92,11 +92,24 @@ static CandidateTable graph_chunks_to_candidate_table(
                 // orig_walk_idx: 0 = ref walk, 1 = first alt walk → meta.alts[0], etc.
                 const int alt_idx = orig_walk_idx - 1;
                 if (alt_idx < 0 || alt_idx >= static_cast<int>(meta.alts.size())) continue;
-                const std::string& alt_seq = meta.alts[static_cast<size_t>(alt_idx)];
-                if (alt_seq.empty() || alt_seq == "*") continue;
+                const std::string& raw_alt = meta.alts[static_cast<size_t>(alt_idx)];
+                if (raw_alt.empty() || raw_alt == "*") continue;
 
-                const std::string& ref_seq = meta.ref;
-                if (ref_seq.empty()) continue;
+                if (meta.ref.empty()) continue;
+
+                // Normalize to minimal VCF form before deriving the key. Catalog
+                // alleles carry flanking repeat context on both sides; an equal-
+                // length SNP padded with repeat bases (e.g. the AGGG array at
+                // chr20:49031440) otherwise falls through to the MNP branch with a
+                // misleading multi-bp ref/alt and the wrong POS, and the same SNP
+                // is emitted once per overlapping snarl. Trimming the shared suffix
+                // then prefix yields the BAM pipeline's canonical representation so
+                // keys match and duplicates collapse. (apply_graph_noise_filter
+                // already trims for the noise check; this trims the key itself.)
+                std::string ref_seq = meta.ref;
+                std::string alt_seq = raw_alt;
+                hts_pos_t var_pos = meta.pos;
+                trim_to_minimal_vcf(var_pos, ref_seq, alt_seq);
 
                 CandidateVariant cand;
                 cand.key.tid = fai_tid;
@@ -108,24 +121,24 @@ static CandidateTable graph_chunks_to_candidate_table(
                 if (ref_seq.size() == 1 && alt_seq.size() == 1) {
                     // SNP
                     cand.key.type = VariantType::Snp;
-                    cand.key.pos = meta.pos;
+                    cand.key.pos = var_pos;
                     cand.key.alt = alt_seq;
                     cand.key.ref_len = 1;
                 } else if (alt_seq.size() > ref_seq.size() && ref_seq[0] == alt_seq[0]) {
                     // Left-anchored insertion: strip shared prefix; pos after anchor.
                     cand.key.type = VariantType::Insertion;
-                    cand.key.pos = meta.pos + 1;
+                    cand.key.pos = var_pos + 1;
                     cand.key.alt = alt_seq.substr(ref_seq.size());
                     cand.key.ref_len = 0;
                 } else if (ref_seq.size() > alt_seq.size() && ref_seq[0] == alt_seq[0]) {
                     // Left-anchored deletion: empty alt matches BAM-path convention.
                     cand.key.type = VariantType::Deletion;
-                    cand.key.pos = meta.pos + static_cast<hts_pos_t>(alt_seq.size());
+                    cand.key.pos = var_pos + static_cast<hts_pos_t>(alt_seq.size());
                     cand.key.alt = "";
                     cand.key.ref_len = static_cast<int>(ref_seq.size() - alt_seq.size());
                 } else {
                     // Complex / MNP: no shared anchor base — classify by net length change.
-                    cand.key.pos = meta.pos;
+                    cand.key.pos = var_pos;
                     cand.key.alt = alt_seq;
                     cand.key.ref_len = static_cast<int>(ref_seq.size());
                     if (alt_seq.size() > ref_seq.size()) {

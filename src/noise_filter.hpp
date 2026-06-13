@@ -16,6 +16,19 @@
 
 namespace pgphase_collect {
 
+/// @brief Reduce a (pos, ref, alt) allele pair to minimal VCF form in place.
+///
+/// Strips the shared suffix, then the shared prefix (advancing @p pos by the
+/// number of prefix bases removed), leaving at least one base in each allele.
+/// This matches the canonical representation the BAM pipeline produces, so graph
+/// catalog alleles (which carry full flanking repeat context) compare equal to
+/// the same variant called from alignments. A no-op for already-minimal alleles.
+///
+/// @param pos  1-based position of the first base of @p ref (updated on prefix trim).
+/// @param ref  Reference allele string (modified in place).
+/// @param alt  Alternate allele string (modified in place).
+void trim_to_minimal_vcf(hts_pos_t& pos, std::string& ref, std::string& alt);
+
 /// @brief Run SDUST low-complexity detection on a reference slice.
 /// @param ref_seq  Reference sequence (uppercase ACGTN).
 /// @param ref_beg  1-based start of ref_seq on the chromosome.

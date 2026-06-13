@@ -257,21 +257,7 @@ void apply_graph_noise_filter(GraphChunkBuildResult& result,
             std::string vcf_ref = meta.ref;
             std::string vcf_alt = raw_alt;
             hts_pos_t vcf_pos = meta.pos;
-            while (vcf_ref.size() > 1 && vcf_alt.size() > 1 &&
-                   vcf_ref.back() == vcf_alt.back()) {
-                vcf_ref.pop_back();
-                vcf_alt.pop_back();
-            }
-            size_t pfx = 0;
-            while (pfx + 1 < vcf_ref.size() && pfx + 1 < vcf_alt.size() &&
-                   vcf_ref[pfx] == vcf_alt[pfx]) {
-                ++pfx;
-            }
-            if (pfx > 0) {
-                vcf_ref.erase(0, pfx);
-                vcf_alt.erase(0, pfx);
-                vcf_pos += static_cast<hts_pos_t>(pfx);
-            }
+            trim_to_minimal_vcf(vcf_pos, vcf_ref, vcf_alt);
             if (is_noisy_site(vcf_pos, vcf_ref, vcf_alt, ref_seq, ref_beg, ref_end,
                               lc, max_xgaps)) {
                 noisy = true;
