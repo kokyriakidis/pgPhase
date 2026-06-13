@@ -1095,7 +1095,7 @@ void collect_noisy_vars_step4(PhasingChunk& chunk, const Options& opts) {
         }
         // Re-run k-means with kCandGermlineVarCate whenever new
         // noisy variants were merged, incorporating NOISY_CAND_HET / NOISY_CAND_HOM.
-        if (any_new_var)
+        if (any_new_var && !opts.skip_noisy_kmeans)
             assign_hap_based_on_germline_het_vars_kmeans(chunk, opts, kCandGermlineVarCate);
         // stop when no region made progress in this pass.
         if (!any_done) break;

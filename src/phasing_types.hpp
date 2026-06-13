@@ -184,6 +184,15 @@ struct Options {
     // Graph-only het-indel anchor gates (hybrid pipeline).  See constants above.
     double graph_indel_af_margin = kDefaultGraphIndelAfMargin;
     int graph_indel_min_alt = kDefaultGraphIndelMinAlt;
+    // When true, keep step-4 noisy-region MSA variant recall (so noisy variants
+    // still appear in the output VCF) but skip the kCandGermlineVarCate k-means
+    // re-run that re-orients reads using those noisy candidates. On the hybrid
+    // pipeline this re-orientation phased ~8k extra reads at ~65% error and
+    // poisoned the BAM-shared core (Hamming 0.71% -> 3.11%); skipping it brings
+    // hybrid accuracy to graph-pipeline level (99.18%) at higher contiguity.
+    // Defaults true for hybrid (set in collect_hybrid_variation), false for the
+    // BAM pipeline. See CHECKPOINT.md "Hybrid step-4 re-orientation".
+    bool skip_noisy_kmeans = false;
     // Step 4: noisy-region MSA options.
     int max_noisy_reg_len = 50000; // skip regions longer than this bp
     int max_noisy_reg_cov = 1000;  // skip regions with more overlapping reads

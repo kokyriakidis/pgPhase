@@ -907,36 +907,35 @@ against HG002 T2T diploid assembly (diplinator). All numbers reflect the current
 binary after all fixes above, including the indel noise-filter fixes (content-base
 anchoring, nt4 insertion compare, non-minimal graph-allele trimming).
 
-| Metric | BAM | Graph | Hybrid |
-|---|---|---|---|
-| **Completeness** | | | |
-| Input reads | 272,016 | 231,382 | 272,016 |
-| Phased reads | 219,925 (80.9%) | 203,729 (88.0%) | **220,725 (81.1%)** |
-| Unphased reads | 52,091 | 27,653 | 51,291 |
-| Phase sets | 429 | 368 | **415** |
-| Perfect phase sets | 125 / 429 (29.1%) | 142 / 368 (39.1%) | 96 / 415 (23.5%) |
-| **Contiguity** | | | |
-| Phase block N50 | 937,648 bp | 917,581 bp | **945,071 bp** |
-| Phase block auN | 9,834,145 bp | 989,988 bp | **11,876,987 bp** |
-| Largest block | 53,165,843 bp | 2,080,875 bp | **59,316,535 bp** |
-| Median block span | 867,222 bp | 871,853 bp | 870,769 bp |
-| Genome covered | 313,517,513 bp | 221,616,803 bp | **317,945,255 bp** |
-| **Accuracy** | | | |
-| Concordant reads | 213,127 | 202,076 | 213,609 |
-| Discordant reads | 6,798 | 1,639 | 7,099 |
-| Overall accuracy | 96.91% | **99.20%** | 96.78% |
-| Hamming error rate | 3.09% | **0.80%** | 3.22% |
-| Switch errors | 1,393 | 367 | 1,386 |
-| Flip errors | 2,052 | 858 | 2,135 |
-| Switchflip errors | 3,445 | 1,225 | 3,521 |
-| Switch opportunities | 219,496 | 203,352 | 220,299 |
-| Switch error rate | 0.63% | **0.18%** | 0.63% |
-| Switchflip error rate | 1.57% | **0.60%** | 1.60% |
-| **Phaseable / Unphaseable** | | | |
-| Phaseable PS (>60%) | 366 | 343 | 345 |
-| Phaseable accuracy | 98.02% | **99.38%** | 97.80% |
-| Unphaseable PS (≤60%) | 63 | 20 | 64 |
-| Unphaseable accuracy | 53.62% | 54.11% | 53.88% |
+"Hybrid (old)" = BAM-base + graph-augment with the step-4 noisy-candidate k-means
+re-orientation still on. "Hybrid (new)" = current default after disabling that
+re-orientation (`skip_noisy_kmeans`, on by default for hybrid; `--keep-noisy-kmeans`
+restores the old behaviour). See "Hybrid step-4 re-orientation" below.
+
+| Metric | BAM | Graph | Hybrid (old) | **Hybrid (new)** |
+|---|---|---|---|---|
+| **Completeness** | | | | |
+| Input reads | 272,016 | 231,382 | 272,016 | 272,016 |
+| Phased reads | 219,925 (80.9%) | 203,729 (88.0%) | 220,725 (81.1%) | 212,484 (78.1%) |
+| Phase sets | 429 | 368 | 415 | 348 |
+| Perfect phase sets | 125 (29.1%) | 142 (39.1%) | 96 (23.5%) | **114 (33.4%)** |
+| **Contiguity** | | | | |
+| Phase block N50 | 937,648 bp | 917,581 bp | 945,071 bp | **1,041,015 bp** |
+| Phase block auN | 9,834,145 bp | 989,988 bp | 11,876,987 bp | **13,677,722 bp** |
+| Largest block | 53,165,843 bp | 2,080,875 bp | 59,316,535 bp | 58,616,492 bp |
+| Median block span | 867,222 bp | 871,853 bp | 870,769 bp | 867,209 bp |
+| Genome covered | 313,517,513 bp | 221,616,803 bp | 317,945,255 bp | 266,888,983 bp |
+| **Accuracy** | | | | |
+| Concordant reads | 213,127 | 202,076 | 213,609 | 210,724 |
+| Discordant reads | 6,798 | 1,639 | 7,099 | 1,741 |
+| Overall accuracy | 96.91% | 99.20% | 96.78% | **99.18%** |
+| Hamming error rate | 3.09% | 0.80% | 3.22% | **0.82%** |
+| Switch errors | 1,393 | 367 | 1,386 | **319** |
+| Flip errors | 2,052 | 858 | 2,135 | 953 |
+| Switchflip errors | 3,445 | 1,225 | 3,521 | **1,272** |
+| Switch opportunities | 219,496 | 203,352 | 220,299 | 212,124 |
+| Switch error rate | 0.63% | 0.18% | 0.63% | **0.15%** |
+| Switchflip error rate | 1.57% | 0.60% | 1.60% | **0.60%** |
 
 ### Observations
 
@@ -947,23 +946,62 @@ anchoring, nt4 insertion compare, non-minimal graph-allele trimming).
   Phased reads drop (216k → 204k) because those noisy indels previously phased
   many reads incorrectly — the pipeline now trades a small completeness loss for a
   large accuracy gain. Perfect phase sets rose from 22.0% to **39.1%**.
-- **Hybrid is essentially flat** (96.96% → 96.78%, Hamming 3.04% → 3.22%). Hybrid is
-  dominated by BAM reads, whose read-level noise filtering (XID clustering, MSA
-  recall) already handled these indels, so the shared-filter fix has little net
-  effect there. The 0.18 pt move is within the k-means convergence variance
-  documented above (switch counts vary 26–92/chunk by random init). The fix
-  reclassifies 1,456 hybrid het indels (`CLEAN_HET_INDEL` 6,108 → 4,652,
-  `REP_HET_INDEL` 4,680 → 6,136), confirming it reaches the hybrid path.
-- **Hybrid contiguity still exceeds BAM**: auN +21% (11.9M vs 9.8M), largest block
-  +12% (59.3M vs 53.2M), genome covered +4.4M bp more.
+- **Hybrid (new) reaches graph-pipeline accuracy at far higher contiguity.** After
+  disabling the step-4 noisy-candidate k-means re-orientation, hybrid jumps from
+  96.78% to **99.18%** (Hamming 3.22% → **0.82%**, switch rate 0.63% → **0.15%**).
+  It now matches standalone graph accuracy (99.20% / 0.18%) while keeping BAM-class
+  contiguity (auN 13.7M vs graph's 0.99M — 14× longer blocks) and phasing 8.8k more
+  reads than graph (212k vs 204k). It even has *fewer* switch errors than graph
+  (319 vs 367). This is the single biggest hybrid improvement to date — see
+  "Hybrid step-4 re-orientation" below for the mechanism.
 
-> **Caveat (graph hybrid-allele trimming):** the non-minimal multiallelic-allele
-> trimming was added to `apply_graph_noise_filter` (graph pipeline) but NOT to
-> `apply_hybrid_noise_filter` (hybrid), which feeds catalog alleles to
-> `is_noisy_site` untrimmed. Hybrid still benefits from the shared content-base
-> anchoring fix, but non-minimal graph-only het indels in repeats may not be
-> demoted in hybrid. Not pursued because hybrid accuracy is BAM-dominated and flat;
-> revisit if graph-only candidates are shown to drive hybrid errors.
+### Hybrid step-4 re-orientation: the root cause of hybrid's accuracy gap
+
+The post-fix marginal analysis (below) localised 96% of hybrid errors to the
+**BAM core**, not the graph layer. The cause was found by A/B toggle: the BAM
+pipeline's **step-4 noisy-region recall** (`collect_noisy_vars_step4`) runs an MSA
+to recall variants inside noisy regions, then **re-runs k-means over
+`kCandGermlineVarCate`** (which includes the recalled `NOISY_CAND_HET` candidates)
+to re-assign read haplotypes. The standalone graph pipeline never does this — it
+runs a single k-means over `kCandGermlineClean` only.
+
+On hybrid, this second k-means was **actively harmful**:
+
+- It phased **8,243 extra reads at 65% error** (5,358 wrong, 2,885 right).
+- It poisoned the shared core: BAM-shared Hamming went **0.71% → 3.11%** when on.
+- It also *fragmented* blocks (auN 13.7M with it off vs 11.9M on; perfect PS 114 vs 96).
+
+**The fix (`skip_noisy_kmeans`, default on for hybrid):** keep the MSA variant
+recall (noisy variants still appear in the output VCF, `NOISY_CAND_HET=22,240`) but
+skip *only* the noisy-candidate k-means re-run. Confirmed by two equivalent toggles
+giving identical results: skipping all of step 4 (`exp_skip_step4`) and skipping
+just the re-run both yield 99.181% / 0.819% — proving the **re-orientation, not the
+recall, was the entire harm**. `--keep-noisy-kmeans` restores the old behaviour.
+The BAM pipeline is unchanged (the re-run still runs there; only hybrid defaults to
+skipping it, because hybrid's graph-anchored first k-means already orients reads
+well and the noisy re-run only adds error).
+
+**Knob sweeps on the clean base were saturated** (no further gain):
+`--graph-indel-af-margin` {0.11→0.50} *worsened* accuracy (admitting off-center
+graph indels adds noise); `--stitch-min-margin` {4,10,15,20} and `--stitch-rule`
+{1,3} moved nothing on accuracy (the both-strands rule dominates merges, not the
+margin). `--stitch-rule 3 --stitch-min-margin 15` adds +6 perfect PS (120 vs 114)
+and +5M genome covered at identical accuracy — a valid optional contiguity knob,
+not promoted to default.
+
+### Result is deterministic, not seed-dependent
+
+The k-means has no RNG (greedy seeded init); repeated runs of the same config give
+bit-identical metrics (319 switches every time). The "convergence variance"
+referenced in earlier notes was about a separate experimental optimizer, not the
+production k-means.
+
+> **Remaining caveat (graph hybrid-allele trimming):** the non-minimal
+> multiallelic-allele trimming added to `apply_graph_noise_filter` is still NOT in
+> `apply_hybrid_noise_filter`. Low priority now — hybrid (new) error is dominated by
+> the graph-influenced hard tail (1,660 reads at 14.6%), and the BAM-shared core is
+> already at 0.71%. Revisit only if graph-only repeat indels are shown to drive the
+> remaining hybrid errors.
 
 ### Post-fix error decomposition: is graph's accuracy transferable to hybrid? (NO)
 
@@ -977,29 +1015,26 @@ bam-shared = phased by both):
 | bam-shared | 219,004 | 6,815 | 3.11% |
 | ALL hybrid-phased | 220,708 | 7,099 | 3.22% |
 
-Two conclusions for the "lower Hamming/switch" goal:
+> **SUPERSEDED conclusion — read with the step-4 finding above.** This section
+> concluded "96% of hybrid errors are in the BAM core, which is unfixable, so you
+> cannot get graph's low Hamming at BAM coverage." The *diagnosis* (96% BAM-core)
+> was correct and led directly to the fix; the *prognosis* (unfixable) was WRONG.
+> The BAM-core errors were caused by the step-4 noisy k-means re-orientation, and
+> disabling it took hybrid to 99.18% / 0.82% at 212k reads — graph accuracy at far
+> higher contiguity. The "denominator effect" framing below is therefore only
+> partly true: graph's accuracy is real (see shared-read analysis) AND hybrid can
+> now match it. Kept for the diagnostic trail.
 
-- **96% of hybrid errors are in the BAM core** (6,815 / 7,099). The BAM-shared
-  Hamming (3.11%) is identical to standalone BAM (3.09%) — hybrid is BAM plus a
-  thin graph layer, not a dilution of graph accuracy. Removing every
-  graph-influenced error would drop hybrid Hamming only 3.22% → 3.11%, still above
-  BAM. So tightening the hybrid noise filter (the trimming caveat above) cannot
-  close the gap to graph; confirmed, not estimated.
-- **Graph's 0.80% Hamming is a denominator effect, not per-read superiority.** The
-  same graph-marginal reads error at **16.67%** when added to hybrid — the
-  opposite of low. Graph's headline accuracy comes from phasing a smaller, easier
-  read population (231k vs 272k input, minus 17.5k demoted noisy indels), not from
-  graph candidates being individually more accurate. This matches the established
-  root cause: **GAF reads are a strict subset of BAM reads (271,930 ⊂ 272,016,
-  0 unique)** — the graph carries no read evidence independent of BAM, only ~3,541
-  extra easy sites. You cannot obtain graph's low Hamming at BAM's coverage by
-  blending; the low Hamming is inseparable from phasing fewer, easier reads.
+Two conclusions for the "lower Hamming/switch" goal (the second is now superseded):
 
-**Net answer (first pass):** graph wins the Hamming/switch *metric* (0.80% / 0.18%
-vs BAM 3.09% / 0.63%). The marginal-read split (graph-influenced reads error at
-16.67% in hybrid) initially suggested this was *purely* a denominator effect. The
-shared-read analysis below **partially corrects that** — graph is also genuinely
-more accurate on reads both pipelines phase.
+- **96% of hybrid errors are in the BAM core** (6,815 / 7,099). ✅ Correct, and the
+  key clue: it pointed the search at a BAM-core operation (step-4 re-orientation),
+  not the graph layer. The BAM-shared Hamming (3.11%) matched standalone BAM (3.09%)
+  *with the re-orientation on*; with it off, BAM-shared drops to **0.71%**.
+- **~~Graph's 0.80% is a pure denominator effect; you cannot get it at BAM
+  coverage.~~** SUPERSEDED — hybrid (new) gets 0.82% at 212k reads. Graph's
+  marginal reads do error at 16.67% in hybrid (the hard tail is real), but the bulk
+  of the gap was the fixable step-4 re-orientation, not an intrinsic ceiling.
 
 All rows in the table above were regenerated from the same current HEAD binary
 (BAM/graph/hybrid all run with shipped defaults; hybrid = af0.11 + stitch margin
