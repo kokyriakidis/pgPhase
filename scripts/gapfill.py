@@ -1,28 +1,38 @@
 #!/usr/bin/env python3
 """
-Additive BAM gap-fill: hybrid (or graph) phased core + BAM-only phased reads.
+Additive gap-fill: phased core + reads only a secondary pipeline phased.
 
 The hybrid pipeline's `skip_noisy_kmeans` default deliberately leaves a set of
 hard reads (segdup / low-complexity regions) unphased rather than phasing them
 at ~36% error. This recovers them additively WITHOUT degrading the clean core:
-take the hybrid phased BAM as-is, and for reads the BAM pipeline phases but
-hybrid does not, copy the BAM HP/PS onto the hybrid record. The filled reads'
-phase sets are shifted into a disjoint namespace (PS += PS_OFFSET) so no hybrid
-phase set is renumbered, merged, or re-oriented — the merge is purely additive.
+take the hybrid phased BAM as-is, and for reads a secondary pipeline phased but
+hybrid did not, copy the secondary HP/PS onto the hybrid record. The filled
+reads' phase sets are shifted into a disjoint namespace (PS += PS_OFFSET) so no
+hybrid phase set is renumbered, merged, or re-oriented — purely additive.
 
-The core BAM must carry the fill reads as records (the hybrid phased BAM does:
-it emits all input reads). The graph phased BAM is unaligned and only carries
-graph-input reads, so it is not a valid core here without realignment.
+NOTE ON PROVENANCE: the bam / graph / hybrid pipeline outputs are all phasings
+of the SAME vg-giraffe alignment, not different aligners. The BAM is the
+linear surjection of the graph alignment; the GAF is its graph-space form. So
+"fill reads" are not reads from another aligner — they are reads that a
+different pgphase PIPELINE managed to phase. The fill BAM is only read for its
+HP/PS labels by read name; the core already carries every read as a record, so
+no realignment is needed even when the fill BAM is unaligned (e.g. the graph
+pipeline's phased BAM has no @SQ header — samtools view still yields its tags).
+
+Chaining: run twice with different ps_offset to add two sources to one core,
+e.g. core=hybrid, fill1=bam (offset 1e9), fill2=graph (offset 2e9).
 
 On HG002 HiFi chr20 this Pareto-beats the standalone BAM pipeline: more reads
 phased, lower Hamming error, fewer switch errors, higher auN, more genome
-covered. See CHECKPOINT.md "hybrid-core + BAM gap-fill" for measured results.
+covered. See CHECKPOINT.md "hybrid-core + gap-fill" for measured results.
 
 Usage:
   python3 gapfill.py CORE_PHASED_BAM FILL_PHASED_BAM OUT_BAM [samtools] [ps_offset]
 
-  CORE_PHASED_BAM   phased BAM whose reads are kept verbatim (e.g. hybrid)
-  FILL_PHASED_BAM   phased BAM supplying HP/PS for core-unphased reads (e.g. bam)
+  CORE_PHASED_BAM   phased BAM whose reads are kept verbatim (e.g. hybrid);
+                    must carry all reads as records (the hybrid pipeline does)
+  FILL_PHASED_BAM   phased BAM read only for HP/PS of core-unphased reads
+                    (e.g. the bam or graph pipeline output; may be unaligned)
   OUT_BAM           output BAM (core reads unchanged + fill reads stamped)
   samtools          samtools binary [default: samtools]
   ps_offset         disjoint PS namespace offset [default: 1000000000]

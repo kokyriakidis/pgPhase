@@ -28,10 +28,12 @@
 # sibling subdirectories (bam/ and graph/) for head-to-head comparison.
 #
 # Add --gapfill (implies --compare) to also emit hybrid_gapfill/phased.bam: the
-# hybrid phased core with the BAM-only reads added back as disjoint phase sets.
+# hybrid phased core with reads the BAM pipeline phased but hybrid dropped,
+# added back as disjoint phase sets. (All pipelines phase the same vg-giraffe
+# alignment, so this is a cross-pipeline label transfer, not a re-alignment.)
 # This recovers the hard reads the hybrid skip_noisy_kmeans default drops, and
 # Pareto-beats the BAM pipeline (more reads, lower error, higher auN). See
-# CHECKPOINT.md "hybrid-core + BAM gap-fill".
+# CHECKPOINT.md "hybrid-core + gap-fill".
 
 set -euo pipefail
 
@@ -163,8 +165,8 @@ if [[ "${COMPARE}" -eq 1 ]]; then
         --gaf "${GAF}" --sites "${SITES}"
 fi
 
-# ── Optional additive gap-fill: hybrid core + BAM-only reads ──────────
-# Stamp the reads the BAM pipeline phases but hybrid drops onto the hybrid
+# ── Optional additive gap-fill: hybrid core + BAM-pipeline reads ──────
+# Stamp the reads the BAM pipeline phased but hybrid dropped onto the hybrid
 # phased BAM, in a disjoint phase-set namespace (no re-stitch). Needs the BAM
 # pipeline output, which --gapfill forces by also setting --compare.
 if [[ "${GAPFILL}" -eq 1 ]]; then

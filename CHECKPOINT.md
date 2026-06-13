@@ -1218,7 +1218,7 @@ accuracy-at-high-coverage (2.49% < 3.09% BAM is a real gain). NOT worth it if th
 goal is graph's headline 0.80% — that is unreachable at full coverage by
 construction, because the missing reads are the hard ones. Decision pending.
 
-### Built and measured: hybrid-core + BAM gap-fill (additive, no re-stitch)
+### Built and measured: hybrid-core + gap-fill (additive, no re-stitch)
 
 The gap-fill strategy above was prototyped and evaluated on real chr20 data
 (binary `9dcc509`, HG002 HiFi → CHM13, diplinator truth). Implementation
@@ -1227,10 +1227,20 @@ for the 9,169 reads BAM phases but hybrid leaves unphased, copy BAM's `HP` onto
 the hybrid record with `PS += 1e9` (a disjoint phase-set namespace). Purely
 additive — no hybrid block is renumbered, merged, or re-oriented.
 
-The hybrid core is the correct substrate because its phased BAM carries all
-272,016 aligned reads. The graph phased BAM is **unaligned** (no `@SQ` header,
-only ~231k graph-input reads), so graph-core fill would require realignment and
-is out of scope for "append, no re-stitch".
+**Provenance (important):** the bam / graph / hybrid pipeline outputs are all
+phasings of the **same vg-giraffe alignment**, not different aligners. The BAM
+is the linear surjection of the graph alignment (`@PG vg` → `pgbam annotate`);
+the GAF is its graph-space form. So a "fill read" is not from another aligner —
+it is a read that a different pgphase *pipeline* managed to phase. Gap-fill is a
+cross-pipeline HP/PS label transfer by read name, not a re-alignment.
+
+The hybrid phased BAM is the correct substrate because it carries all 272,016
+reads as records. The **fill** BAM is read only for its HP/PS labels, so it may
+be unaligned: the graph pipeline's phased BAM has no `@SQ` header, but
+`samtools view` still yields its tags, and the labels land on the core's
+already-aligned records. (Earlier notes claimed graph fill "needs realignment"
+— that was wrong; it conflated using the graph BAM as the *core* with reading
+its labels.)
 
 **Which reads hybrid drops vs BAM (measured on this run):** 9,169 reads. They
 error at **36.35%** even under the pipeline that phases them (BAM), are all
@@ -1271,12 +1281,31 @@ step-4 noisy reads — the `skip_noisy_kmeans` default drops them on purpose.
   three pipelines), so 2.15% is essentially at the achievable floor for that
   coverage.
 
+**Two-source gap-fill (hybrid core + BAM fill + graph fill):** chaining a second
+`gapfill.py` pass with `ps_offset=2e9` adds the **1,374 reads only the graph
+pipeline phased** (neither hybrid nor BAM). All 1,374 are already present as
+records in the hybrid BAM — no realignment — and phase at 81% in isolation.
+
+| Metric | BAM | Hybrid | +gapfill (1-src) | **+gapfill2 (2-src)** |
+|---|---:|---:|---:|---:|
+| Phased reads | 219,925 | 212,259 | 221,428 | **222,802** |
+| Overall accuracy | 96.91% | **99.23%** | 97.85% | 97.77% |
+| Hamming | 3.091% | **0.768%** | 2.149% | 2.228% |
+| Switch errors | 1,395 | **291** | 1,171 | 1,244 |
+| auN | 9.83M | 7.15M | **11.25M** | 10.62M |
+
+222,802 is the full union of all three pipelines (+2,877 over BAM, the maximum
+phaseable at this coverage). Adding the 1,374 graph-pipeline reads costs +73
+switch errors (their ~19% error on 1,374 reads ≈ +258 discordant), so 2-source
+maximizes coverage while 1-source is marginally cleaner. Both Pareto-beat BAM.
+
 **Decision matrix (all measured):**
 
 | Goal | Method | Hamming | Reads |
 |---|---|---:|---:|
 | Lowest error | Hybrid (default) | 0.77% | 212.3k |
 | Best accuracy *and* coverage vs BAM | **Hybrid+gapfill** | 2.15% | 221.4k |
+| Max coverage (full union) | Hybrid+gapfill2 | 2.23% | 222.8k |
 | Raw BAM-class behavior | BAM / `--keep-noisy-kmeans` | 3.09% | 219.9k |
 
 **Verification of `--keep-noisy-kmeans` (the in-pipeline alternative):** ran for
@@ -1286,9 +1315,11 @@ accuracy. Additive gap-fill is strictly better than `--keep-noisy-kmeans` (2.15%
 vs 3.21% Hamming at comparable coverage) because it does not let the noisy reads
 re-orient the clean core.
 
-**Status:** prototype validated. Not wired into the binary — it is a 40-line
-post-process (`gapfill.py`) over two phased BAMs. Promote to a CLI subcommand
-only if accuracy-at-high-coverage becomes a shipped target.
+**Status:** prototype validated (`scripts/gapfill.py`, exposed via
+`scripts/bench_hybrid.sh --gapfill`). It is a post-process over phased BAMs that
+transfers HP/PS labels by read name; chain it for multi-source fill. Not wired
+into the binary — promote to a CLI subcommand only if accuracy-at-high-coverage
+becomes a shipped target.
 
 ---
 
