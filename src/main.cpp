@@ -1,3 +1,4 @@
+#include <exception>
 #include <iostream>
 #include <string>
 
@@ -20,17 +21,24 @@ void print_main_help() {
 } // namespace
 
 int main(int argc, char* argv[]) {
-    if (argc > 1 && std::string(argv[1]) == "collect-bam-variation") {
-        return collect_bam_variation(argc - 1, argv + 1);
-    }
-    if (argc > 1 && std::string(argv[1]) == "collect-graph-variation") {
-        return collect_graph_variation(argc - 1, argv + 1);
-    }
-    if (argc > 1 && std::string(argv[1]) == "collect-hybrid-variation") {
-        return collect_hybrid_variation(argc - 1, argv + 1);
-    }
-    if (argc > 1 && std::string(argv[1]) == "build-snarl-catalog") {
-        return build_snarl_catalog(argc - 1, argv + 1);
+    try {
+        if (argc > 1 && std::string(argv[1]) == "collect-bam-variation") {
+            return collect_bam_variation(argc - 1, argv + 1);
+        }
+        if (argc > 1 && std::string(argv[1]) == "collect-graph-variation") {
+            return collect_graph_variation(argc - 1, argv + 1);
+        }
+        if (argc > 1 && std::string(argv[1]) == "collect-hybrid-variation") {
+            return collect_hybrid_variation(argc - 1, argv + 1);
+        }
+        if (argc > 1 && std::string(argv[1]) == "build-snarl-catalog") {
+            return build_snarl_catalog(argc - 1, argv + 1);
+        }
+    } catch (const std::exception& e) {
+        // Turn any uncaught error (bad CLI value, missing file, etc.) into a
+        // clean diagnostic and non-zero exit instead of an abort/core dump.
+        std::cerr << "error: " << e.what() << '\n';
+        return 1;
     }
 
     print_main_help();

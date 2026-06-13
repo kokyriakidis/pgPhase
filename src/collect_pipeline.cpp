@@ -9,6 +9,7 @@
 
 #include "collect_pipeline.hpp"
 
+#include "arg_parse.hpp"
 #include "bam_digar.hpp"
 #include "collect_bam_output.hpp"
 #include "collect_output.hpp"
@@ -1189,18 +1190,18 @@ int collect_bam_variation(int argc, char* argv[]) {
 
     while ((opt = getopt_long(argc, argv, "t:q:B:D:r:R:aj:o:v:S:b:C:hX:LV:", long_options, &long_index)) != -1) {
         switch (opt) {
-            case 't': opts.threads = std::stoi(optarg); break;
-            case 'q': opts.min_mapq = std::stoi(optarg); break;
-            case 'B': opts.min_bq = std::stoi(optarg); break;
-            case 'D': opts.min_depth = std::stoi(optarg); break;
-            case kMinAltDepthOption:    opts.min_alt_depth = std::stoi(optarg); break;
-            case kMinAfOption:          opts.min_af = std::stod(optarg); break;
-            case kMaxAfOption:          opts.max_af = std::stod(optarg); break;
+            case 't': opts.threads = parse_int_arg(optarg, "--threads"); break;
+            case 'q': opts.min_mapq = parse_int_arg(optarg, "--min-mapq"); break;
+            case 'B': opts.min_bq = parse_int_arg(optarg, "--min-bq"); break;
+            case 'D': opts.min_depth = parse_int_arg(optarg, "--min-depth"); break;
+            case kMinAltDepthOption:    opts.min_alt_depth = parse_int_arg(optarg, "--min-alt-depth"); break;
+            case kMinAfOption:          opts.min_af = parse_double_arg(optarg, "--min-af"); break;
+            case kMaxAfOption:          opts.max_af = parse_double_arg(optarg, "--max-af"); break;
             case 'r': opts.regions.push_back(optarg); break;
             case 'R': opts.region_file = optarg; break;
             case 'a': opts.autosome = true; break;
-            case 'j': opts.max_var_ratio_per_read = std::stod(optarg); break;
-            case kMaxNoisyFracOption:   opts.max_noisy_frac_per_read = std::stod(optarg); break;
+            case 'j': opts.max_var_ratio_per_read = parse_double_arg(optarg, "--max-var-ratio"); break;
+            case kMaxNoisyFracOption:   opts.max_noisy_frac_per_read = parse_double_arg(optarg, "--max-noisy-frac"); break;
             case 'f': opts.include_filtered = true; break;
             case kAmbBaseOption: opts.output_ambiguous_bases = true; break;
             case 'o': opts.output_tsv = optarg; break;
@@ -1221,18 +1222,18 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kRefineAlnOption:      opts.refine_aln = true; break;
 
             case kPgbamFileOption:      opts.pgbam_file = optarg; break;
-            case kPgbamPrimaryMarginOption: opts.pgbam_primary_polarity_margin = std::stoi(optarg); break;
-            case kPgbamPrimaryMinWinningOption: opts.pgbam_primary_min_winning_threads = std::stoi(optarg); break;
+            case kPgbamPrimaryMarginOption: opts.pgbam_primary_polarity_margin = parse_int_arg(optarg, "--pgbam-primary-margin"); break;
+            case kPgbamPrimaryMinWinningOption: opts.pgbam_primary_min_winning_threads = parse_int_arg(optarg, "--pgbam-primary-min-winning"); break;
             case kNoPgbamCleanupPassOption: opts.pgbam_cleanup_pass = false; break;
-            case kPgbamCleanupMarginOption: opts.pgbam_cleanup_polarity_margin = std::stoi(optarg); break;
-            case kPgbamCleanupMinWinningOption: opts.pgbam_cleanup_min_winning_threads = std::stoi(optarg); break;
+            case kPgbamCleanupMarginOption: opts.pgbam_cleanup_polarity_margin = parse_int_arg(optarg, "--pgbam-cleanup-margin"); break;
+            case kPgbamCleanupMinWinningOption: opts.pgbam_cleanup_min_winning_threads = parse_int_arg(optarg, "--pgbam-cleanup-min-winning"); break;
             case kNoPgbamRelaxedCleanupPassOption: opts.pgbam_relaxed_cleanup_pass = false; break;
-            case kPgbamRelaxedCleanupMarginOption: opts.pgbam_relaxed_cleanup_polarity_margin = std::stoi(optarg); break;
-            case kPgbamRelaxedCleanupMinWinningOption: opts.pgbam_relaxed_cleanup_min_winning_threads = std::stoi(optarg); break;
-            case kChunkSizeOption:      opts.chunk_size = std::stoll(optarg); break;
-            case kNoisyRegMergeDisOption: opts.noisy_reg_merge_dis = std::stoi(optarg); break;
-            case kMinSvLenOption:       opts.min_sv_len = std::stoi(optarg); break;
-            case kNoisySlideWinOption:  opts.noisy_reg_slide_win = std::stoi(optarg); break;
+            case kPgbamRelaxedCleanupMarginOption: opts.pgbam_relaxed_cleanup_polarity_margin = parse_int_arg(optarg, "--pgbam-relaxed-cleanup-margin"); break;
+            case kPgbamRelaxedCleanupMinWinningOption: opts.pgbam_relaxed_cleanup_min_winning_threads = parse_int_arg(optarg, "--pgbam-relaxed-cleanup-min-winning"); break;
+            case kChunkSizeOption:      opts.chunk_size = parse_ll_arg(optarg, "--chunk-size"); break;
+            case kNoisyRegMergeDisOption: opts.noisy_reg_merge_dis = parse_int_arg(optarg, "--noisy-merge-dis"); break;
+            case kMinSvLenOption:       opts.min_sv_len = parse_int_arg(optarg, "--min-sv-len"); break;
+            case kNoisySlideWinOption:  opts.noisy_reg_slide_win = parse_int_arg(optarg, "--noisy-slide-win"); break;
             case kDebugSiteOption:      opts.debug_site = optarg; break;
             case kPhaseMatrixDumpOption: opts.phase_matrix_dump_prefix = optarg; break;
             case 'X': extra_bam_files.push_back(optarg); break;
@@ -1240,11 +1241,11 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kHifiOption:           set_read_technology(ReadTechnology::Hifi); break;
             case kOntOption:            set_read_technology(ReadTechnology::Ont); break;
             case kShortReadsOption:     set_read_technology(ReadTechnology::ShortReads); break;
-            case kStrandBiasPvalOption: opts.strand_bias_pval = std::stod(optarg); break;
-            case kNoisyMaxXgapsOption:  opts.noisy_reg_max_xgaps = std::stoi(optarg); break;
+            case kStrandBiasPvalOption: opts.strand_bias_pval = parse_double_arg(optarg, "--strand-bias-pval"); break;
+            case kNoisyMaxXgapsOption:  opts.noisy_reg_max_xgaps = parse_int_arg(optarg, "--noisy-max-xgaps"); break;
             case kRefOption:            opts.ref_fasta = optarg; break;
             case kBamOption:            opts.bam_files.push_back(optarg); break;
-            case 'V': opts.verbose = std::stoi(optarg); break;
+            case 'V': opts.verbose = parse_int_arg(optarg, "--verbose"); break;
             case 'h': print_collect_help(); return 0;
             default:  print_collect_help(); return 1;
         }

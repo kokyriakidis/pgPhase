@@ -1,5 +1,7 @@
 #include "build_catalog.hpp"
 
+#include "arg_parse.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #include <getopt.h>
@@ -93,7 +95,7 @@ int build_snarl_catalog(int argc, char* argv[]) {
         switch (ch) {
         case 'R': ref_sample  = optarg; break;
         case 'N': contig      = optarg; break;
-        case 't': threads     = std::stoi(optarg); break;
+        case 't': threads     = pgphase_collect::parse_int_arg(optarg, "--threads"); break;
         case 'V': vg_bin      = optarg; break;
         case 'S': snarls_file = optarg; break;
         case 'o': output_file = optarg; break;

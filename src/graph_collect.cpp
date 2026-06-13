@@ -1,5 +1,6 @@
 #include "graph_collect.hpp"
 
+#include "arg_parse.hpp"
 #include "collect_output.hpp"
 #include "collect_phase.hpp"
 #include "collect_phase_pgbam.hpp"
@@ -1010,14 +1011,14 @@ int collect_graph_variation(int argc, char* argv[]) {
             case 'v': opts.output_vcf = optarg; break;
             case kGcPhasedVcf:    opts.output_phased_vcf = optarg; break;
             case kGcPhasedBam:    opts.output_phased_bam = optarg; break;
-            case 't': opts.threads = std::stoi(optarg); break;
-            case 'q': opts.min_mapq = std::stoi(optarg); break;
-            case 'D': opts.min_depth = std::stoi(optarg); break;
-            case kGcMinAltDepth:  opts.min_alt_depth = std::stoi(optarg); break;
-            case kGcMinAf:        opts.min_af = std::stod(optarg); break;
-            case kGcMaxAf:        opts.max_af = std::stod(optarg); break;
-            case kGcMinSvLen:     opts.min_sv_len = std::stoi(optarg); break;
-            case kGcChunkSize:    opts.chunk_size = std::stoll(optarg); break;
+            case 't': opts.threads = parse_int_arg(optarg, "--threads"); break;
+            case 'q': opts.min_mapq = parse_int_arg(optarg, "--min-mapq"); break;
+            case 'D': opts.min_depth = parse_int_arg(optarg, "--min-depth"); break;
+            case kGcMinAltDepth:  opts.min_alt_depth = parse_int_arg(optarg, "--min-alt-depth"); break;
+            case kGcMinAf:        opts.min_af = parse_double_arg(optarg, "--min-af"); break;
+            case kGcMaxAf:        opts.max_af = parse_double_arg(optarg, "--max-af"); break;
+            case kGcMinSvLen:     opts.min_sv_len = parse_int_arg(optarg, "--min-sv-len"); break;
+            case kGcChunkSize:    opts.chunk_size = parse_ll_arg(optarg, "--chunk-size"); break;
             case 'r': opts.regions.push_back(optarg); break;
             case kGcRegionFile:   opts.region_file = optarg; break;
             case kGcAutosome:     opts.autosome = true; break;
@@ -1027,19 +1028,19 @@ int collect_graph_variation(int argc, char* argv[]) {
             case kGcSample:       opts.graph_sample = optarg; break;
             case kGcHifi:         opts.read_technology = ReadTechnology::Hifi; break;
             case kGcOnt:          opts.read_technology = ReadTechnology::Ont; break;
-            case kGcStrandBiasPval: opts.strand_bias_pval = std::stod(optarg); break;
+            case kGcStrandBiasPval: opts.strand_bias_pval = parse_double_arg(optarg, "--strand-bias-pval"); break;
             case kGcRef:          opts.ref_fasta = optarg; break;
             case kGcSites:        opts.graph_sites_vcf = optarg; break;
             case kGcPgbamFile:      opts.pgbam_file = optarg; break;
-            case kGcPgbamPrimaryMargin: opts.pgbam_primary_polarity_margin = std::stoi(optarg); break;
-            case kGcPgbamPrimaryMinWinning: opts.pgbam_primary_min_winning_threads = std::stoi(optarg); break;
+            case kGcPgbamPrimaryMargin: opts.pgbam_primary_polarity_margin = parse_int_arg(optarg, "--pgbam-primary-margin"); break;
+            case kGcPgbamPrimaryMinWinning: opts.pgbam_primary_min_winning_threads = parse_int_arg(optarg, "--pgbam-primary-min-winning"); break;
             case kGcNoPgbamCleanupPass: opts.pgbam_cleanup_pass = false; break;
-            case kGcPgbamCleanupMargin: opts.pgbam_cleanup_polarity_margin = std::stoi(optarg); break;
-            case kGcPgbamCleanupMinWinning: opts.pgbam_cleanup_min_winning_threads = std::stoi(optarg); break;
+            case kGcPgbamCleanupMargin: opts.pgbam_cleanup_polarity_margin = parse_int_arg(optarg, "--pgbam-cleanup-margin"); break;
+            case kGcPgbamCleanupMinWinning: opts.pgbam_cleanup_min_winning_threads = parse_int_arg(optarg, "--pgbam-cleanup-min-winning"); break;
             case kGcNoPgbamRelaxedCleanupPass: opts.pgbam_relaxed_cleanup_pass = false; break;
-            case kGcPgbamRelaxedCleanupMargin: opts.pgbam_relaxed_cleanup_polarity_margin = std::stoi(optarg); break;
-            case kGcPgbamRelaxedCleanupMinWinning: opts.pgbam_relaxed_cleanup_min_winning_threads = std::stoi(optarg); break;
-            case 'V': opts.verbose = std::stoi(optarg); break;
+            case kGcPgbamRelaxedCleanupMargin: opts.pgbam_relaxed_cleanup_polarity_margin = parse_int_arg(optarg, "--pgbam-relaxed-cleanup-margin"); break;
+            case kGcPgbamRelaxedCleanupMinWinning: opts.pgbam_relaxed_cleanup_min_winning_threads = parse_int_arg(optarg, "--pgbam-relaxed-cleanup-min-winning"); break;
+            case 'V': opts.verbose = parse_int_arg(optarg, "--verbose"); break;
             case 'h': print_graph_collect_help(); return 0;
             default:  print_graph_collect_help(); return 1;
         }
