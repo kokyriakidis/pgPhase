@@ -995,20 +995,88 @@ Two conclusions for the "lower Hamming/switch" goal:
   extra easy sites. You cannot obtain graph's low Hamming at BAM's coverage by
   blending; the low Hamming is inseparable from phasing fewer, easier reads.
 
-**Net answer:** graph wins the Hamming/switch *metric* (0.80% / 0.18% vs BAM 3.09%
-/ 0.63%) but only by attempting an easier subset. No blend recovers it at BAM
-coverage. Per the rejected-lever ledger, the only path to beating BAM on shared
-reads is **data BAM lacks** (trio/parental reads or a second orthogonal
-technology), not reprocessing the graph alignment of the same reads.
-- **Hybrid phases more reads**: 220,897 vs 219,925 (+972 reads).
-- **BAM edges hybrid on two secondary metrics**: switchflip 1.57% vs 1.62% and perfect
-  PS 125 vs 91 — the cost of hybrid's more aggressive (contiguity-gaining) merging.
-- **Graph**: highest read phasing rate (93.4%) but substantially lower accuracy (92.70%)
-  and fragmented blocks (auN 981k). Sees fewer input reads (231k vs 272k) because the
-  GAF covers only pangenome-aligned reads.
+**Net answer (first pass):** graph wins the Hamming/switch *metric* (0.80% / 0.18%
+vs BAM 3.09% / 0.63%). The marginal-read split (graph-influenced reads error at
+16.67% in hybrid) initially suggested this was *purely* a denominator effect. The
+shared-read analysis below **partially corrects that** — graph is also genuinely
+more accurate on reads both pipelines phase.
 
-All three rows were regenerated from the same current HEAD binary (BAM/graph/hybrid
-all run with shipped defaults; hybrid = af0.11 + stitch margin 10 + both-strands rule).
+All rows in the table above were regenerated from the same current HEAD binary
+(BAM/graph/hybrid all run with shipped defaults; hybrid = af0.11 + stitch margin
+10 + both-strands rule), scored against the same diplinator truth BAM.
+
+### Shared-read accuracy: graph IS better on the same reads (corrects earlier claim)
+
+Comparing per-read concordance on the **201,202 reads both graph and BAM phase**
+(`eval_graph/per_read.tsv.gz` ∩ `eval_bam/per_read.tsv.gz`, same truth BAM):
+
+| On 201,202 shared reads | Graph | BAM |
+|---|---:|---:|
+| Discordant | 1,247 (**0.62%**) | 2,896 (**1.44%**) |
+
+Per-read disagreement on those shared reads:
+
+| Outcome | Reads |
+|---|---:|
+| graph RIGHT, bam WRONG | **2,082** |
+| bam RIGHT, graph WRONG | 433 |
+| both WRONG | 814 |
+
+**Graph wins disagreements 4.8 : 1.** This means graph's accuracy is *not* purely a
+denominator effect — on reads both attempt, graph is ~2.3× more concordant. The
+earlier "pure denominator effect" framing (marginal-split section) was too strong.
+
+**Confound (unresolved):** graph blocks are far shorter (auN 0.99M vs 9.83M; 368
+vs 429 PS). A read in a shorter block spans fewer adjacent-het transitions, so it
+is *mechanically* less likely to be scored discordant. Graph's 0.62% is therefore
+**part genuinely-better-phasing, part shorter-blocks**; the two are not separated
+by this measurement. Any strategy that lengthens graph blocks (e.g. by adding BAM
+sites) would partly surrender the short-block component.
+
+### Incremental (non-shared) reads — the hard tail
+
+| Reads only one pipeline phases | Count | Discordant |
+|---|---:|---:|
+| graph-only | 2,513 | 15.6% |
+| **bam-only** | **18,723** | **20.8%** |
+
+The 18,723 reads BAM phases but graph does not error at 20.8% — graph lacks sites
+there precisely in the **hard regions** (segdups), the same windows (37–38 Mb)
+where prior analysis found "pulling hard reads into blocks injects switches."
+
+### Proposed strategy: invert hybrid (graph-base + BAM-fill)
+
+Idea (user, this session): since graph now performs so well, flip the hybrid base
+from BAM to graph, and bring **validated BAM sites into the graph where the graph
+has no sites**, instead of the current BAM-base + graph-augment design.
+
+**Why it has merit:** graph is genuinely more accurate on shared reads (above), so
+keeping graph as the core and only filling gaps could retain graph's clean phasing
+while recovering coverage.
+
+**Optimistic ceiling:** if the graph core keeps ~0.80% and the ~18,723 bam-only
+reads are added at BAM accuracy: ≈5,541 errors / 222,438 reads ≈ **2.5% Hamming**
+— would beat BAM (3.09%) and current hybrid (3.22%) at *higher* coverage.
+
+**Risks that could collapse the ceiling:**
+1. Adding BAM sites lengthens graph blocks → reawakens the short-block confound
+   (some of graph's 0.62% edge was mechanical) and the segdup-switch penalty
+   established in the rejected-lever ledger.
+2. The bam-only fill reads error at 20.8% — the gain is bounded by how many are
+   *recoverable* and whether merging them keeps graph's core clean.
+
+**Feasibility probes to run BEFORE building (offline, no C++ — matches this
+project's measure-first track record):**
+1. **GAF membership of the 18,723 bam-only reads.** If present in the GAF but
+   unphased for lack of sites → recoverable. If absent from the GAF → unreachable
+   regardless. (Established globally: GAF 271,930 ⊂ BAM 272,016; confirm for *this*
+   subset.)
+2. **Block-length-fair accuracy.** Re-score graph vs BAM on shared reads within
+   comparable block spans, to isolate real phasing quality from the short-block
+   artifact and get a realistic (not optimistic) ceiling.
+
+**Status:** not yet started — awaiting decision on probe-first (recommended) vs
+build-first. This is the live thread to resume.
 
 ---
 
@@ -1346,6 +1414,21 @@ Only **data BAM does not contain**: trio/parental reads (HG002 has them — true
 independent inheritance signal) or a second orthogonal sequencing technology
 (e.g. ONT — independent error modes). Not another way to process the graph
 alignment of the same reads.
+
+> **PARTIALLY SUPERSEDED (post noise-filter-fix session).** This ledger was built
+> *before* the indel noise-filter fixes that took graph accuracy 92.70% → 99.20%.
+> Two of its premises now need re-examination:
+> - "Graph is 3× less accurate" (lever #4) is **no longer true** — post-fix graph
+>   is *more* accurate than BAM on shared reads (0.62% vs 1.44% discordant; wins
+>   disagreements 4.8:1). See "Shared-read accuracy" in the three-pipeline section.
+> - This changes the calculus for a **graph-base + BAM-fill** hybrid inversion
+>   (proposed this session, see "Proposed strategy: invert hybrid"). The ledger's
+>   levers all assumed BAM-base + graph-augment; an inverted architecture was never
+>   tested. The "GAF ⊂ BAM / no independent read evidence" point still holds and
+>   still caps gains on *shared* reads — but graph-base changes *which* pipeline
+>   phases the easy core, which the ledger did not evaluate.
+> The trio/ONT conclusion below still stands for beating BAM on the *shared hard
+> reads*; it does not rule out the graph-base inversion, which is a different lever.
 
 ### A real, optional trade-off knob (not promoted to default)
 
