@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <climits>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -238,6 +240,70 @@ static int read_to_cons_allele_score(CandidateVariant& var, int hap, uint32_t va
     if (var.hap_to_cons_alle[hap] == allele_i) return var_score;
     if (var.hap_to_cons_alle[hap] == -1) return 0;
     return -var_score;
+}
+
+// Weight a candidate gets in k-means scoring (mirrors read_to_cons_allele_score):
+// clean het SNP/indel count double, everything else single.
+static int phase_matrix_var_weight(uint32_t var_i_to_cate) {
+    if (var_i_to_cate == kCandCleanHetSnp) return 2;
+    if (var_i_to_cate == kCandCleanHetIndel) return 2;
+    return 1;
+}
+
+// Dump the per-read x per-variant allele matrix that k-means consumes, in long
+// format (one row per read/variant observation). Debug-only; gated on
+// opts.phase_matrix_dump_prefix. Must be called BEFORE any phasing mutates
+// hap_to_cons_alle. Truth labels are NOT emitted (the pipeline has none) — join
+// by read qname offline. Variants are emitted in candidate-table order so the
+// offline reader can reconstruct read ordering along the contig.
+static void dump_phase_matrix(const PhasingChunk& chunk,
+                              const std::vector<int>& valid_var_idx,
+                              const std::vector<bool>& var_is_valid,
+                              const Options& opts, uint32_t flags) {
+    if (opts.phase_matrix_dump_prefix.empty()) return;
+
+    std::string path = opts.phase_matrix_dump_prefix + ".chunk" +
+                       std::to_string(chunk.region.chunk_id) + ".flags" +
+                       std::to_string(flags) + ".tsv";
+    std::FILE* fp = std::fopen(path.c_str(), "w");
+    if (fp == nullptr) {
+        std::fprintf(stderr, "[dump-phase-matrix] cannot open %s\n", path.c_str());
+        return;
+    }
+
+    // Variant header block: idx, pos, type, category, weight. Variant idx is the
+    // position within valid_var_idx (0-based, contig order).
+    std::fprintf(fp, "#tid\t%d\tchunk\t%d\tflags\t%u\tn_vars\t%zu\n",
+                 chunk.region.tid, chunk.region.chunk_id, flags, valid_var_idx.size());
+    std::fprintf(fp, "#VAR\tvar_idx\tpos\ttype\tcate\tweight\n");
+    std::vector<int> global_to_vidx(chunk.candidates.size(), -1);
+    for (int vidx = 0; vidx < (int)valid_var_idx.size(); ++vidx) {
+        const int gi = valid_var_idx[vidx];
+        global_to_vidx[gi] = vidx;
+        const CandidateVariant& var = chunk.candidates[gi];
+        const char t = (var.key.type == VariantType::Snp ? 'X'
+                     : (var.key.type == VariantType::Insertion ? 'I' : 'D'));
+        std::fprintf(fp, "VAR\t%d\t%" PRId64 "\t%c\t%u\t%d\n",
+                     vidx, static_cast<int64_t>(var.key.pos), t,
+                     var.lcd_var_i_to_cate,
+                     phase_matrix_var_weight(var.lcd_var_i_to_cate));
+    }
+
+    // Observation rows: qname, var_idx, allele (0=ref,1=alt,-1=non-inf,-2=lowqual).
+    std::fprintf(fp, "#OBS\tqname\tvar_idx\tallele\n");
+    for (size_t read_i = 0; read_i < chunk.reads.size(); ++read_i) {
+        const ReadRecord& read = chunk.reads[read_i];
+        if (read.is_skipped) continue;
+        const ReadVariantProfile& prof = chunk.read_var_profile[read_i];
+        if (prof.start_var_idx < 0) continue;
+        for (int vi = prof.start_var_idx; vi <= prof.end_var_idx; ++vi) {
+            if (!var_is_valid[vi]) continue;
+            const int allele = prof.alleles[vi - prof.start_var_idx];
+            std::fprintf(fp, "OBS\t%s\t%d\t%d\n",
+                         read.qname.c_str(), global_to_vidx[vi], allele);
+        }
+    }
+    std::fclose(fp);
 }
 
 // Assign a read to hap 1, 2, 0 (tied), or -1 (no informative variants).
@@ -519,6 +585,9 @@ void assign_hap_based_on_germline_het_vars_kmeans(PhasingChunk& chunk,
         var_is_valid[i] = true;
     }
     if (valid_var_idx.empty()) return;
+
+    // Debug: dump the read x variant allele matrix before phasing mutates state.
+    dump_phase_matrix(chunk, valid_var_idx, var_is_valid, opts, flags);
 
     const bool is_ont = opts.is_ont();
     const size_t n_reads = chunk.reads.size();

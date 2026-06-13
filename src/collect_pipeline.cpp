@@ -988,6 +988,7 @@ enum LongOption {
     kAmbBaseOption,
     kRefOption,
     kBamOption,
+    kPhaseMatrixDumpOption,
 
 };
 
@@ -1157,6 +1158,7 @@ int collect_bam_variation(int argc, char* argv[]) {
         {"min-sv-len",                required_argument, nullptr, kMinSvLenOption},
         {"noisy-slide-win",           required_argument, nullptr, kNoisySlideWinOption},
         {"debug-site",                required_argument, nullptr, kDebugSiteOption},
+        {"dump-phase-matrix",         required_argument, nullptr, kPhaseMatrixDumpOption},
         {"extra-bam",                 required_argument, nullptr, 'X'},
         {"input-is-list",             no_argument,       nullptr, 'L'},
         {"hifi",                      no_argument,       nullptr, kHifiOption},
@@ -1232,6 +1234,7 @@ int collect_bam_variation(int argc, char* argv[]) {
             case kMinSvLenOption:       opts.min_sv_len = std::stoi(optarg); break;
             case kNoisySlideWinOption:  opts.noisy_reg_slide_win = std::stoi(optarg); break;
             case kDebugSiteOption:      opts.debug_site = optarg; break;
+            case kPhaseMatrixDumpOption: opts.phase_matrix_dump_prefix = optarg; break;
             case 'X': extra_bam_files.push_back(optarg); break;
             case 'L': opts.input_is_list = true; break;
             case kHifiOption:           set_read_technology(ReadTechnology::Hifi); break;

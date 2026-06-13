@@ -243,6 +243,10 @@ struct Options {
     /** Optional precomputed vg deconstruct VCF used as a development/debug graph-site catalog. */
     std::string graph_sites_vcf;
     std::string debug_site; // CHR:POS, emits per-read digar hits to stderr
+    // If non-empty, dump the per-read x per-variant allele matrix consumed by
+    // k-means to "{prefix}.chunk{id}.flags{flags}.tsv" for offline optimizer
+    // experiments (MEC/EM vs the production greedy k-means). Debug-only.
+    std::string phase_matrix_dump_prefix;
     /** CLI command string used for PG:CL header field in phased SAM/BAM/CRAM output. */
     std::string command_line;
 
