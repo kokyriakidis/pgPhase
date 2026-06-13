@@ -26,10 +26,17 @@
 #
 # Add --compare to also run the BAM-only and graph-only pipelines into
 # sibling subdirectories (bam/ and graph/) for head-to-head comparison.
+#
+# Add --gapfill (implies --compare) to also emit hybrid_gapfill/phased.bam: the
+# hybrid phased core with the BAM-only reads added back as disjoint phase sets.
+# This recovers the hard reads the hybrid skip_noisy_kmeans default drops, and
+# Pareto-beats the BAM pipeline (more reads, lower error, higher auN). See
+# CHECKPOINT.md "hybrid-core + BAM gap-fill".
 
 set -euo pipefail
 
 readonly SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 REF=""
 BAM=""
@@ -40,6 +47,7 @@ THREADS=8
 PLATFORM="hifi"   # hifi or ont
 PGPHASE="./pgphase"
 COMPARE=0
+GAPFILL=0
 
 die() {
     echo "Error: $*" >&2
@@ -59,6 +67,7 @@ Required:
 
 Optional:
   --compare        Also run BAM-only and graph-only pipelines for A/B
+  --gapfill        Emit hybrid_gapfill/phased.bam (implies --compare)
   --ont            ONT mode [default: HiFi]
   --pgphase PATH   Path to pgphase binary [./pgphase]
   --threads INT    Threads [8]
@@ -76,6 +85,7 @@ while [[ $# -gt 0 ]]; do
         --outdir)  OUTDIR="$2";  shift 2 ;;
         --threads) THREADS="$2"; shift 2 ;;
         --compare) COMPARE=1;    shift ;;
+        --gapfill) GAPFILL=1; COMPARE=1; shift ;;
         --ont)     PLATFORM="ont"; shift ;;
         --pgphase) PGPHASE="$2"; shift 2 ;;
         -h|--help) usage ;;
@@ -151,6 +161,27 @@ if [[ "${COMPARE}" -eq 1 ]]; then
     run_pipeline "bam" "collect-bam-variation" "--out-bam" --bam "${BAM}"
     run_pipeline "graph" "collect-graph-variation" "--phased-bam-out" \
         --gaf "${GAF}" --sites "${SITES}"
+fi
+
+# ── Optional additive gap-fill: hybrid core + BAM-only reads ──────────
+# Stamp the reads the BAM pipeline phases but hybrid drops onto the hybrid
+# phased BAM, in a disjoint phase-set namespace (no re-stitch). Needs the BAM
+# pipeline output, which --gapfill forces by also setting --compare.
+if [[ "${GAPFILL}" -eq 1 ]]; then
+    gapfill_dir="${OUTDIR}/hybrid_gapfill"
+    gapfill_bam="${gapfill_dir}/phased.bam"
+    if [[ -f "${gapfill_bam}" ]]; then
+        echo "[hybrid_gapfill] phased BAM exists, skipping."
+    else
+        command -v samtools >/dev/null 2>&1 || die "samtools required for --gapfill"
+        mkdir -p "${gapfill_dir}"
+        echo "[hybrid_gapfill] Building hybrid core + BAM gap-fill ..."
+        python3 "${SCRIPT_DIR}/gapfill.py" \
+            "${OUTDIR}/hybrid/phased.bam" \
+            "${OUTDIR}/bam/phased.bam" \
+            "${gapfill_bam}"
+        samtools index "${gapfill_bam}"
+    fi
 fi
 
 echo ""

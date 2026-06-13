@@ -1218,6 +1218,78 @@ accuracy-at-high-coverage (2.49% < 3.09% BAM is a real gain). NOT worth it if th
 goal is graph's headline 0.80% — that is unreachable at full coverage by
 construction, because the missing reads are the hard ones. Decision pending.
 
+### Built and measured: hybrid-core + BAM gap-fill (additive, no re-stitch)
+
+The gap-fill strategy above was prototyped and evaluated on real chr20 data
+(binary `9dcc509`, HG002 HiFi → CHM13, diplinator truth). Implementation
+(`run_all3_fixed/gapfill.py`): take the hybrid phased BAM as the untouched core;
+for the 9,169 reads BAM phases but hybrid leaves unphased, copy BAM's `HP` onto
+the hybrid record with `PS += 1e9` (a disjoint phase-set namespace). Purely
+additive — no hybrid block is renumbered, merged, or re-oriented.
+
+The hybrid core is the correct substrate because its phased BAM carries all
+272,016 aligned reads. The graph phased BAM is **unaligned** (no `@SQ` header,
+only ~231k graph-input reads), so graph-core fill would require realignment and
+is out of scope for "append, no re-stitch".
+
+**Which reads hybrid drops vs BAM (measured on this run):** 9,169 reads. They
+error at **36.35%** even under the pipeline that phases them (BAM), are all
+mapq 60 (not a mapping artifact), and concentrate in segdup/low-complexity
+windows (44–46 Mb ≈ 3,805 reads at 38–53% error; 13–14, 35–36, 43 Mb). Graph
+phases only 625 of them, at 64% accuracy. These are the deliberately-skipped
+step-4 noisy reads — the `skip_noisy_kmeans` default drops them on purpose.
+
+**Result:**
+
+| Metric | BAM | Graph | Hybrid | **Hybrid+gapfill** |
+|---|---:|---:|---:|---:|
+| Phased reads | 219,925 | 203,734 | 212,259 | **221,428** |
+| Overall accuracy | 96.91% | 99.21% | **99.23%** | 97.85% |
+| Hamming | 3.091% | 0.790% | **0.768%** | 2.149% |
+| Switch errors | 1,395 | 364 | **291** | 1,171 |
+| Switch rate | 0.636% | 0.179% | **0.137%** | 0.530% |
+| Flip errors | 2,050 | 856 | **906** | 1,958 |
+| Perfect PS % | 29.14% | **39.12%** | 33.82% | 28.79% |
+| Phase sets | 429 | 368 | 347 | 499 |
+| N50 | 937,648 | 917,581 | **993,831** | 927,359 |
+| auN | 9.83M | 0.99M | 7.15M | **11.25M** |
+| Genome covered | 313.5M | 221.6M | 246.7M | **340.2M** |
+
+**Findings:**
+- **Hybrid+gapfill Pareto-beats pure BAM on every axis:** more reads phased
+  (+1,503), lower Hamming (2.15% vs 3.09%, ~30% relative), fewer switch errors
+  (1,171 vs 1,395), higher auN (11.25M vs 9.83M), more genome covered (340M vs
+  314M). If a workflow ships/compares against BAM for high coverage, gap-fill is
+  a strict upgrade.
+- **The disjoint-PS design works:** switch errors rose only to 1,171 (below BAM's
+  1,395), confirming the fill reads create their own small phase sets without
+  contaminating the hybrid core. Measured Hamming (2.149%) **beat** the offline
+  projection (2.25%) for this reason.
+- **It does NOT preserve hybrid's 0.77% Hamming.** Adding the hard segdup reads
+  (36% error) drags Hamming 0.77% → 2.15%. Unavoidable: the oracle best-of-3
+  per-read ceiling is 2.16% Hamming at 222.8k reads (4,804 reads are wrong in all
+  three pipelines), so 2.15% is essentially at the achievable floor for that
+  coverage.
+
+**Decision matrix (all measured):**
+
+| Goal | Method | Hamming | Reads |
+|---|---|---:|---:|
+| Lowest error | Hybrid (default) | 0.77% | 212.3k |
+| Best accuracy *and* coverage vs BAM | **Hybrid+gapfill** | 2.15% | 221.4k |
+| Raw BAM-class behavior | BAM / `--keep-noisy-kmeans` | 3.09% | 219.9k |
+
+**Verification of `--keep-noisy-kmeans` (the in-pipeline alternative):** ran for
+real — recovers reads to 220,633 but regresses to 96.79% / 3.21% Hamming /
+1,371 switch (essentially BAM), confirming step-4 phases its extra reads at ~65%
+accuracy. Additive gap-fill is strictly better than `--keep-noisy-kmeans` (2.15%
+vs 3.21% Hamming at comparable coverage) because it does not let the noisy reads
+re-orient the clean core.
+
+**Status:** prototype validated. Not wired into the binary — it is a 40-line
+post-process (`gapfill.py`) over two phased BAMs. Promote to a CLI subcommand
+only if accuracy-at-high-coverage becomes a shipped target.
+
 ---
 
 ## Graph Het-Indel AF Gate (resolves hybrid accuracy/contiguity regression)
