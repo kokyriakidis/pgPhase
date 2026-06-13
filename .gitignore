@@ -6,6 +6,7 @@
 /test_graph_phase
 /test_graph_bam_adapter
 /test_hybrid_inject
+/test_noise_filter
 /dist/
 /release/
 *.tar
