@@ -39,8 +39,9 @@
 #
 # Note: the N=1 (BAM-pipeline) gap-fill is now built into the binary as
 # `collect-hybrid-variation --gap-fill` (no post-process / second pipeline run
-# needed). This script's --gapfill remains for N=2 (graph-source) and for
-# reproducing the prototype BAMs against the native output.
+# needed) and is the only supported gap-fill: it recovers reads present in the
+# projected BAM. N=2 (graph-source) is a deliberate non-goal for the binary and
+# stays here for offline analysis only; see CHECKPOINT.md "hybrid-core + gap-fill".
 
 set -euo pipefail
 

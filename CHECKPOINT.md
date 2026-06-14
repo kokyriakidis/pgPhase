@@ -1281,10 +1281,15 @@ step-4 noisy reads — the `skip_noisy_kmeans` default drops them on purpose.
   three pipelines), so 2.15% is essentially at the achievable floor for that
   coverage.
 
-**Two-source gap-fill (hybrid core + BAM fill + graph fill):** chaining a second
-`gapfill.py` pass with `ps_offset=2e9` adds the **1,374 reads only the graph
-pipeline phased** (neither hybrid nor BAM). All 1,374 are already present as
-records in the hybrid BAM — no realignment — and phase at 81% in isolation.
+**Two-source gap-fill (hybrid core + BAM fill + graph fill) — measured but
+deliberately NOT shipped:** chaining a second `gapfill.py` pass with
+`ps_offset=2e9` adds the **1,374 reads only the graph pipeline phased** (neither
+hybrid nor BAM). All 1,374 are already present as records in the hybrid BAM — no
+realignment — and phase at 81% in isolation. **Decision (final): gap-fill will
+only ever recover reads present in the projected BAM** (the linear surjection of
+the graph alignment that the hybrid pipeline already loads). The graph-only reads
+are out of scope by design, so this row is kept for the record only — it is not a
+candidate for promotion to the binary.
 
 | Metric | BAM | Hybrid | +gapfill (1-src) | **+gapfill2 (2-src)** |
 |---|---:|---:|---:|---:|
@@ -1305,7 +1310,7 @@ maximizes coverage while 1-source is marginally cleaner. Both Pareto-beat BAM.
 |---|---|---:|---:|
 | Lowest error | Hybrid (default) | 0.77% | 212.3k |
 | Best accuracy *and* coverage vs BAM | **Hybrid+gapfill** | 2.15% | 221.4k |
-| Max coverage (full union) | Hybrid+gapfill2 | 2.23% | 222.8k |
+| Max coverage (full union, offline only — not shipped) | Hybrid+gapfill2 | 2.23% | 222.8k |
 | Raw BAM-class behavior | BAM / `--keep-noisy-kmeans` | 3.09% | 219.9k |
 
 **Verification of `--keep-noisy-kmeans` (the in-pipeline alternative):** ran for
@@ -1328,10 +1333,11 @@ clean core is never renumbered, merged, or re-oriented — the in-binary form of
 the validated `scripts/gapfill.py` 1-source pass. `collect_bam_output.cpp` emits
 the gap-fill HP/PS for any read the core left unphased. Off by default.
 
-The 2-source variant (also adding the 1,374 graph-only reads → 222,802 /
-2.23%) remains a post-process only, via `scripts/bench_hybrid.sh --gapfill 2`;
-it needs the graph-pipeline phasing as a second source, which the single hybrid
-binary run does not produce. The original prototype (`scripts/gapfill.py`,
+The 2-source variant (adding the 1,374 graph-only reads → 222,802 / 2.23%) is a
+**deliberate non-goal** and will not be promoted to the binary: gap-fill recovers
+only reads present in the projected BAM, and the graph-only reads are out of scope
+by design. It exists solely as a post-process for offline analysis via
+`scripts/bench_hybrid.sh --gapfill 2`. The prototype (`scripts/gapfill.py`,
 `scripts/bench_hybrid.sh --gapfill [N]`) is retained for reproducing both BAMs.
 
 ---
