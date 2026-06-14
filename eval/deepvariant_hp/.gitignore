@@ -1,0 +1,5 @@
+# Downloaded resources (reference, GIAB truth, container images)
+resources/
+
+# Evaluation outputs (DeepVariant VCFs, hap.py reports, comparison)
+results/
