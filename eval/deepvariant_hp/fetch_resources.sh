@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly DV_VERSION="1.6.1"
+readonly DV_VERSION="1.10.0"
 readonly HAPPY_VERSION="v0.3.12"
 
 RESOURCE_DIR="${SCRIPT_DIR}/resources"

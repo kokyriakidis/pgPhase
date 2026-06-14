@@ -13,23 +13,27 @@
 #   Arm B (dv_our_hp):  DeepVariant on the pgphase PHASED BAM (carries HP/PS
 #                       tags). DeepVariant's internal phasing is disabled
 #                       (phase_reads=false) but it still sorts the pileup by
-#                       haplotype and feeds the HP channel from OUR tags
-#                       (sort_by_haplotypes=true, add_hp_channel is a PACBIO
-#                       default). This isolates the effect of substituting
-#                       pgphase phasing for DeepVariant's own.
+#                       haplotype, which makes make_examples parse the HP tag
+#                       from OUR reads (sort_by_haplotypes=true). This isolates
+#                       the effect of substituting pgphase phasing for
+#                       DeepVariant's own.
 #
 # If arm B's SNP/INDEL F1 exceeds arm A's, pgphase phasing improves DeepVariant
 # variant calling. The comparison is reported by summarize_happy.py.
 #
-# The PACBIO make_examples defaults that matter here (from DeepVariant r1.6
-# run_deepvariant.py) are: add_hp_channel=true, sort_by_haplotypes=true,
-# phase_reads=true, parse_sam_aux_fields=true. Arm B overrides phase_reads.
+# Flag basis (DeepVariant r1.10): from v1.10.0 the per-model make_examples args
+# (incl. the PACBIO default phase_reads=true) live in the model's
+# example_info.json, so arm A needs no flags. make_examples_options.py documents
+# the HP-tag contract used by arm B: "HP is parsed if --phase_reads=False and
+# --sort_by_haplotypes ... are set." parse_sam_aux_fields is deprecated in 1.10
+# (AUX parsing is now auto-controlled by the requested channels/flags), so it is
+# not set here. Arm B only overrides phase_reads=false,sort_by_haplotypes=true.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly DV_VERSION="1.6.1"
+readonly DV_VERSION="1.10.0"
 readonly HAPPY_VERSION="v0.3.12"
 readonly MODEL_TYPE="PACBIO"
 

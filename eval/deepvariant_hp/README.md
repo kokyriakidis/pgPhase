@@ -9,22 +9,27 @@ on variant-calling accuracy (hap.py vs GIAB truth).
 ## The two arms
 
 Both arms call variants from the **same reads/alignment** with DeepVariant
-`PACBIO` (r1.6.1). Only the source of read phasing differs.
+`PACBIO` (1.10.0). Only the source of read phasing differs.
 
 | Arm | Input BAM | DeepVariant phasing | Isolates |
 |---|---|---|---|
 | `dv_default` | raw BAM (no HP tags) | internal (`phase_reads=true`, default) | stock DeepVariant baseline |
 | `dv_our_hp` | pgphase phased BAM (HP/PS tags) | **off** (`phase_reads=false`), uses our HP | pgphase phasing vs DeepVariant's own |
 
-`dv_our_hp` keeps `sort_by_haplotypes=true` and the PacBio-default
-`add_hp_channel`/`parse_sam_aux_fields`, so DeepVariant reads the HP tags already
-present in the pgphase BAM and feeds them into the pileup HP channel — instead of
+`dv_our_hp` sets `sort_by_haplotypes=true`, which is exactly the condition under
+which `make_examples` parses the existing HP tag from the reads instead of
 computing its own phasing. If `dv_our_hp` F1 > `dv_default` F1, pgphase phasing
 helps.
 
-The relevant PacBio `make_examples` defaults are taken from DeepVariant r1.6
-`run_deepvariant.py`: `add_hp_channel=true`, `sort_by_haplotypes=true`,
-`phase_reads=true`, `parse_sam_aux_fields=true`, `realign_reads=false`.
+**Flag basis (DeepVariant r1.10).** From v1.10.0 the per-model `make_examples`
+arguments — including the PacBio default `phase_reads=true` — are stored in the
+model's `example_info.json`, so arm A needs no extra flags to get DeepVariant's
+own phasing. The HP-tag contract for arm B is documented in
+`make_examples_options.py`: *"HP is parsed if `--phase_reads=False` and
+`--sort_by_haplotypes` ... are set."* `parse_sam_aux_fields` is **deprecated** in
+1.10 (AUX-field parsing is now auto-controlled by the requested channels/flags),
+so it is not set. Arm B's only override is
+`phase_reads=false,sort_by_haplotypes=true`.
 
 ## Why this cannot run in the Ona dev container
 
@@ -111,7 +116,7 @@ INDEL: pgphase HP improves DeepVariant F1 (+0.000842)
 
 ## Notes
 
-- **Versions are pinned** (DeepVariant 1.6.1, hap.py v0.3.12, GIAB v4.2.1) for
+- **Versions are pinned** (DeepVariant 1.10.0, hap.py v0.3.12, GIAB v4.2.1) for
   reproducibility. Change them at the top of the scripts if needed.
 - **hap.py uses the `vcfeval` engine** and `--pass-only`, matching the
   DeepVariant PacBio case study, so numbers are comparable to published results.
