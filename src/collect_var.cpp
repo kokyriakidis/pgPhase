@@ -12,7 +12,9 @@
 #include "sdust.h"
 
 #include <algorithm>
+#include <array>
 #include <cfloat>
+#include <cinttypes>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -2022,6 +2024,72 @@ void collect_var_build_profiles(PhasingChunk& chunk, const Options& opts) {
     collect_read_var_profile(opts, chunk);
 }
 
+// Recover the reads that skip_noisy_kmeans leaves unphased without disturbing
+// the clean core.  Runs the same kCandGermlineVarCate k-means that
+// collect_noisy_vars_step4 skips when skip_noisy_kmeans is set, but adopts its
+// haplotype only for reads the core left at hap==0, writing them into the
+// separate gap_haps/gap_phase_sets vectors with a disjoint PS namespace.  The
+// k-means call rewrites chunk.haps/phase_sets and per-candidate consensus
+// fields, so those are snapshotted and restored — the authoritative core state
+// is byte-for-byte unchanged on return.  In-binary form of scripts/gapfill.py.
+static void gap_fill_unphased_reads(PhasingChunk& chunk, const Options& opts) {
+    const size_t n_reads = chunk.haps.size();
+    if (n_reads == 0) return;
+
+    // Snapshot authoritative core read-phase state.
+    const std::vector<int> core_haps = chunk.haps;
+    const std::vector<hts_pos_t> core_phase_sets = chunk.phase_sets;
+
+    // Snapshot per-candidate consensus fields the k-means rewrites (these feed
+    // the phased VCF and must reflect the core, not the fill pass).
+    struct CandSnapshot {
+        hts_pos_t phase_set;
+        int hap_alt;
+        int hap_ref;
+        std::array<int, 3> hap_to_cons_alle;
+    };
+    std::vector<CandSnapshot> cand_snap;
+    cand_snap.reserve(chunk.candidates.size());
+    for (const CandidateVariant& c : chunk.candidates) {
+        cand_snap.push_back({c.phase_set, c.hap_alt, c.hap_ref, c.hap_to_cons_alle});
+    }
+
+    // Fill pass: same k-means skip_noisy_kmeans disabled (includes recalled
+    // noisy candidates via kCandGermlineVarCate).
+    assign_hap_based_on_germline_het_vars_kmeans(chunk, opts, kCandGermlineVarCate);
+
+    // Harvest assignments only for reads the core left unphased.
+    chunk.gap_haps.assign(n_reads, 0);
+    chunk.gap_phase_sets.assign(n_reads, -1);
+    int n_filled = 0;
+    for (size_t i = 0; i < n_reads; ++i) {
+        if (core_haps[i] != 0) continue;            // never touch the core
+        if (chunk.haps[i] == 0) continue;           // fill could not phase it
+        if (chunk.phase_sets[i] < 0) continue;
+        chunk.gap_haps[i] = chunk.haps[i];
+        chunk.gap_phase_sets[i] = chunk.phase_sets[i] + kGapFillPsOffset;
+        ++n_filled;
+    }
+
+    // Restore authoritative core state.
+    chunk.haps = core_haps;
+    chunk.phase_sets = core_phase_sets;
+    for (size_t ci = 0; ci < chunk.candidates.size(); ++ci) {
+        chunk.candidates[ci].phase_set = cand_snap[ci].phase_set;
+        chunk.candidates[ci].hap_alt = cand_snap[ci].hap_alt;
+        chunk.candidates[ci].hap_ref = cand_snap[ci].hap_ref;
+        chunk.candidates[ci].hap_to_cons_alle = cand_snap[ci].hap_to_cons_alle;
+    }
+
+    if (opts.verbose >= 1 && n_filled > 0) {
+        std::fprintf(stderr, "[gap-fill] chunk tid=%d %" PRId64 "-%" PRId64
+                     ": recovered %d read(s)\n",
+                     chunk.region.tid,
+                     static_cast<int64_t>(chunk.region.beg),
+                     static_cast<int64_t>(chunk.region.end), n_filled);
+    }
+}
+
 void collect_var_run_phasing(PhasingChunk& chunk, const Options& opts) {
     if (chunk.candidates.empty() && chunk.noisy_regions.empty()) return;
 
@@ -2032,6 +2100,11 @@ void collect_var_run_phasing(PhasingChunk& chunk, const Options& opts) {
 
     // iteratively call variants in noisy regions via MSA and re-run k-means.
     collect_noisy_vars_step4(chunk, opts);
+
+    // Additive gap-fill: recover the reads skip_noisy_kmeans left unphased.
+    if (opts.gap_fill && opts.skip_noisy_kmeans && !chunk.candidates.empty()) {
+        gap_fill_unphased_reads(chunk, opts);
+    }
 
     const hts_pos_t active_reg_beg = chunk.region.beg;
     const hts_pos_t active_reg_end = chunk.region.end;

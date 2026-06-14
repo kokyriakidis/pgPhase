@@ -55,6 +55,7 @@ static void print_hybrid_help() {
         << "      --graph-indel-min-alt INT Min alt support for graph het-indel anchor [0]\n"
         << "      --keep-noisy-kmeans       Restore step-4 noisy-candidate k-means re-orientation (off by default)\n"
         << "      --no-hybrid-trim          Disable minimal-VCF trimming of graph-only alleles before noise filter (on by default)\n"
+        << "      --gap-fill                Additively phase reads the clean core left unphased into a disjoint PS namespace (off by default)\n"
         << "  -V, --verbose INT             Verbosity level [0]\n"
         << "\n"
         << "Examples:\n"
@@ -113,6 +114,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         kGraphIndelMinAltOption,
         kKeepNoisyKmeansOption,
         kNoHybridTrimOption,
+        kGapFillOption,
     };
 
     static struct option long_options[] = {
@@ -145,6 +147,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
         {"graph-indel-min-alt", required_argument, nullptr, kGraphIndelMinAltOption},
         {"keep-noisy-kmeans", no_argument,     nullptr, kKeepNoisyKmeansOption},
         {"no-hybrid-trim", no_argument,        nullptr, kNoHybridTrimOption},
+        {"gap-fill",        no_argument,       nullptr, kGapFillOption},
         {"refine-aln",      no_argument,       nullptr, kRefineAlnOption},
         {"verbose",         required_argument, nullptr, 'V'},
         {"help",            no_argument,       nullptr, 'h'},
@@ -191,6 +194,7 @@ int pgphase_collect::collect_hybrid_variation(int argc, char* argv[]) {
             case kGraphIndelMinAltOption: opts.graph_indel_min_alt = std::atoi(optarg); break;
             case kKeepNoisyKmeansOption: opts.skip_noisy_kmeans = false; break;
             case kNoHybridTrimOption: opts.exp_hybrid_trim = false; break;
+            case kGapFillOption:      opts.gap_fill = true; break;
             case kRefineAlnOption:    opts.refine_aln = true; break;
             case 'V':                 opts.verbose = std::atoi(optarg); break;
             case 'h':

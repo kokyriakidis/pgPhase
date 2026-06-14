@@ -86,6 +86,11 @@ constexpr int kDefaultStitchRule = kStitchRuleNetMargin;
 // Hamming flat).  --stitch-rule overrides it.
 constexpr int kHybridDefaultStitchRule = kStitchRuleBothStrands;
 
+// Gap-fill (--gap-fill): phase-set id offset applied to reads recovered by the
+// scratch-buffer noisy k-means, so their phase sets occupy a disjoint namespace
+// well above any genomic-coordinate PS id and never collide with core blocks.
+constexpr hts_pos_t kGapFillPsOffset = 1000000000;
+
 // Graph-only het-indel anchor gating (hybrid pipeline only).  Graph het indels
 // added to k-means as CleanHetIndel can mis-orient reads when the genotype is
 // unreliable.  Keep an indel anchor only when its allele fraction sits within
@@ -193,6 +198,16 @@ struct Options {
     // Defaults true for hybrid (set in collect_hybrid_variation), false for the
     // BAM pipeline. See CHECKPOINT.md "Hybrid step-4 re-orientation".
     bool skip_noisy_kmeans = false;
+    // When true (hybrid + skip_noisy_kmeans only), recover the reads that
+    // skip_noisy_kmeans leaves unphased: re-run the kCandGermlineVarCate k-means
+    // into a scratch buffer and adopt its haplotype for reads the clean core
+    // left unphased (hap==0), shifting their phase-set ids into a disjoint
+    // namespace (PS += kGapFillPsOffset) so no core phase set is renumbered,
+    // merged, or re-oriented. Additive: the clean core is never modified. This
+    // is the in-binary form of scripts/gapfill.py (1-source / BAM-pipeline gap).
+    // Off by default; enabled by --gap-fill on collect-hybrid-variation. See
+    // CHECKPOINT.md "hybrid-core + gap-fill".
+    bool gap_fill = false;
     // Trim graph-only catalog alleles to minimal VCF form before the hybrid
     // indel noise filter, matching apply_graph_noise_filter. Graph catalog
     // alleles are non-minimal (full repeat run on both flanks); trimming shrinks
@@ -509,6 +524,14 @@ struct PhasingChunk {
     std::vector<int> n_down_ovlp_skip_reads;
     std::vector<int> haps;
     std::vector<hts_pos_t> phase_sets;
+    // Gap-fill (--gap-fill) results, parallel to `haps`/`phase_sets`. Populated
+    // only for reads the clean core left unphased (haps[i]==0) and recovered by
+    // the scratch-buffer noisy k-means; empty otherwise. Kept separate from
+    // `haps` so they never influence cross-chunk stitching (which inspects
+    // `haps` and skips hap==0 reads). Applied only at BAM-write time. PS values
+    // already carry kGapFillPsOffset.
+    std::vector<int> gap_haps;
+    std::vector<hts_pos_t> gap_phase_sets;
     std::vector<ReadVariantProfile> read_var_profile;
     /** Interval tree [start_var_idx, end_var_idx+1) → read_i, built by `collect_read_var_profile`. */
     std::unique_ptr<cgranges_t, CgrangesDeleter> read_var_cr;

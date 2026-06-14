@@ -423,8 +423,16 @@ int PhasedAlignmentWriter::write_chunks(const std::vector<PhasingChunk>& chunks)
                 }
                 if (read_i >= static_cast<int>(chunk.up_ovlp_read_i[bi].size())) {
                     const ReadRecord& rr = chunk.reads[static_cast<size_t>(global_read_i)];
-                    const int hap = static_cast<size_t>(global_read_i) < chunk.haps.size() ? chunk.haps[static_cast<size_t>(global_read_i)] : 0;
-                    const hts_pos_t ps = static_cast<size_t>(global_read_i) < chunk.phase_sets.size() ? chunk.phase_sets[static_cast<size_t>(global_read_i)] : static_cast<hts_pos_t>(-1);
+                    int hap = static_cast<size_t>(global_read_i) < chunk.haps.size() ? chunk.haps[static_cast<size_t>(global_read_i)] : 0;
+                    hts_pos_t ps = static_cast<size_t>(global_read_i) < chunk.phase_sets.size() ? chunk.phase_sets[static_cast<size_t>(global_read_i)] : static_cast<hts_pos_t>(-1);
+                    // --gap-fill: for reads the clean core left unphased, adopt
+                    // the additive gap-fill assignment (disjoint PS namespace).
+                    if (hap == 0 &&
+                        static_cast<size_t>(global_read_i) < chunk.gap_haps.size() &&
+                        chunk.gap_haps[static_cast<size_t>(global_read_i)] != 0) {
+                        hap = chunk.gap_haps[static_cast<size_t>(global_read_i)];
+                        ps = chunk.gap_phase_sets[static_cast<size_t>(global_read_i)];
+                    }
                     if (opts_.refine_aln) {
                         if (digar_query_len(rr.digars) != read->core.l_qseq) {
                             const char* tname = (tid >= 0 && tid < in_header->n_targets) ? in_header->target_name[tid] : ".";

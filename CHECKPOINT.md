@@ -1315,13 +1315,24 @@ accuracy. Additive gap-fill is strictly better than `--keep-noisy-kmeans` (2.15%
 vs 3.21% Hamming at comparable coverage) because it does not let the noisy reads
 re-orient the clean core.
 
-**Status:** prototype validated (`scripts/gapfill.py`). Exposed via
-`scripts/bench_hybrid.sh --gapfill [N]`: `N=1` (default) adds BAM-pipeline
-reads, `N=2` chains a second pass to also add graph-pipeline reads. Both modes
-verified to reproduce the BAMs above (221,428 / 222,802 phased). It is a
-post-process over phased BAMs that transfers HP/PS labels by read name; the
-hybrid binary itself only does hybrid-default — promote gap-fill to a CLI
-subcommand only if accuracy-at-high-coverage becomes a shipped target.
+**Status:** shipped natively as `collect-hybrid-variation --gap-fill`. The
+1-source variant (hybrid core + BAM-pipeline fill → 221,428 reads / 2.15%
+Hamming) is built into the binary: when `--gap-fill` is set alongside the
+hybrid `skip_noisy_kmeans` default, `gap_fill_unphased_reads`
+(`src/collect_var.cpp`) re-runs the `kCandGermlineVarCate` k-means into a
+scratch buffer and adopts its haplotype only for reads the clean core left at
+`hap==0`, writing them to `chunk.gap_haps`/`gap_phase_sets` with
+`PS += kGapFillPsOffset` (1e9, disjoint namespace). The core read-phase and
+per-candidate consensus state are snapshotted and byte-for-byte restored, so the
+clean core is never renumbered, merged, or re-oriented — the in-binary form of
+the validated `scripts/gapfill.py` 1-source pass. `collect_bam_output.cpp` emits
+the gap-fill HP/PS for any read the core left unphased. Off by default.
+
+The 2-source variant (also adding the 1,374 graph-only reads → 222,802 /
+2.23%) remains a post-process only, via `scripts/bench_hybrid.sh --gapfill 2`;
+it needs the graph-pipeline phasing as a second source, which the single hybrid
+binary run does not produce. The original prototype (`scripts/gapfill.py`,
+`scripts/bench_hybrid.sh --gapfill [N]`) is retained for reproducing both BAMs.
 
 ---
 

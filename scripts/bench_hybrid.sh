@@ -36,6 +36,11 @@
 # This recovers the hard reads the hybrid skip_noisy_kmeans default drops, and
 # Pareto-beats the BAM pipeline (more reads, lower error, higher auN). See
 # CHECKPOINT.md "hybrid-core + gap-fill".
+#
+# Note: the N=1 (BAM-pipeline) gap-fill is now built into the binary as
+# `collect-hybrid-variation --gap-fill` (no post-process / second pipeline run
+# needed). This script's --gapfill remains for N=2 (graph-source) and for
+# reproducing the prototype BAMs against the native output.
 
 set -euo pipefail
 
