@@ -3283,3 +3283,111 @@ pipeline gains (99.195→99.210%) while hybrid holds steady.
 
 Covered by the existing `test_graph_bam_adapter` multiallelic-decomposition tests
 (which guard the same-site case) and `make unit-tests`.
+
+---
+
+## DeepVariant calling on HG003 GRCh38: surjection cost and the refined-pbmm2 + graph-HP win
+
+A separate evaluation track on **HG003 chr20** (GIAB v4.2.1, GRCh38) measures how
+pgphase's graph-derived phasing affects **downstream DeepVariant variant calling**,
+rather than internal phasing accuracy. This is a different sample/reference than the
+HG002/CHM13 work above; inputs live under the eval harness (`hg003_vg/`), not in
+`test_data/`.
+
+**Setup (all arms identical except where noted):** HG003 Revio SPRQ HiFi, 32×, chr20.
+DeepVariant 1.10.0 PACBIO model, `--disable_small_model` in every arm so they share
+one calling path (main CNN); the only variable is the alignment substrate and the
+phasing source. hap.py vs GIAB HG003 v4.2.1 `noinconsistent` BED (chr20), vcfeval,
+PASS-only. Two read alignments of the same reads:
+
+- **pbmm2 (native):** the PacBio case-study minimap2/pbmm2 linear GRCh38 alignment.
+- **graph-surject:** vg-giraffe alignment to the HPRC pangenome, surjected to GRCh38.
+
+HP-aware arms feed pgphase HP tags to DV with
+`--make_examples_extra_args "phase_reads=false,sort_by_haplotypes=true"`.
+
+### Vanilla control reproduces the published case study
+
+DV on the native pbmm2 BAM (DV-internal phasing) matches Google's published number
+to within 0.0001 INDEL F1 (our 0.99359 vs published 0.99368; identical TP 10,561),
+validating the harness. The graph-surject pipeline scores **lower** on raw DV calling:
+
+| Config (best arm) | Alignment | INDEL F1 | SNP F1 |
+|---|---|---|---|
+| Vanilla pbmm2 (DV-internal) | pbmm2 | 0.99359 | 0.99910 |
+| graph-surject hybrid_hp (mq20 af0.12) | surject | 0.98724 | 0.99877 |
+
+The ~0.0064 INDEL-F1 gap is the **surjection penalty**, not the phasing. SNPs are
+nearly immune (~0.0003), because the cost is almost entirely indel re-representation:
+projecting a graph path onto linear GRCh38 makes CIGAR/left-shift decisions that
+differ from minimap2's, and the PACBIO model was trained on minimap2 alignments.
+
+### Threshold sweeps are saturated
+
+`--min-af` (0.20→0.12) and `--min-mapq` (20→10→1) were swept on the surject pipeline.
+AF 0.20→0.12 gained +0.00145 INDEL F1 (the only real mover) by recruiting low-VAF
+candidates; MAPQ moved INDEL F1 by ≤0.0004 across the whole 20→1 range (plateaued).
+Lowering either threshold recruits **mostly SNPs, not indels** (e.g. mq20→mq1 added
++5,887 SNP vs +827 indel candidates). You cannot tune past the surjection penalty
+with candidate thresholds. Best surject config: **mq20 af0.12 / dv_hybrid_hp**.
+
+### The fix: native pbmm2 substrate + graph phasing
+
+Putting graph phasing on a **native** alignment closes the entire gap. Three
+constructions, vs the vanilla baseline (TP/FP are PASS counts):
+
+| Config | INDEL F1 | INDEL FP | SNP F1 | SNP FP |
+|---|---|---|---|---|
+| Vanilla pbmm2 (DV-internal) | 0.99359 | 72 | 0.99910 | 68 |
+| pbmm2-hybrid, dv_hybrid_hp | **0.99420** | 67 | 0.99789 | **241** ❌ |
+| **refined-pbmm2 + graph-surject HP** | 0.99396 | 69 | **0.99917** | **59** ✅ |
+| graph-surject hybrid_hp | 0.98724 | — | 0.99877 | — |
+
+- **pbmm2-hybrid** = run `collect-hybrid-variation` with the native pbmm2 BAM as
+  `--bam` plus the giraffe GAF/sites (`--refine-aln --min-mapq 20 --min-af 0.12`).
+  This is coordinate-safe: the GAF is queried by GRCh38 interval (its own surjection
+  projection) and graph observations join to BAM reads by **read name only**, so a
+  different BAM aligner still merges. It gives the **best INDEL F1 (0.99420, +8 TP)**
+  but regresses SNP precision (FP 68→241).
+
+- **refined-pbmm2 + graph-surject HP** = take the BAM-pipeline refined pbmm2 reads
+  (`run_pgphase_pbmm2hybrid_af12/bam/phased.bam` — fixed indel CIGARs, native
+  coords), strip their HP/PS, and stamp the **graph-surject** hybrid HP tags
+  (`run_pgphase_refine_mq20_af12/hybrid/phased.bam`) by read name (`gapfill.py` with
+  core=refined-pbmm2, fill=graph-surject). This is a **strict Pareto win over
+  vanilla** — every metric improves, both types:
+
+| | INDEL | SNP |
+|---|---|---|
+| TP | 10,561 → 10,566 (+5) | 70,107 → 70,108 (+1) |
+| FN | 67 → 62 (−5) | 59 → 58 (−1) |
+| FP | 72 → 69 (−3) | 68 → 59 (−9) |
+| Recall | 0.99370 → 0.99417 | 0.99916 → 0.99917 |
+| Precision | 0.99348 → 0.99376 | 0.99903 → 0.99916 |
+| F1 | 0.99359 → 0.99396 | 0.99910 → 0.99917 |
+
+### What caused the SNP regression (and what did not)
+
+The +173 SNP FP in the pbmm2-hybrid arm is **not** from `--refine-aln`. Two arms on
+the *same refined substrate* isolate it: pbmm2-hybrid HP (graph fed in pbmm2 coords)
+→ SNP FP 241; graph-surject HP (graph phased in graph coords, then surjected) → SNP
+FP 59. The damage comes entirely from the **HP source**, not from refine. The
+in-pbmm2-coordinate hybrid phasing mislabels reads at some SNP sites (the untested
+no-conflict profile-extension path, `hybrid_inject.cpp:295`, where pbmm2 and giraffe
+disagree on placement); graph-native phasing does not. `dv_default` on the refined
+pbmm2 BAM keeps SNP FP at 65, confirming refine itself is clean.
+
+### Recommendations
+
+- **Graph phasing is not the problem; the surjected alignment is.** Graph-derived HP
+  labels are accurate enough to match (and slightly beat) DV's own phasing — when
+  applied to a native alignment.
+- **For a no-downside config:** refined-pbmm2 substrate + graph-surject hybrid HP.
+  Beats vanilla DV on both indels and SNPs with no regression.
+- **For max indel recall (accepting SNP cost):** pbmm2-hybrid dv_hybrid_hp.
+- **Use the hybrid (clean-core) HP source, not gapfill** — gapfill's hard reads cost
+  precision on the native substrate, same as on surject.
+
+Eval scripts: `hg003_vg/{26..43}_*.sbatch` (pgphase / DeepVariant / hap.py per
+config) and `bench_hybrid_refine_mq{1,10,20}_af12.sh`. Results under
+`hg003_vg/dv_results_*/`. These artifacts live on the eval cluster, not in-repo.
