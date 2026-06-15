@@ -3303,6 +3303,12 @@ PASS-only. Two read alignments of the same reads:
 - **pbmm2 (native):** the PacBio case-study minimap2/pbmm2 linear GRCh38 alignment.
 - **graph-surject:** vg-giraffe alignment to the HPRC pangenome, surjected to GRCh38.
 
+**Pangenome graph:** HPRC **v1.1** minigraph-cactus, GRCh38-based
+(`hprc-v1.1-mc-grch38.gbz` + `.hapl`, from
+`human-pangenomics/.../freeze1/minigraph-cactus/hprc-v1.1-mc-grch38`). Giraffe maps
+with the `.hapl` personalized haplotype-sampling index. Every graph-derived signal in
+this section (surject BAM, GAF, snarl sites) comes from v1.1, not v2.x.
+
 HP-aware arms feed pgphase HP tags to DV with
 `--make_examples_extra_args "phase_reads=false,sort_by_haplotypes=true"`.
 
