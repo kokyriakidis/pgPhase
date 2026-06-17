@@ -3397,3 +3397,102 @@ pbmm2 BAM keeps SNP FP at 65, confirming refine itself is clean.
 Eval scripts: `hg003_vg/{26..43}_*.sbatch` (pgphase / DeepVariant / hap.py per
 config) and `bench_hybrid_refine_mq{1,10,20}_af12.sh`. Results under
 `hg003_vg/dv_results_*/`. These artifacts live on the eval cluster, not in-repo.
+
+## HPRC v2.1 vs v1.1 on HG003 chr20 (refined-pbmm2 + graph-HP and graph-surject)
+
+Re-ran the two best recipes from the section above on the **HPRC v2.1**
+minigraph-cactus GRCh38 graph (`hprc-v2.1-mc-grch38.gbz`) to test whether the newer
+pangenome improves downstream DeepVariant calling. Same sample/reference/evaluator as
+the v1.1 work (HG003 chr20, GRCh38, GIAB v4.2.1 `noinconsistent` BED, hap.py vcfeval,
+PASS-only, DV 1.10.0 PACBIO, `--disable_small_model`).
+
+**Result: v2.1 improves on v1.1 in both recipes, and the refined-pbmm2 + graph-HP
+recipe on v2.1 is a strict win over vanilla DV across every metric.**
+
+### Final three-way comparison (the configs that matter)
+
+INDEL (PASS):
+
+| Config | F1 | Recall | Precision | FP | FN |
+|---|---|---|---|---|---|
+| Vanilla DV (pbmm2) | 0.993590 | 0.993696 | 0.993484 | 72 | 67 |
+| refined-pbmm2 + graphHP (v1.1) | 0.993963 | 0.994166 | 0.993759 | 69 | 62 |
+| **refined-pbmm2 + graphHP (v2.1)** | **0.994335** | **0.994637** | **0.994033** | **66** | **57** |
+
+SNP (PASS):
+
+| Config | F1 | Recall | Precision | FP | FN |
+|---|---|---|---|---|---|
+| Vanilla DV (pbmm2) | 0.999096 | 0.999159 | 0.999032 | 68 | 59 |
+| refined-pbmm2 + graphHP (v1.1) | 0.999167 | 0.999173 | 0.999160 | 59 | 58 |
+| **refined-pbmm2 + graphHP (v2.1)** | **0.999209** | **0.999188** | **0.999231** | **54** | **57** |
+
+v2.1 graph-surject `dv_hybrid_hp` also improved over v1.1 (INDEL F1
+0.987239 → 0.988046, FP 168 → 150; SNP F1 0.998767 → 0.998831, FP 53 → 47) but still
+trails vanilla on SNP recall (FN 117 vs 59) — graph-surject alone remains inferior to
+the refined-pbmm2 substrate, exactly as on v1.1.
+
+### vg compatibility: regenerate the `.hapl`, do not reuse the published one
+
+The published v2.1 `.hapl` is **haplotype-index version 5**, which vg 1.67.0 (the
+pinned eval binary, max supported `.hapl` version 4) cannot read. The fix is to
+regenerate a v4 `.hapl` locally from the `.gbz` with `vg haplotypes`. This requires
+the `.dist` index and a `.ri` (r-index): build `.dist` first (`vg index -j`), then
+`vg gbwt -Z -r` to emit the `.ri`, then `vg haplotypes`. The `.dist` build is the
+memory bottleneck — it peaks at ~591 GB RSS and needs a ~900 GB high-mem node; the
+`.hapl` regen itself is light. After giraffe is done the 20 GB `.regen.hapl` can be
+deleted (catalog/pgphase steps do not use it).
+
+### pggaf: use the upstream-fixed binary for annotate-gaf
+
+Giraffe emits unmapped records (`*` path) that crash the older bundled `pggaf
+annotate-gaf`. The upstream fix is commit `0a54c09` ("Fix annotate-gaf crash on
+unmapped reads") on `github.com/kokyriakidis/pggaf` `main`. Rebuild pggaf from
+upstream (CMake + GCC 13.3; the binary needs the GCC 13.3 C++ runtime and
+`libcrypto.so.3` on `LD_LIBRARY_PATH`) and run `annotate-gaf` on the raw giraffe GAF.
+
+### Operational gotcha: shared group quota is volatile — stage to $HOME
+
+The eval cluster's shared group filesystem (`/sc1/groups`, 11P/13P used) enforces a
+**group quota that floats near-full**, independent of raw disk space. Symptoms seen
+repeatedly during the v2.1 run: a 10 MB write returns "0 bytes copied", `vg
+deconstruct` aborts mid-catalog with "Failed to write BAM record", and — most
+insidiously — SLURM cannot create the job's `--output` log, so the job dies at
+0 s with **no log file at all** (looks like an instant, unexplained failure).
+
+Durable fix: route **every** write vector to the user `$HOME` filesystem (separate,
+uncontended, 13 T free), keeping the original shared-FS path strings intact via
+symlinks so downstream scripts need no edits:
+
+- catalog VCFs staged to `$HOME/pgphase_catalog_v21/`;
+- `logs/` → symlink to `$HOME/pgphase_logs`;
+- `run_pgphase_v21_*`, `dv_results_*_v21` → symlinks to `$HOME/...`.
+
+With outputs on `$HOME`, the catalog build (4 h 55 m), pgphase (7 m, all four arms),
+and both DV recipes (run in parallel, ~15–28 m each) completed cleanly.
+
+### Whole-genome (all chromosomes) is not yet runnable as-is
+
+A request to extend these three configs (vanilla, refined-pbmm2+graphHP v1.1 and
+v2.1) to all chromosomes was **investigated but not run** — the inputs on disk are
+chr20-only:
+
+- Reads: only `hg003_vg/reads/HG003.chr20.fq.gz` and the chr20 SPRQ BAM are present.
+  A whole-genome HG003 HiFi BAM (~54 GB) exists under `/sc1/groups/sbx/public-stage/`
+  but belongs to another user/track and would need to be vetted/copied.
+- Truth set: the only GIAB benchmark staged locally is **HG002**
+  (`HG002_GRCh38_1_22_v4.2.1_benchmark.vcf.gz` + BED). The genome-wide **HG003**
+  v4.2.1 truth VCF/BED must be sourced before any all-chr hap.py can run.
+
+Prerequisites for a genome-wide run: (1) whole-genome HG003 HiFi reads,
+(2) genome-wide HG003 v4.2.1 truth VCF + BED, (3) the catalog rebuilt for all
+contigs (the chr20 `vg deconstruct` alone took ~5 h, so expect a substantially
+longer, higher-memory build genome-wide), and (4) the same `$HOME`-staging quota
+workaround.
+
+### Artifacts (eval cluster, not in-repo)
+
+Scripts `hg003_vg/{50..59}_*_v21.sbatch` (fetch graph, regen `.hapl`, giraffe+surject,
+build catalog, pgphase, DV ×2 recipes, hap.py ×2, build/test pggaf). Results under
+`$HOME/dv_results_v21_mq20_af12/`, `$HOME/dv_results_refinedpbmm2_graphhp_v21/`, and
+the comparison write-up at `$HOME/v21_vs_v11_comparison.md`.
