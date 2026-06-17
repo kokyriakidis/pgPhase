@@ -3496,3 +3496,62 @@ Scripts `hg003_vg/{50..59}_*_v21.sbatch` (fetch graph, regen `.hapl`, giraffe+su
 build catalog, pgphase, DV ×2 recipes, hap.py ×2, build/test pggaf). Results under
 `$HOME/dv_results_v21_mq20_af12/`, `$HOME/dv_results_refinedpbmm2_graphhp_v21/`, and
 the comparison write-up at `$HOME/v21_vs_v11_comparison.md`.
+
+## FN root-cause: the misses are alignment/evidence limits, not pgphase site gaps
+
+Question asked of the winning config (refined-pbmm2 + graphHP **v2.1**,
+`dv_hybrid_hp`): *why* are the 114 false negatives missed, and do they exist as sites
+in the BAM or graph pipeline? Method: parse `happy.vcf.gz` for TRUTH `BD=FN` records
+(57 SNP + 57 INDEL, all inside the GIAB CONF BED), then for each locus (1) read the
+DV genotype call, (2) measure ALT-allele depth in the DV-input BAM
+(`refined_pbmm2.graphHP.bam`) via `bcftools mpileup -a AD`, and (3) test membership in
+the pgphase BAM and graph candidate sets (`*/candidates.tsv`, POS-exact for SNPs, ±5 bp
+for indels to absorb left-alignment differences).
+
+### DV behavior at FN loci
+
+- 84 NOCALL — DV emitted nothing.
+- 30 WRONGCALL — DV called but with the wrong genotype (these also count as FP).
+
+### Evidence in the DV-input BAM (ALT allele fraction at the truth locus)
+
+| Type | NO_COVERAGE (DP<5) | LOW_VAF (alt AF<0.2) | EVIDENCE_PRESENT (alt AF≥0.2) |
+|---|---|---|---|
+| SNP | 0 | 46 | 11 |
+| INDEL | 0 | **57** | 0 |
+
+### Do the FN exist as pgphase candidates?
+
+Only **13 of 114** FN are pgphase candidates (9 SNP `EVIDENCE_PRESENT` + 4 SNP
+`LOW_VAF`, from the BAM or graph set); the other 101 are not. This is **not** the
+cause of the misses: pgphase candidates only drive HP phasing, they do not gate what
+DeepVariant calls. The 101 non-candidates fail for the *same* reason DV misses them —
+no callable ALT evidence at the locus.
+
+### Why each class is missed
+
+- **INDEL FN (all 57): alignment representation, not detection.** ALT depth is ~0 at
+  every indel FN — the reads carry the *reference* indel representation (left-shift /
+  homopolymer collapse from the linear/surjected alignment), so the truth-form ALT is
+  not in the pileup. Same surjection indel-representation penalty documented above;
+  no phasing change recovers these.
+- **SNP FN, LOW_VAF (46): allele dropout at true hets.** Median alt AF ≈ 0.08; reads
+  dropped the alternate allele (mapping bias), so DV correctly calls reference.
+- **SNP FN, EVIDENCE_PRESENT (11): genuinely hard.** The only loci with callable
+  signal. 8 are NOCALL despite AF 0.2–0.5 — including a tight 3-SNP cluster at
+  chr20:5,309,435 / 5,309,444 / 5,310,690 (paralog/segdup signature DV filters as
+  ambiguous). 3 are WRONGCALL at AF 0.77–0.90 — **zygosity errors** (e.g. truth 1/1 →
+  DV 0/1, or a multiallelic mismatch), not missed sites. The pgphase pipelines *do*
+  see 9 of these 11 as candidates; DV still declines them.
+
+### Bottom line
+
+The FNs are **not** a pgphase site-detection failure. ~90% are alignment/evidence
+limits — indel representation (57) and het allele-dropout (46) — unreachable by any
+phasing or candidate-threshold change. Only ~11 are hard SNPs with real signal
+(segdup cluster + zygosity), already candidates in the graph/BAM pipelines but
+declined by DV. Moving these would need a different alignment or DV model, not pgphase
+changes.
+
+Artifacts (eval cluster): `$HOME/fn_analysis/fn_evidence.tsv` (per-locus depth/AF/
+class/candidate table) and `$HOME/fn_analysis/FN_FINDINGS.md` (write-up).
